@@ -7,7 +7,7 @@ import Link from "next/link";
 
 interface Service {
   id: string;
-  status: "PENDING" | "PROVISIONING" | "ACTIVE" | "SUSPENDED" | "CANCELLED" | "FAILED";
+  status: "PENDING" | "PROVISIONING" | "INSTALLING" | "ACTIVE" | "SUSPENDED" | "CANCELLED" | "FAILED" | "DELETED";
   serverIp: string | null;
   sshUsername: string | null;
   sshPassword: string | null;
@@ -26,19 +26,23 @@ interface Service {
 const statusColors: Record<Service["status"], string> = {
   PENDING: "bg-blue-900/40 text-blue-400 border-blue-800",
   PROVISIONING: "bg-blue-900/40 text-blue-400 border-blue-800",
+  INSTALLING: "bg-blue-900/40 text-blue-400 border-blue-800",
   ACTIVE: "bg-green-900/40 text-green-400 border-green-800",
   SUSPENDED: "bg-amber-900/40 text-amber-400 border-amber-800",
   CANCELLED: "bg-red-900/40 text-red-400 border-red-800",
   FAILED: "bg-red-900/40 text-red-400 border-red-800",
+  DELETED: "bg-gray-800/60 text-gray-400 border-gray-700",
 };
 
 const statusLabels: Record<Service["status"], string> = {
   PENDING: "Setting up",
   PROVISIONING: "Provisioning",
+  INSTALLING: "Installing",
   ACTIVE: "ACTIVE",
   SUSPENDED: "SUSPENDED",
   CANCELLED: "CANCELLED",
   FAILED: "Setup failed",
+  DELETED: "Deleted",
 };
 
 function CopyButton({ value }: { value: string }) {

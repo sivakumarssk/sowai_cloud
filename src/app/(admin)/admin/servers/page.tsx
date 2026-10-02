@@ -7,7 +7,7 @@ import { showToast } from "@/components/ui/Toast";
 
 interface ServiceRecord {
   id: string;
-  status: "ACTIVE" | "SUSPENDED" | "CANCELLED";
+  status: "ACTIVE" | "SUSPENDED" | "CANCELLED" | "DELETED";
   serverIp: string | null;
   sshUsername: string | null;
   sshPassword: string | null;
@@ -21,6 +21,7 @@ const statusColors = {
   ACTIVE: "bg-green-900/40 text-green-400 border-green-800",
   SUSPENDED: "bg-amber-900/40 text-amber-400 border-amber-800",
   CANCELLED: "bg-red-900/40 text-red-400 border-red-800",
+  DELETED: "bg-gray-800/60 text-gray-400 border-gray-700",
 };
 
 export default function AdminServersPage() {

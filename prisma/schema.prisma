@@ -28,16 +28,19 @@ enum PlanTier {
 enum ServiceStatus {
   PENDING
   PROVISIONING
+  INSTALLING
   ACTIVE
   SUSPENDED
   CANCELLED
   FAILED
+  DELETED
 }
 
 enum PaymentStatus {
   PENDING
   SUCCESS
   FAILED
+  REFUNDED
 }
 
 enum OrderStatus {
@@ -110,9 +113,17 @@ model Service {
   osImage         String?
   stackPreset     String?
   serverIp        String?
+  ipv6Address     String?
+  hetznerFloatingIpId String?
   sshUsername     String?
   sshPassword     String?
   panelUrl        String?
+  /// AES-256-GCM encrypted (see src/lib/crypto.ts)
+  panelPassword   String?
+  hasCoolify      Boolean       @default(false)
+  proxmoxVmId     String?
+  provisioningStep String?
+  provisioningPct Int           @default(0)
   provisionError  String?
   startDate       DateTime      @default(now())
   nextBillingDate DateTime

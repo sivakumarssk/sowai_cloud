@@ -2,6 +2,8 @@ import { prisma } from "@/lib/prisma";
 import { SimulatedProvider } from "@/lib/provisioning/SimulatedProvider";
 import type { ProvisioningProvider } from "@/lib/provisioning/ProvisioningProvider";
 import { sendCredentialsEmail } from "@/lib/email";
+import { encrypt } from "@/lib/crypto";
+import { provisionVPS } from "@/lib/provisioning/provisionVPS";
 
 export type ProvisionJobData = {
   serviceId: string;
@@ -24,6 +26,13 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
   });
   if (!service) return;
 
+  // Real Proxmox provisioning for VPS plans once PROVISIONER=proxmox is set;
+  // every other plan (and VPS until then) still goes through the simulator.
+  if (process.env.PROVISIONER === "proxmox" && service.plan.category === "VPS") {
+    await provisionVPS(serviceId);
+    return;
+  }
+
   try {
     await prisma.service.update({
       where: { id: serviceId },
@@ -45,7 +54,7 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
         status: "ACTIVE",
         serverIp: result.serverIp,
         sshUsername: result.sshUsername,
-        sshPassword: result.sshPassword,
+        sshPassword: encrypt(result.sshPassword),
         panelUrl: result.panelUrl,
       },
     });
