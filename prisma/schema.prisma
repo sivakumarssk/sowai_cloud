@@ -1,0 +1,210 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CLIENT
+  ADMIN
+}
+
+enum PlanCategory {
+  SHARED
+  VPS
+  WORDPRESS
+  STORAGE
+  DEDICATED
+}
+
+enum PlanTier {
+  STANDARD
+  PREMIUM
+}
+
+enum ServiceStatus {
+  PENDING
+  PROVISIONING
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  FAILED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum OrderStatus {
+  DRAFT
+  AWAITING_PAYMENT
+  PAID
+  CANCELLED
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String
+  name          String
+  phone         String
+  company       String?
+  role          Role      @default(CLIENT)
+  isVerified    Boolean   @default(false)
+  resetToken    String?
+  resetTokenExp DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  services      Service[]
+  payments      Payment[]
+  tickets       Ticket[]
+  notifications Notification[]
+  orders        Order[]
+
+  @@index([email])
+}
+
+model Plan {
+  id           String       @id @default(cuid())
+  name         String
+  category     PlanCategory
+  tier         PlanTier     @default(STANDARD)
+  price        Int
+  billingCycle String       @default("monthly")
+  features     Json
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+
+  services Service[]
+  orders   Order[]
+
+  @@index([category, tier])
+}
+
+model Service {
+  id              String        @id @default(cuid())
+  userId          String
+  planId          String
+  orderId         String?       @unique
+  status          ServiceStatus @default(PENDING)
+  hostname        String?
+  region          String        @default("eu-nuremberg")
+  osImage         String?
+  stackPreset     String?
+  serverIp        String?
+  sshUsername     String?
+  sshPassword     String?
+  panelUrl        String?
+  provisionError  String?
+  startDate       DateTime      @default(now())
+  nextBillingDate DateTime
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan     Plan      @relation(fields: [planId], references: [id])
+  order    Order?    @relation(fields: [orderId], references: [id])
+  payments Payment[]
+  tickets  Ticket[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  userId        String
+  planId        String
+  status        OrderStatus @default(DRAFT)
+  billingCycle  Int         @default(12)
+  addons        Json        @default("[]")
+  region        String      @default("eu-nuremberg")
+  osImage       String?
+  stackPreset   String?
+  hostname      String?
+  amount        Int
+  gstAmount     Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan    Plan     @relation(fields: [planId], references: [id])
+  payments Payment[]
+  service Service?
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  userId            String
+  serviceId         String?
+  orderId           String?
+  amount            Int
+  currency          String        @default("INR")
+  razorpayOrderId   String?       @unique
+  razorpayPaymentId String?       @unique
+  status            PaymentStatus @default(PENDING)
+  invoiceNumber     String?       @unique
+  gstAmount         Int           @default(0)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  service Service? @relation(fields: [serviceId], references: [id])
+  order   Order?   @relation(fields: [orderId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+  @@index([razorpayOrderId])
+}
+
+model Ticket {
+  id        String         @id @default(cuid())
+  userId    String
+  serviceId String?
+  subject   String
+  status    TicketStatus   @default(OPEN)
+  priority  TicketPriority @default(MEDIUM)
+  messages  Json           @default("[]")
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  service Service? @relation(fields: [serviceId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+}
