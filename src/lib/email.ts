@@ -1,11 +1,23 @@
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM = process.env.EMAIL_FROM || "noreply@sowsicloud.com";
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://sowsicloud.com";
 
+// Resend's constructor throws on a missing/empty key. Building it lazily
+// (only when an email actually needs to go out) keeps a missing key from
+// crashing `next build`'s page-data collection for every route that
+// imports this module, and from taking down unrelated requests at runtime.
+let resend: Resend | null = null;
+function getResendClient(): Resend | null {
+  if (!process.env.RESEND_API_KEY) return null;
+  if (!resend) resend = new Resend(process.env.RESEND_API_KEY);
+  return resend;
+}
+
 export async function sendWelcomeEmail(to: string, name: string) {
-  await resend.emails.send({
+  const client = getResendClient();
+  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping welcome email to", to);
+  await client.emails.send({
     from: FROM,
     to,
     subject: "Welcome to Sowsi Cloud Services!",
@@ -28,8 +40,10 @@ export async function sendPasswordResetEmail(
   name: string,
   token: string
 ) {
+  const client = getResendClient();
+  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping password reset email to", to);
   const resetUrl = `${APP_URL}/reset-password?token=${token}`;
-  await resend.emails.send({
+  await client.emails.send({
     from: FROM,
     to,
     subject: "Reset Your Sowsi Cloud Password",
@@ -57,7 +71,9 @@ export async function sendCredentialsEmail(
     panelUrl?: string;
   }
 ) {
-  await resend.emails.send({
+  const client = getResendClient();
+  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping credentials email to", to);
+  await client.emails.send({
     from: FROM,
     to,
     subject: `Your ${server.planName} server is ready`,
@@ -92,8 +108,10 @@ export async function sendInvoiceEmail(
   amount: number,
   gstAmount: number
 ) {
+  const client = getResendClient();
+  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping invoice email to", to);
   const total = amount + gstAmount;
-  await resend.emails.send({
+  await client.emails.send({
     from: FROM,
     to,
     subject: `Invoice #${invoiceNumber} - Sowsi Cloud Services`,

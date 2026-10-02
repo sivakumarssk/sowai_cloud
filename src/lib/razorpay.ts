@@ -1,9 +1,28 @@
 import Razorpay from "razorpay";
 import crypto from "crypto";
 
-export const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID!,
-  key_secret: process.env.RAZORPAY_KEY_SECRET!,
+// Razorpay's constructor throws if key_id is missing/empty. Building it
+// lazily (only when a route actually calls razorpay.orders.create) keeps a
+// missing key from crashing `next build`'s page-data collection for every
+// route that imports this module.
+let razorpayClient: Razorpay | null = null;
+function getRazorpayClient(): Razorpay {
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    throw new Error("Razorpay is not configured — set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.");
+  }
+  if (!razorpayClient) {
+    razorpayClient = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
+  }
+  return razorpayClient;
+}
+
+export const razorpay = new Proxy({} as Razorpay, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getRazorpayClient(), prop, receiver);
+  },
 });
 
 export function verifyRazorpaySignature(
