@@ -1,125 +1,226 @@
 /**
  * End-to-end check of the Proxmox side of provisioning.
  *
- *   npx tsx scripts/testProxmox.ts                   # IPv6-only test container
- *   npx tsx scripts/testProxmox.ts --ipv4 1.2.3.4    # also use an existing, assigned Floating IP
+ *   npx tsx scripts/testProxmox.ts           # IPv6-only test container (free)
+ *   npx tsx scripts/testProxmox.ts --ipv4    # also buys a Hetzner Floating IP (billed by Hetzner)
  *
  * Creates a real LXC container (1 core, 2 GB, 20 GB, Ubuntu 22.04), starts
- * it, syncs host routes, prints its details, then asks whether to delete it.
- * Does not touch the database or buy anything from Hetzner.
- * Run scripts/proxmox-host-setup.sh on the host first.
+ * it, routes its IPs on the host, SSHes in over each address, creates a test
+ * user, then asks whether to delete everything (container + Floating IP).
+ * Does not touch the database. Run scripts/proxmox-host-setup.sh on the host first.
  */
 import "dotenv/config";
 import { createInterface } from "node:readline/promises";
 import { proxmox } from "../src/lib/proxmox";
-import { vmSetup } from "../src/lib/vmSetup";
+import { hetzner } from "../src/lib/hetzner";
+import { vmSetup, connectWithRetry, provisioningKey, run } from "../src/lib/vmSetup";
+import { generatePassword, randomLowerAlnum } from "../src/lib/crypto";
 
 const OS = "ubuntu-22.04";
+const WANT_IPV4 = process.argv.includes("--ipv4");
 
-function arg(name: string): string | undefined {
-  const i = process.argv.indexOf(name);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+let stepNo = 0;
+function step(text: string) {
+  console.log(`\n[${++stepNo}] ${text}`);
 }
 
-function step(n: number, text: string) {
-  console.log(`\n[${n}] ${text}`);
-}
+const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 async function syncRoutes() {
   try {
     console.log(`    ${await vmSetup.syncHostRoutes()}`);
   } catch (err) {
-    console.warn(`    ⚠ Route sync failed (has proxmox-host-setup.sh been run?): ${err instanceof Error ? err.message : err}`);
+    console.warn(`    ⚠ Route sync failed (has proxmox-host-setup.sh been run?): ${message(err)}`);
   }
 }
 
-async function main() {
-  step(1, "Connecting to Proxmox...");
-  if (!(await proxmox.testConnection())) throw new Error("Connection failed — check PROXMOX_* in .env");
-  console.log("    OK");
+type SshResult = { address: string; ok: boolean; detail: string };
 
-  step(2, "Version");
+/** SSH in as root with the provisioning key and report who/where we are and which IPs traffic leaves from. */
+async function sshCheck(address: string): Promise<SshResult> {
+  try {
+    const ssh = await connectWithRetry({ host: address, username: "root", ...provisioningKey() }, 6);
+    try {
+      const whoami = (await run(ssh, "whoami", "whoami")).trim();
+      const uname = (await run(ssh, "uname", "uname -a")).trim();
+      const egress = (family: 4 | 6) =>
+        run(
+          ssh,
+          `egress IPv${family}`,
+          `curl -${family} -s --max-time 10 https://api${family === 6 ? "6" : ""}.ipify.org ` +
+            `|| wget -${family} -qO- -T 10 https://api${family === 6 ? "6" : ""}.ipify.org || echo unreachable`
+        ).then((s) => s.trim());
+      console.log(`    whoami:   ${whoami}`);
+      console.log(`    uname -a: ${uname}`);
+      console.log(`    outbound IPv4 seen as: ${await egress(4)}`);
+      console.log(`    outbound IPv6 seen as: ${await egress(6)}`);
+      return { address, ok: true, detail: "root login with provisioning key" };
+    } finally {
+      ssh.dispose();
+    }
+  } catch (err) {
+    console.warn(`    ✗ ${message(err)}`);
+    return { address, ok: false, detail: message(err) };
+  }
+}
+
+/** Creates a sudo user with a random password, then proves a password login works. */
+async function createTestUser(address: string): Promise<{ username: string; password: string; loginOk: boolean }> {
+  const username = `user${randomLowerAlnum(6)}`;
+  const password = generatePassword(16);
+
+  const ssh = await connectWithRetry({ host: address, username: "root", ...provisioningKey() }, 3);
+  try {
+    await run(ssh, "create user", `useradd -m -s /bin/bash ${username} && usermod -aG sudo ${username}`);
+    await run(ssh, "set password", "chpasswd", { stdin: `${username}:${password}\n` });
+  } finally {
+    ssh.dispose();
+  }
+
+  let loginOk = false;
+  try {
+    const userSsh = await connectWithRetry({ host: address, username, password }, 2);
+    try {
+      loginOk = (await run(userSsh, "whoami", "whoami")).trim() === username;
+    } finally {
+      userSsh.dispose();
+    }
+  } catch (err) {
+    console.warn(`    ✗ Password login as ${username} failed: ${message(err)}`);
+  }
+  return { username, password, loginOk };
+}
+
+async function askDelete(vmid: number): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await rl.question(`\nDelete test container ${vmid}${WANT_IPV4 ? " and release its Floating IP" : ""}? (y/n) `);
+  rl.close();
+  if (!answer.trim().toLowerCase().startsWith("y")) return false;
+
+  step(`Deleting container ${vmid}...`);
+  await proxmox.deleteLXC(vmid);
+  await syncRoutes();
+  console.log("    Deleted");
+  return true;
+}
+
+async function main() {
+  step("Connecting to Proxmox...");
+  if (!(await proxmox.testConnection())) throw new Error("Connection failed — check PROXMOX_* in .env and that port 8006 is reachable");
   const version = await proxmox.getVersion();
-  console.log(`    Proxmox VE ${version.version} (release ${version.release})`);
+  console.log(`    OK — Proxmox VE ${version.version}`);
 
   if (!(await proxmox.hasOSTemplate(OS))) {
     console.log(`    Template ${proxmox.getTemplateFile(OS)} missing — downloading...`);
     await proxmox.downloadOSTemplate(OS);
   }
 
-  step(3, "Next container ID");
+  step("Next container ID");
   const vmid = await proxmox.getNextVMID();
   console.log(`    ${vmid}`);
 
   const subnet = process.env.PROXMOX_IPV6_SUBNET?.replace(/:+$/, "");
-  const ipv4 = arg("--ipv4");
   const ipv6 = subnet ? `${subnet}::${vmid}` : undefined;
 
-  step(4, `Creating test container ${vmid} (1 core, 2 GB RAM, 20 GB disk, ${OS}) and starting it...`);
-  const started = Date.now();
-  await proxmox.createLXC({
-    vmid,
-    hostname: `sowsi-test-${vmid}`,
-    cores: 1,
-    memory: 2048,
-    diskSize: 20,
-    osTemplate: OS,
-    ipv4,
-    ipv6,
-    start: true,
-  });
-  console.log(`    Created in ${secs(started)}s`);
+  let floatingIp: { id: number; ip: string } | null = null;
+  let created = false;
+  let deleted = false;
 
   try {
-    step(5, "Waiting for running state...");
+    if (WANT_IPV4) {
+      step("Buying Hetzner Floating IP...");
+      floatingIp = await hetzner.buyFloatingIP(`sowsi-test-${vmid}`);
+      console.log(`    ${floatingIp.ip} (id ${floatingIp.id})`);
+
+      step(`Assigning it to Proxmox server ${hetzner.serverId}...`);
+      await hetzner.assignFloatingIP(floatingIp.id);
+      console.log("    Assigned");
+    }
+
+    step(`Creating test container ${vmid} (1 core, 2 GB RAM, 20 GB disk, ${OS}) and starting it...`);
+    const started = Date.now();
+    await proxmox.createLXC({
+      vmid,
+      hostname: `sowsi-test-${vmid}`,
+      cores: 1,
+      memory: 2048,
+      diskSize: 20,
+      osTemplate: OS,
+      ipv4: floatingIp?.ip,
+      ipv6,
+      start: true,
+    });
+    created = true;
+    console.log(`    Created in ${((Date.now() - started) / 1000).toFixed(0)}s`);
+
+    step("Waiting for running state...");
     await proxmox.waitForLXC(vmid);
     console.log("    Running");
 
-    step(6, "Syncing host routes...");
+    step("Routing the container's IPs on the host...");
     await syncRoutes();
 
-    step(7, "Details");
+    const addresses = [ipv6, floatingIp?.ip].filter((a): a is string => Boolean(a));
+    const sshResults: SshResult[] = [];
+    for (const address of addresses) {
+      step(`SSH as root@${address} with the provisioning key...`);
+      sshResults.push(await sshCheck(address));
+    }
+
+    const reachable = sshResults.find((r) => r.ok);
+    let testUser: Awaited<ReturnType<typeof createTestUser>> | null = null;
+    if (reachable) {
+      step(`Creating a test user via ${reachable.address}...`);
+      testUser = await createTestUser(reachable.address);
+    }
+
+    step("Details");
     const status = await proxmox.getLXCStatus(vmid);
     console.table({
       vmid,
       status: status.status,
-      ipv4: ipv4 ?? "(none — pass --ipv4)",
+      ipv4: floatingIp?.ip ?? "(none — run with --ipv4)",
       ipv6: ipv6 ?? "(PROXMOX_IPV6_SUBNET not set)",
       net0: (await proxmox.getLXCNetConfig(vmid)) ?? "",
       cpu: `${(status.cpu * 100).toFixed(1)}%`,
-      memory: `${mb(status.mem)} / ${mb(status.maxmem)} MB`,
-      disk: `${gb(status.disk)} / ${gb(status.maxdisk)} GB`,
+      memory: `${(status.mem / 1024 ** 2).toFixed(0)} / ${(status.maxmem / 1024 ** 2).toFixed(0)} MB`,
+      disk: `${(status.disk / 1024 ** 3).toFixed(1)} / ${(status.maxdisk / 1024 ** 3).toFixed(1)} GB`,
+      ...Object.fromEntries(sshResults.map((r) => [`ssh ${r.address}`, r.ok ? "OK" : `FAILED: ${r.detail}`])),
     });
 
-    const target = ipv4 ?? ipv6;
-    if (target) {
-      console.log(`\n    From another machine, try:  ping ${target}   and   ssh -i <provisioning key> root@${target}`);
+    if (testUser) {
+      console.log("\n    Test user credentials:");
+      console.table({
+        username: testUser.username,
+        password: testUser.password,
+        "password login": testUser.loginOk ? "OK" : "FAILED",
+        ssh: `ssh ${testUser.username}@${reachable!.address}`,
+      });
     }
   } finally {
-    await askDelete(vmid);
+    if (created) {
+      try {
+        deleted = await askDelete(vmid);
+      } catch (err) {
+        console.error(`    ✗ Delete failed: ${message(err)}`);
+      }
+    }
+    if (floatingIp) {
+      if (!created || deleted) {
+        step(`Releasing Floating IP ${floatingIp.ip}...`);
+        await hetzner.releaseFloatingIP(floatingIp.id);
+        console.log("    Released");
+      } else {
+        console.log(
+          `    Floating IP ${floatingIp.ip} (id ${floatingIp.id}) kept with the container — Hetzner keeps billing it.\n` +
+            `    After deleting the container, delete the IP in Hetzner Console → Floating IPs.`
+        );
+      }
+    }
   }
 }
-
-async function askDelete(vmid: number) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(`\n[8] Delete test container ${vmid}? (y/n) `);
-  rl.close();
-
-  if (answer.trim().toLowerCase().startsWith("y")) {
-    step(9, `Deleting container ${vmid}...`);
-    await proxmox.deleteLXC(vmid);
-    await syncRoutes();
-    console.log("    Deleted");
-  } else {
-    console.log(`    Kept. Delete later in the Proxmox UI or with: pct stop ${vmid} && pct destroy ${vmid} --purge`);
-  }
-}
-
-const secs = (since: number) => ((Date.now() - since) / 1000).toFixed(0);
-const mb = (bytes: number) => (bytes / 1024 ** 2).toFixed(0);
-const gb = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
 
 main().catch((err) => {
-  console.error("\n✗", err instanceof Error ? err.message : err);
+  console.error("\n✗", message(err));
   process.exit(1);
 });

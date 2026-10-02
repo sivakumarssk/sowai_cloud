@@ -33,7 +33,7 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function provisioningKey(): { privateKey: string } | { privateKeyPath: string } {
+export function provisioningKey(): { privateKey: string } | { privateKeyPath: string } {
   if (process.env.PROVISIONING_SSH_PRIVATE_KEY_PATH) {
     return { privateKeyPath: process.env.PROVISIONING_SSH_PRIVATE_KEY_PATH };
   }
@@ -44,7 +44,7 @@ function provisioningKey(): { privateKey: string } | { privateKeyPath: string } 
   throw new Error("Set PROVISIONING_SSH_PRIVATE_KEY_PATH or PROVISIONING_SSH_PRIVATE_KEY");
 }
 
-async function connectWithRetry(config: SSHConfig, attempts = SSH_CONNECT_ATTEMPTS): Promise<NodeSSH> {
+export async function connectWithRetry(config: SSHConfig, attempts = SSH_CONNECT_ATTEMPTS): Promise<NodeSSH> {
   let lastError: unknown;
   for (let i = 1; i <= attempts; i++) {
     const ssh = new NodeSSH();
@@ -63,7 +63,7 @@ async function connectWithRetry(config: SSHConfig, attempts = SSH_CONNECT_ATTEMP
   );
 }
 
-async function run(
+export async function run(
   ssh: NodeSSH,
   label: string,
   command: string,
