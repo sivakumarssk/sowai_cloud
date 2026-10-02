@@ -158,7 +158,13 @@ async function main() {
     console.log("    Running");
 
     step("Routing the container's IPs on the host...");
-    await syncRoutes();
+    // Without routes nothing can reach the container, so stop here rather
+    // than wait for SSH to time out.
+    const routes = await vmSetup.syncHostRoutes();
+    console.log(`    ${routes}`);
+    if (/ 0 IPv6/.test(routes) && ipv6) {
+      throw new Error("Host reports 0 IPv6 routes — the container's net0 isn't on vmbr1 or has no ip6=");
+    }
 
     const addresses = [ipv6, floatingIp?.ip].filter((a): a is string => Boolean(a));
     const sshResults: SshResult[] = [];
