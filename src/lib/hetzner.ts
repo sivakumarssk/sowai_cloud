@@ -123,9 +123,23 @@ export class HetznerService {
     await this.waitForAction(action);
   }
 
-  /** Deletes the Floating IP (Hetzner unassigns it automatically). Already-deleted IPs are ignored. */
+  /**
+   * Unassigns the Floating IP if needed, then deletes it. Hetzner refuses to
+   * delete an assigned IP ("must_be_unassigned"). Already-deleted IPs are ignored.
+   */
   async releaseFloatingIP(floatingIpId: number): Promise<void> {
     try {
+      const { floating_ip } = await this.request<{ floating_ip: ApiFloatingIp }>(
+        "get",
+        `/floating_ips/${floatingIpId}`
+      );
+      if (floating_ip.server !== null) {
+        const { action } = await this.request<{ action: HetznerAction }>(
+          "post",
+          `/floating_ips/${floatingIpId}/actions/unassign`
+        );
+        await this.waitForAction(action);
+      }
       await this.request("delete", `/floating_ips/${floatingIpId}`);
     } catch (err) {
       if (err instanceof HetznerError && err.status === 404) return;
