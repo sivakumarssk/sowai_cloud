@@ -53,7 +53,7 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
       data: {
         status: "ACTIVE",
         serverIp: result.serverIp,
-        sshUsername: result.sshUsername,
+        sshUsername: encrypt(result.sshUsername),
         sshPassword: encrypt(result.sshPassword),
         panelUrl: result.panelUrl,
       },

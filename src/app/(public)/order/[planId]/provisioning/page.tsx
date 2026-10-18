@@ -9,16 +9,17 @@ export default async function ProvisioningPage({
   searchParams,
 }: {
   params: Promise<{ planId: string }>;
-  searchParams: Promise<{ orderId?: string }>;
+  searchParams: Promise<{ orderId?: string; serviceId?: string }>;
 }) {
   const { planId } = await params;
-  const { orderId } = await searchParams;
+  const { orderId, serviceId } = await searchParams;
 
   const session = await getSession();
   if (!session) {
-    redirect(`/login?redirect=${encodeURIComponent(`/order/${planId}/provisioning${orderId ? `?orderId=${orderId}` : ""}`)}`);
+    const query = new URLSearchParams({ ...(orderId && { orderId }), ...(serviceId && { serviceId }) }).toString();
+    redirect(`/login?redirect=${encodeURIComponent(`/order/${planId}/provisioning${query ? `?${query}` : ""}`)}`);
   }
   if (!orderId) redirect("/dashboard/services");
 
-  return <ProvisioningClient orderId={orderId} />;
+  return <ProvisioningClient orderId={orderId} initialServiceId={serviceId ?? null} />;
 }

@@ -1,6 +1,7 @@
 import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
+import { formatINR } from "@/lib/pricing";
 
 async function getRevenueData() {
   const payments = await prisma.payment.findMany({
@@ -14,10 +15,10 @@ async function getRevenueData() {
 
   for (const p of payments) {
     const planName = p.service?.plan?.name || "Unknown";
-    planRevenue[planName] = (planRevenue[planName] || 0) + p.amount + p.gstAmount;
+    planRevenue[planName] = (planRevenue[planName] || 0) + p.amount + p.gstAmount + p.processingFee;
 
     const month = new Date(p.createdAt).toLocaleDateString("en-IN", { month: "short", year: "2-digit" });
-    monthlyRevenue[month] = (monthlyRevenue[month] || 0) + p.amount + p.gstAmount;
+    monthlyRevenue[month] = (monthlyRevenue[month] || 0) + p.amount + p.gstAmount + p.processingFee;
   }
 
   return { payments, planRevenue, monthlyRevenue };
@@ -28,8 +29,8 @@ export default async function AdminRevenuePage() {
   if (!session || session.role !== "ADMIN") redirect("/dashboard");
 
   const { payments, planRevenue, monthlyRevenue } = await getRevenueData();
-  const totalRevenue = payments.reduce((sum, p) => sum + p.amount + p.gstAmount, 0);
-  const totalGst = payments.reduce((sum, p) => sum + p.gstAmount, 0);
+  const totalRevenue = payments.reduce((sum, p) => sum + p.amount + p.gstAmount + p.processingFee, 0);
+  const totalFees = payments.reduce((sum, p) => sum + p.processingFee + p.gstAmount, 0);
 
   return (
     <div>
@@ -41,11 +42,11 @@ export default async function AdminRevenuePage() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
         <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-5">
           <p className="text-gray-500 text-xs mb-1 uppercase tracking-wider">Total Revenue</p>
-          <p className="text-3xl font-black text-green-400">₹{totalRevenue.toLocaleString("en-IN")}</p>
+          <p className="text-3xl font-black text-green-400">{formatINR(totalRevenue)}</p>
         </div>
         <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-5">
-          <p className="text-gray-500 text-xs mb-1 uppercase tracking-wider">Total GST Collected</p>
-          <p className="text-3xl font-black text-white">₹{totalGst.toLocaleString("en-IN")}</p>
+          <p className="text-gray-500 text-xs mb-1 uppercase tracking-wider">Processing Charges Collected</p>
+          <p className="text-3xl font-black text-white">{formatINR(totalFees)}</p>
         </div>
         <div className="bg-[#111827] border border-[#1F2937] rounded-xl p-5">
           <p className="text-gray-500 text-xs mb-1 uppercase tracking-wider">Total Transactions</p>
@@ -66,7 +67,7 @@ export default async function AdminRevenuePage() {
                   <div key={plan}>
                     <div className="flex justify-between text-sm mb-1">
                       <span className="text-gray-300">{plan}</span>
-                      <span className="text-white font-semibold">₹{amount.toLocaleString("en-IN")}</span>
+                      <span className="text-white font-semibold">{formatINR(amount)}</span>
                     </div>
                     <div className="h-2 bg-[#1F2937] rounded-full overflow-hidden">
                       <div className="h-full bg-gradient-to-r from-purple-600 to-purple-400 rounded-full" style={{ width: `${pct}%` }} />
@@ -84,7 +85,7 @@ export default async function AdminRevenuePage() {
             {Object.entries(monthlyRevenue).map(([month, amount]) => (
               <div key={month} className="flex justify-between items-center">
                 <span className="text-gray-400 text-sm">{month}</span>
-                <span className="text-white text-sm font-semibold">₹{amount.toLocaleString("en-IN")}</span>
+                <span className="text-white text-sm font-semibold">{formatINR(amount)}</span>
               </div>
             ))}
           </div>
@@ -105,7 +106,7 @@ export default async function AdminRevenuePage() {
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Plan</th>
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Date</th>
                 <th className="text-right px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Amount</th>
-                <th className="text-right px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">GST</th>
+                <th className="text-right px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Processing</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#1F2937]">
@@ -121,10 +122,10 @@ export default async function AdminRevenuePage() {
                     {new Date(p.createdAt).toLocaleDateString("en-IN")}
                   </td>
                   <td className="px-6 py-4 text-white text-sm font-semibold text-right">
-                    ₹{p.amount.toLocaleString("en-IN")}
+                    {formatINR(p.amount)}
                   </td>
                   <td className="px-6 py-4 text-gray-400 text-sm text-right">
-                    ₹{p.gstAmount.toLocaleString("en-IN")}
+                    {formatINR(p.processingFee + p.gstAmount)}
                   </td>
                 </tr>
               ))}

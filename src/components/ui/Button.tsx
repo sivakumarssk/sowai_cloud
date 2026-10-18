@@ -22,23 +22,21 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     ref
   ) => {
     const base =
-      "inline-flex items-center justify-center font-semibold rounded-lg transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-[#0A0F1E] disabled:opacity-50 disabled:cursor-not-allowed";
+      "inline-flex items-center justify-center font-semibold rounded-lg cursor-pointer select-none transition-[background-color,border-color,color,box-shadow,transform] duration-150 ease-out active:translate-y-px disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-y-0";
 
     const variants = {
       primary:
-        "bg-[#1B4FE8] hover:bg-[#1540C4] text-white focus:ring-[#1B4FE8]",
+        "bg-primary text-on-primary shadow-sm shadow-primary/30 hover:bg-primary-hover hover:shadow-md hover:shadow-primary/30 active:bg-primary-active active:shadow-none",
       secondary:
-        "bg-[#111827] border border-[#374151] hover:border-[#1B4FE8] hover:bg-[#1B4FE8]/10 text-white focus:ring-[#374151]",
-      ghost:
-        "bg-transparent hover:bg-white/5 text-gray-400 hover:text-white focus:ring-transparent",
-      danger:
-        "bg-red-600 hover:bg-red-700 text-white focus:ring-red-500",
+        "bg-surface border border-line-strong text-fg hover:border-fg-subtle hover:bg-surface-2 active:bg-canvas",
+      ghost: "bg-transparent text-fg-muted hover:bg-surface-2 hover:text-fg active:bg-canvas",
+      danger: "bg-danger-fill text-on-primary hover:bg-red-700 active:bg-red-800",
     };
 
     const sizes = {
-      sm: "text-sm px-3 py-1.5 gap-1.5",
-      md: "text-sm px-4 py-2.5 gap-2",
-      lg: "text-base px-6 py-3 gap-2",
+      sm: "text-sm h-8 px-3 gap-1.5",
+      md: "text-sm h-10 px-4 gap-2",
+      lg: "text-base h-12 px-6 gap-2",
     };
 
     return (

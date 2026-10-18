@@ -2,6 +2,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { formatINR } from "@/lib/pricing";
 
 async function getAdminStats() {
   const now = new Date();
@@ -20,7 +21,7 @@ async function getAdminStats() {
     prisma.ticket.count({ where: { status: { in: ["OPEN", "IN_PROGRESS"] } } }),
     prisma.payment.aggregate({
       where: { status: "SUCCESS", createdAt: { gte: firstOfMonth } },
-      _sum: { amount: true, gstAmount: true },
+      _sum: { amount: true, gstAmount: true, processingFee: true },
     }),
     prisma.user.findMany({
       where: { role: "CLIENT" },
@@ -32,7 +33,7 @@ async function getAdminStats() {
     prisma.payment.groupBy({
       by: ["createdAt"],
       where: { status: "SUCCESS" },
-      _sum: { amount: true, gstAmount: true },
+      _sum: { amount: true, gstAmount: true, processingFee: true },
     }),
   ]);
 
@@ -41,7 +42,7 @@ async function getAdminStats() {
     activeServices,
     openTickets,
     monthlyRevenue:
-      (monthlyRevenue._sum.amount || 0) + (monthlyRevenue._sum.gstAmount || 0),
+      (monthlyRevenue._sum.amount || 0) + (monthlyRevenue._sum.gstAmount || 0) + (monthlyRevenue._sum.processingFee || 0),
     recentSignups,
   };
 }
@@ -55,7 +56,7 @@ export default async function AdminPage() {
   const statCards = [
     {
       label: "Monthly Revenue",
-      value: `₹${stats.monthlyRevenue.toLocaleString("en-IN")}`,
+      value: formatINR(stats.monthlyRevenue),
       color: "text-green-400",
       icon: "💰",
     },

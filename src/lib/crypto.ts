@@ -42,12 +42,13 @@ export function decryptNullable(value: string | null): string | null {
   return value === null ? null : decrypt(value);
 }
 
-/** Replaces sshPassword / panelPassword with their decrypted values for API responses. */
-export function withDecryptedCredentials<T extends { sshPassword: string | null; panelPassword: string | null }>(
-  service: T
-): T {
+/** Replaces sshUsername / sshPassword / panelPassword with their decrypted values for API responses. */
+export function withDecryptedCredentials<
+  T extends { sshUsername: string | null; sshPassword: string | null; panelPassword: string | null },
+>(service: T): T {
   return {
     ...service,
+    sshUsername: decryptNullable(service.sshUsername),
     sshPassword: decryptNullable(service.sshPassword),
     panelPassword: decryptNullable(service.panelPassword),
   };

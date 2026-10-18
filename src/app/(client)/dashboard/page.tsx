@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import type { ServiceStatus } from "@prisma/client";
+import { formatINR } from "@/lib/pricing";
 
 async function getDashboardData(userId: string) {
   const [services, payments, notifications] = await Promise.all([
@@ -189,7 +190,7 @@ export default async function DashboardPage() {
                   </div>
                   <div className="text-right shrink-0 ml-2">
                     <p className="text-white text-sm font-semibold">
-                      ₹{(payment.amount + payment.gstAmount).toLocaleString("en-IN")}
+                      {formatINR(payment.amount + payment.gstAmount + payment.processingFee)}
                     </p>
                     <span className="text-green-400 text-xs">Paid</span>
                   </div>

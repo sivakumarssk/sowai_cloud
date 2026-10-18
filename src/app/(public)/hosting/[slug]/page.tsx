@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
+import { toPublicPlan } from "@/lib/plans";
 import { HOSTING_STACKS, getStackBySlug } from "@/lib/hostingStacks";
 import StackClient from "./StackClient";
 
@@ -31,21 +32,11 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
 
 async function getPlans(category: string) {
   try {
-    return await prisma.plan.findMany({
-      where: { isActive: true, category: category as never, tier: "STANDARD" },
-      orderBy: [{ price: "asc" }],
+    const plans = await prisma.plan.findMany({
+      where: { isActive: true, isDedicated: false, category: category as never },
+      orderBy: [{ sortOrder: "asc" }],
     });
-  } catch {
-    return [];
-  }
-}
-
-async function getDedicatedPlans() {
-  try {
-    return await prisma.plan.findMany({
-      where: { isActive: true, category: "DEDICATED" },
-      orderBy: [{ price: "asc" }],
-    });
+    return plans.map(toPublicPlan);
   } catch {
     return [];
   }
@@ -56,7 +47,7 @@ export default async function HostingStackPage({ params }: { params: Promise<{ s
   const stack = getStackBySlug(slug);
   if (!stack) notFound();
 
-  const plans = stack.category === "DEDICATED" ? await getDedicatedPlans() : await getPlans(stack.category);
+  const plans = await getPlans(stack.category);
 
   return <StackClient stack={stack} plans={plans} />;
 }

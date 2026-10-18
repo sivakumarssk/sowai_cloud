@@ -56,4 +56,4 @@ export function generateInvoiceNumber(): string {
   return `INV-${year}${month}-${random}`;
 }
 
-export { calculateGST } from "@/lib/pricing";
+

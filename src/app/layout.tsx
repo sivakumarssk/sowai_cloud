@@ -1,11 +1,19 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import AuthSessionSync from "@/components/AuthSessionSync";
 import "./globals.css";
 
-const inter = Inter({
+// Fonts per DESIGN.md §3: Plex for UI, JetBrains Mono for IPs, hostnames and specs.
+const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
-  variable: "--font-inter",
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-plex-sans",
+  display: "swap",
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains-mono",
   display: "swap",
 });
 
@@ -31,8 +39,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable} h-full`}>
-      <body className="min-h-full bg-[#0A0F1E] text-white antialiased">
+    <html lang="en" className={`${plexSans.variable} ${jetbrainsMono.variable} h-full`}>
+      <body className="min-h-full bg-canvas text-fg font-sans antialiased">
         <AuthSessionSync />
         {children}
       </body>

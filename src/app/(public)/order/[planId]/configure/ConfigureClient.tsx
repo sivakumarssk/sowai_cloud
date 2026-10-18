@@ -1,76 +1,83 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Navbar from "@/components/landing/Navbar";
-import { REGIONS, DEFAULT_REGION, OS_IMAGES, DEFAULT_OS, getPresetsForCategory } from "@/lib/provisioning/catalog";
-import { categoryLabel, isBillingCycle } from "@/lib/pricing";
+import { Button } from "@/components/ui/Button";
+import { RadioDot, selectCardClass } from "@/components/ui/selection";
+import { OrderSteps } from "@/components/order/OrderSteps";
+import { OrderSummary, MobileOrderBar, PaymentNote } from "@/components/order/OrderSummary";
+import { configureStepHref, planStepHref } from "@/lib/orderFlow";
+import {
+  REGIONS,
+  DEFAULT_REGION,
+  OS_IMAGES,
+  getOsImage,
+  getPresetsForCategory,
+  hostnameError,
+  normalizeHostname,
+} from "@/lib/provisioning/catalog";
+import { type CycleKey, type PricedAddon, type PublicPlan, quotePrice, resolveAddons } from "@/lib/pricing";
 
-type PlanData = {
-  id: string;
-  name: string;
-  category: string;
-  tier: string;
-  price: number;
-};
-
-type Addon = {
-  id: string;
-  name: string;
-  description: string;
-  price: number;
-  icon: string;
-};
-
-const ADDONS: Addon[] = [
-  { id: "coolify",  name: "Coolify Panel",   description: "One-click app deployment panel", price: 99,  icon: "🚀" },
-  { id: "backups",  name: "Daily Backups",   description: "Automated daily backups with 30-day retention", price: 199, icon: "💾" },
-  { id: "extra-ip", name: "Extra IP Address", description: "Additional dedicated IPv4 address", price: 149, icon: "🌐" },
-];
-
-export default function ConfigureClient({ plan }: { plan: PlanData }) {
+export default function ConfigureClient({
+  plan,
+  addons,
+  returning,
+  cycle,
+  chosenAddonSlugs,
+  initialHostname,
+  initialStack,
+  initialOs,
+}: {
+  plan: PublicPlan;
+  addons: PricedAddon[];
+  returning: boolean;
+  cycle: CycleKey;
+  chosenAddonSlugs: string[];
+  initialHostname: string;
+  initialStack: string;
+  initialOs: string;
+}) {
   const router = useRouter();
-  const searchParams = useSearchParams();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const isStorage = plan.category === "STORAGE";
+  const nameKind = isStorage ? "Bucket name" : "Hostname";
 
-  const cycleParam = Number(searchParams.get("cycle") || 12);
-  const billingCycle = isBillingCycle(cycleParam) ? cycleParam : 12;
-  const addonsParam = searchParams.get("addons");
-  const initialAddons = useMemo(
-    () => new Set((addonsParam ? addonsParam.split(",") : []).filter(Boolean)),
-    [addonsParam]
-  );
-
+  const chosenAddons = resolveAddons(addons, chosenAddonSlugs, plan.category);
+  const quote = quotePrice(plan, cycle, chosenAddons, { returning });
   const presets = getPresetsForCategory(plan.category);
+  const region = REGIONS.find((r) => r.value === DEFAULT_REGION)!;
 
-  const [region] = useState(DEFAULT_REGION);
-  const [stackPreset, setStackPreset] = useState(presets[0]?.value || "plain");
-  const [osImage, setOsImage] = useState(DEFAULT_OS);
-  const [hostname, setHostname] = useState("");
-  const [enabledAddons, setEnabledAddons] = useState<Set<string>>(initialAddons);
+  const [stackPreset, setStackPreset] = useState(initialStack);
+  const [osImage, setOsImage] = useState(initialOs);
+  const [hostname, setHostname] = useState(normalizeHostname(initialHostname));
+  const [touched, setTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const activePreset = presets.find((p) => p.value === stackPreset) || presets[0];
   const lockedOs = activePreset?.lockedOs ?? null;
+  const nameError = hostnameError(hostname, nameKind);
+  const showNameError = touched && !!nameError;
 
-  function toggleAddon(id: string) {
-    setEnabledAddons((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  function validHostname(value: string) {
-    return /^[a-zA-Z0-9-]{3,63}$/.test(value);
+  // Mirror choices into the URL so Back from checkout (or a refresh) keeps them.
+  function sync(next: { hostname?: string; stack?: string; os?: string }) {
+    const choices = {
+      cycle,
+      addons: chosenAddonSlugs,
+      hostname: next.hostname ?? hostname,
+      stack: next.stack ?? stackPreset,
+      os: next.os ?? osImage,
+    };
+    window.history.replaceState(null, "", configureStepHref(plan.slug, choices));
   }
 
   async function handleContinue() {
-    setError(null);
-    if (!validHostname(hostname)) {
-      setError("Hostname must be 3-63 characters — letters, numbers, and hyphens only.");
+    setSubmitError(null);
+    setTouched(true);
+    if (nameError) {
+      inputRef.current?.focus();
       return;
     }
 
@@ -81,9 +88,9 @@ export default function ConfigureClient({ plan }: { plan: PlanData }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           planId: plan.id,
-          billingCycle,
-          addons: Array.from(enabledAddons),
-          region,
+          billingCycle: cycle,
+          addons: chosenAddons.map((a) => a.slug),
+          region: region.value,
           osImage: lockedOs || osImage,
           stackPreset: activePreset?.value,
           hostname,
@@ -91,174 +98,214 @@ export default function ConfigureClient({ plan }: { plan: PlanData }) {
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setError(data.error || "Something went wrong. Please try again.");
+        setSubmitError(data.error || "Something went wrong. Please try again.");
         setSubmitting(false);
         return;
       }
-      router.push(`/order/${plan.id}/checkout?orderId=${data.data.orderId}`);
+      router.push(`/order/${plan.slug}/checkout?orderId=${data.data.orderId}`);
     } catch {
-      setError("Network error. Please try again.");
+      setSubmitError("Couldn't reach Sowsi Cloud. Check your connection and try again.");
       setSubmitting(false);
     }
   }
 
+  const planHref = planStepHref(plan.slug, { cycle, addons: chosenAddonSlugs });
+
   return (
-    <div style={{ background: "linear-gradient(135deg, #0B1120 0%, #0F172A 50%, #0B1120 100%)", minHeight: "100vh" }}>
+    <div className="min-h-screen bg-canvas pb-24 lg:pb-0">
       <Navbar />
 
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-2 text-sm mb-8 flex-wrap">
-          <Link href="/pricing" className="text-gray-500 hover:text-gray-300 transition-colors">Pricing</Link>
-          <span className="text-gray-600">→</span>
-          <Link href={`/order/${plan.id}`} className="text-gray-500 hover:text-gray-300 transition-colors">{plan.name}</Link>
-          <span className="text-gray-600">→</span>
-          <span className="text-white font-medium">Configure</span>
-        </div>
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
+        <OrderSteps current="Configure" hrefs={{ Plan: planHref }} />
 
-        <h1 className="text-2xl sm:text-3xl font-bold text-white mb-1">Configure your server</h1>
-        <p className="text-gray-400 text-sm mb-8">
-          {categoryLabel[plan.category] ?? plan.category} · {plan.name}
-        </p>
-
-        <div className="flex flex-col gap-8">
-          {/* Region */}
-          <div>
-            <h3 className="text-white font-semibold text-lg mb-3">Region</h3>
-            <select
-              value={region}
-              disabled
-              className="w-full sm:w-auto px-4 py-3 rounded-xl text-sm text-white bg-white/5 border border-white/10 disabled:opacity-80"
-            >
-              {REGIONS.map((r) => (
-                <option key={r.value} value={r.value} className="bg-[#111827]">{r.label}</option>
-              ))}
-            </select>
-            <p className="text-gray-500 text-xs mt-2">More regions coming soon.</p>
-          </div>
-
-          {/* Stack preset */}
-          {presets.length > 1 && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-2 flex flex-col gap-8">
             <div>
-              <h3 className="text-white font-semibold text-lg mb-3">Server Type</h3>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {presets.map((p) => {
-                  const isSelected = stackPreset === p.value;
-                  return (
-                    <button
-                      key={p.value}
-                      onClick={() => setStackPreset(p.value)}
-                      className="rounded-xl p-4 text-left transition-all duration-200"
-                      style={{
-                        background: isSelected ? "rgba(27,79,232,0.12)" : "rgba(255,255,255,0.03)",
-                        border: isSelected ? "2px solid #1B4FE8" : "1px solid rgba(255,255,255,0.08)",
-                      }}
-                    >
-                      <p className={`text-sm font-semibold mb-1 ${isSelected ? "text-white" : "text-gray-300"}`}>{p.label}</p>
-                      <p className="text-xs text-gray-500">{p.description}</p>
-                    </button>
-                  );
-                })}
-              </div>
+              <h1 className="text-2xl font-semibold text-fg">{isStorage ? "Set up your storage" : "Configure your server"}</h1>
+              <p className="text-fg-muted text-sm mt-1">
+                {isStorage ? "Give your bucket a name." : "Name your server and choose what to install."}
+              </p>
             </div>
-          )}
 
-          {/* OS image */}
-          <div>
-            <h3 className="text-white font-semibold text-lg mb-3">Operating System</h3>
-            {lockedOs ? (
-              <div className="rounded-xl p-4" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}>
-                <p className="text-white text-sm font-medium">{OS_IMAGES.find((o) => o.value === lockedOs)?.label}</p>
-                <p className="text-gray-500 text-xs mt-1">Locked to this OS for the {activePreset?.label} preset.</p>
+            {/* Hostname — the one required field goes first */}
+            <section>
+              <label htmlFor="hostname" className="block text-fg font-semibold text-lg mb-1">
+                {nameKind}
+              </label>
+              <p id="hostname-help" className="text-sm text-fg-muted mb-3">
+                Lowercase letters, numbers and hyphens.
+              </p>
+              <input
+                ref={inputRef}
+                id="hostname"
+                type="text"
+                inputMode="url"
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                maxLength={63}
+                value={hostname}
+                onChange={(e) => {
+                  const v = e.target.value.toLowerCase().replace(/\s+/g, "-");
+                  setHostname(v);
+                  sync({ hostname: v });
+                }}
+                onBlur={() => hostname && setTouched(true)}
+                placeholder={isStorage ? "my-app-assets" : "my-app-server"}
+                aria-invalid={showNameError}
+                aria-describedby={showNameError ? "hostname-error hostname-help" : "hostname-help"}
+                className={`w-full sm:max-w-md h-11 px-3.5 rounded-lg font-mono text-sm text-fg bg-canvas border placeholder:text-fg-subtle focus:outline-none transition-colors duration-150 ${
+                  showNameError ? "border-danger focus:border-danger" : "border-line-strong focus:border-link"
+                }`}
+              />
+              {showNameError && (
+                <p id="hostname-error" className="flex items-center gap-1.5 text-sm text-danger mt-2">
+                  <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  {nameError}
+                </p>
+              )}
+            </section>
+
+            {/* Server type */}
+            {!isStorage && presets.length > 1 && (
+              <section aria-labelledby="stack-heading">
+                <h2 id="stack-heading" className="text-fg font-semibold text-lg mb-3">
+                  What should we install?
+                </h2>
+                <div role="radiogroup" aria-labelledby="stack-heading" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {presets.map((p) => {
+                    const isSelected = stackPreset === p.value;
+                    return (
+                      <button
+                        key={p.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={isSelected}
+                        onClick={() => {
+                          setStackPreset(p.value);
+                          sync({ stack: p.value });
+                        }}
+                        className={selectCardClass(isSelected)}
+                      >
+                        <span className="flex items-center gap-2.5 mb-1">
+                          <RadioDot checked={isSelected} />
+                          <span className="text-sm font-semibold text-fg">{p.label}</span>
+                        </span>
+                        <span className="block text-xs text-fg-muted pl-7">{p.description}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
+            {/* OS image */}
+            {!isStorage && (
+              <section aria-labelledby="os-heading">
+                <h2 id="os-heading" className="text-fg font-semibold text-lg mb-3">
+                  Operating system
+                </h2>
+                {lockedOs ? (
+                  <div className="rounded-xl bg-surface border border-line p-4">
+                    <p className="text-fg text-sm font-medium">{getOsImage(lockedOs)?.label}</p>
+                    <p className="text-fg-muted text-xs mt-1">Included with {activePreset?.label}.</p>
+                  </div>
+                ) : (
+                  <div role="radiogroup" aria-labelledby="os-heading" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {OS_IMAGES.map((os) => {
+                      const isSelected = osImage === os.value;
+                      return (
+                        <button
+                          key={os.value}
+                          type="button"
+                          role="radio"
+                          aria-checked={isSelected}
+                          onClick={() => {
+                            setOsImage(os.value);
+                            sync({ os: os.value });
+                          }}
+                          className={`${selectCardClass(isSelected)} flex items-center gap-2.5`}
+                        >
+                          <RadioDot checked={isSelected} />
+                          <span className="text-sm font-medium text-fg">{os.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* Location — one region for now, so state it rather than show a disabled picker */}
+            <section aria-labelledby="region-heading">
+              <h2 id="region-heading" className="text-fg font-semibold text-lg mb-3">
+                Location
+              </h2>
+              <div className="rounded-xl bg-surface border border-line p-4 flex items-center gap-3">
+                <svg className="w-5 h-5 text-link shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M17.657 16.657L13.414 20.9a2 2 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                <p className="text-sm font-medium text-fg">{region.label}</p>
               </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {OS_IMAGES.map((os) => {
-                  const isSelected = osImage === os.value;
-                  return (
-                    <button
-                      key={os.value}
-                      onClick={() => setOsImage(os.value)}
-                      className="rounded-xl p-4 text-left text-sm font-medium transition-all duration-200"
-                      style={{
-                        background: isSelected ? "rgba(27,79,232,0.12)" : "rgba(255,255,255,0.03)",
-                        border: isSelected ? "2px solid #1B4FE8" : "1px solid rgba(255,255,255,0.08)",
-                        color: isSelected ? "#fff" : "#D1D5DB",
-                      }}
-                    >
-                      {os.label}
-                    </button>
-                  );
-                })}
+            </section>
+
+            {/* Add-ons (chosen on the plan step) */}
+            <section aria-labelledby="addons-heading">
+              <div className="flex items-center justify-between mb-3">
+                <h2 id="addons-heading" className="text-fg font-semibold text-lg">
+                  Add-ons
+                </h2>
+                <Link href={planHref} className="text-sm font-medium text-link hover:underline">
+                  Change
+                </Link>
               </div>
+              {chosenAddons.length === 0 ? (
+                <p className="text-sm text-fg-muted">None selected.</p>
+              ) : (
+                <ul className="flex flex-col gap-2">
+                  {chosenAddons.map((a) => (
+                    <li key={a.slug} className="text-sm rounded-lg bg-surface border border-line px-4 py-3 text-fg">
+                      {a.name}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            {submitError && (
+              <p role="alert" className="lg:hidden text-sm text-danger rounded-lg bg-danger/10 border border-danger/30 px-3 py-2.5">
+                {submitError}
+              </p>
             )}
           </div>
 
-          {/* Hostname */}
-          <div>
-            <h3 className="text-white font-semibold text-lg mb-3">Hostname</h3>
-            <input
-              type="text"
-              value={hostname}
-              onChange={(e) => setHostname(e.target.value)}
-              placeholder="e.g. my-app-server"
-              className="w-full px-4 py-3 rounded-xl text-sm text-white bg-white/5 border border-white/10 placeholder:text-gray-600 focus:outline-none focus:border-[#1B4FE8]"
-            />
-            <p className="text-gray-500 text-xs mt-2">Letters, numbers, and hyphens only. You can point a domain to this later.</p>
-          </div>
-
-          {/* Add-ons */}
-          <div>
-            <h3 className="text-white font-semibold text-lg mb-3">Add-ons</h3>
-            <div className="flex flex-col gap-3">
-              {ADDONS.map((addon) => {
-                const isOn = enabledAddons.has(addon.id);
-                return (
-                  <button
-                    key={addon.id}
-                    onClick={() => toggleAddon(addon.id)}
-                    className="rounded-xl p-4 flex items-center gap-4 text-left transition-all duration-200 w-full"
-                    style={{
-                      background: isOn ? "rgba(27,79,232,0.08)" : "rgba(255,255,255,0.03)",
-                      border: isOn ? "1px solid rgba(27,79,232,0.4)" : "1px solid rgba(255,255,255,0.08)",
-                    }}
-                  >
-                    <div className="w-11 h-6 rounded-full p-0.5 transition-colors shrink-0"
-                      style={{ background: isOn ? "#1B4FE8" : "rgba(255,255,255,0.1)" }}>
-                      <div className="w-5 h-5 rounded-full bg-white transition-transform"
-                        style={{ transform: isOn ? "translateX(20px)" : "translateX(0)" }} />
-                    </div>
-                    <span className="text-2xl shrink-0">{addon.icon}</span>
-                    <div className="flex-1 min-w-0">
-                      <p className={`text-sm font-semibold ${isOn ? "text-white" : "text-gray-300"}`}>{addon.name}</p>
-                      <p className="text-xs text-gray-500">{addon.description}</p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-white">₹{addon.price.toLocaleString("en-IN")}</p>
-                      <p className="text-xs text-gray-500">/month</p>
-                    </div>
-                  </button>
-                );
-              })}
+          {/* ── Summary ── */}
+          <aside className="lg:col-span-1" aria-label="Order summary">
+            <div className="lg:sticky lg:top-24">
+              <OrderSummary planName={plan.name} quote={quote}>
+                {submitError && (
+                  <p role="alert" className="hidden lg:block mt-5 text-sm text-danger rounded-lg bg-danger/10 border border-danger/30 px-3 py-2.5">
+                    {submitError}
+                  </p>
+                )}
+                <Button size="lg" className="w-full mt-5" onClick={handleContinue} loading={submitting}>
+                  Continue to payment
+                </Button>
+                <PaymentNote />
+              </OrderSummary>
             </div>
-          </div>
-
-          {error && (
-            <p className="text-sm text-red-400 rounded-lg px-4 py-3" style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.25)" }}>
-              {error}
-            </p>
-          )}
-
-          <button
-            onClick={handleContinue}
-            disabled={submitting || !hostname}
-            className="w-full sm:w-auto self-end px-8 py-3.5 rounded-xl font-semibold text-white text-sm transition-all hover:opacity-90 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
-            style={{ background: "linear-gradient(135deg, #1B4FE8, #0EA5E9)", boxShadow: "0 4px 20px rgba(27,79,232,0.35)" }}
-          >
-            {submitting ? "Saving..." : "Continue to Payment"}
-          </button>
+          </aside>
         </div>
       </div>
+
+      <MobileOrderBar total={quote.total}>
+        <Button size="lg" onClick={handleContinue} loading={submitting}>
+          Continue to payment
+        </Button>
+      </MobileOrderBar>
     </div>
   );
 }

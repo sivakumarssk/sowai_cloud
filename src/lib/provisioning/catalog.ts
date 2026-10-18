@@ -86,3 +86,20 @@ export function getOsImage(value: string): OsImage | undefined {
 export function getRegion(value: string): Region | undefined {
   return REGIONS.find((r) => r.value === value);
 }
+
+/** Server hostnames and bucket names: 3-63 lowercase letters, digits and hyphens, not starting or ending with a hyphen. */
+export const HOSTNAME_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
+
+/** Hostnames are case-insensitive and bucket names must be lowercase, so normalise instead of rejecting. */
+export function normalizeHostname(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** Why a (normalised) hostname is invalid, or null when it's fine. */
+export function hostnameError(value: string, kind = "Hostname"): string | null {
+  if (!value) return `${kind} is required.`;
+  if (value.length < 3 || value.length > 63) return `${kind} must be 3-63 characters long.`;
+  if (/[^a-z0-9-]/.test(value)) return `Use only letters, numbers and hyphens.`;
+  if (!HOSTNAME_PATTERN.test(value)) return `${kind} can't start or end with a hyphen.`;
+  return null;
+}

@@ -43,6 +43,19 @@ enum PaymentStatus {
   REFUNDED
 }
 
+/// Mirrors Razorpay subscription states.
+enum SubscriptionStatus {
+  CREATED
+  AUTHENTICATED
+  ACTIVE
+  PENDING
+  HALTED
+  PAUSED
+  CANCELLED
+  COMPLETED
+  EXPIRED
+}
+
 enum OrderStatus {
   DRAFT
   AWAITING_PAYMENT
@@ -81,63 +94,112 @@ model User {
   tickets       Ticket[]
   notifications Notification[]
   orders        Order[]
+  subscriptions Subscription[]
 
   @@index([email])
 }
 
 model Plan {
   id           String       @id @default(cuid())
+  /// URL key, e.g. "VPS_PRO" → /order/VPS_PRO
+  slug         String?      @unique
   name         String
   category     PlanCategory
   tier         PlanTier     @default(STANDARD)
+  /// Legacy 1-year monthly price (paise). Superseded by the price* fields below.
   price        Int
   billingCycle String       @default("monthly")
+  /// Feature bullet list shown on the pricing card (string array).
   features     Json
   isActive     Boolean      @default(true)
+  isPopular    Boolean      @default(false)
+  /// Guaranteed (non-shared) resources, flat monthly price, shown on the Dedicated tab.
+  /// Dedicated plans bill a flat priceMonthly (= renewal); their priceIntro1Year /
+  /// priceIntro2Year are term discounts available to every customer.
+  isDedicated  Boolean      @default(false)
+  sortOrder    Int          @default(0)
   createdAt    DateTime     @default(now())
+
+  // ── Pricing — all in PAISE per month (₹599 = 59900) ──
+  /// Pay-monthly price.
+  priceMonthly    Int?
+  /// Introductory monthly rate when paying 1 year upfront (new customers).
+  priceIntro1Year Int?
+  /// Introductory monthly rate when paying 2 years upfront (new customers).
+  priceIntro2Year Int?
+  /// Monthly rate after the intro term, and for returning customers.
+  priceRenewal    Int?
+
+  // ── Specs (pricing cards, provisioning) ──
+  vcpu        Int?
+  ramGB       Int?
+  storageGB   Int?
+  bandwidthTB Int?
 
   services Service[]
   orders   Order[]
 
   @@index([category, tier])
+  @@index([isDedicated])
 }
 
 model Service {
-  id              String        @id @default(cuid())
-  userId          String
-  planId          String
-  orderId         String?       @unique
-  status          ServiceStatus @default(PENDING)
-  hostname        String?
-  region          String        @default("eu-nuremberg")
-  osImage         String?
-  stackPreset     String?
-  serverIp        String?
-  ipv6Address     String?
+  id                  String        @id @default(cuid())
+  userId              String
+  planId              String
+  orderId             String?       @unique
+  status              ServiceStatus @default(PENDING)
+  hostname            String?
+  region              String        @default("eu-nuremberg")
+  osImage             String?
+  stackPreset         String?
+  serverIp            String?
+  ipv6Address         String?
   hetznerFloatingIpId String?
-  sshUsername     String?
-  sshPassword     String?
-  panelUrl        String?
+  sshUsername         String?
+  sshPassword         String?
+  panelUrl            String?
   /// AES-256-GCM encrypted (see src/lib/crypto.ts)
-  panelPassword   String?
-  hasCoolify      Boolean       @default(false)
-  proxmoxVmId     String?
-  provisioningStep String?
-  provisioningPct Int           @default(0)
-  provisionError  String?
-  startDate       DateTime      @default(now())
-  nextBillingDate DateTime
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  panelPassword       String?
+  hasCoolify          Boolean       @default(false)
+  proxmoxVmId         String?
+  provisioningStep    String?
+  provisioningPct     Int           @default(0)
+  provisionError      String?
+  startDate           DateTime      @default(now())
+  /// End of the paid period; autopay renewals move it forward.
+  nextBillingDate     DateTime
+  suspendedAt         DateTime?
+  /// "BILLING" when suspended for non-payment (auto-resumed on payment, deleted after the grace period).
+  suspendReason       String?
 
-  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  plan     Plan      @relation(fields: [planId], references: [id])
-  order    Order?    @relation(fields: [orderId], references: [id])
-  payments Payment[]
-  tickets  Ticket[]
+  // ── Resource engine ──
+  /// Proxmox node the container runs on.
+  nodeId              String?
+  /// Current container limits; may exceed the plan after automatic scaling. Null = plan size.
+  allocatedRamMB      Int?
+  allocatedDiskGB     Int?
+  lastRamExpansionAt  DateTime?
+  lastDiskExpansionAt DateTime?
+  lastMigratedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          Plan             @relation(fields: [planId], references: [id])
+  order         Order?           @relation(fields: [orderId], references: [id])
+  node          ProxmoxNode?     @relation(fields: [nodeId], references: [id])
+  payments      Payment[]
+  tickets       Ticket[]
+  subscriptions Subscription[]
+  metrics       ResourceMetric[]
+  overages      Overage[]
+  migrations    Migration[]
 
   @@index([userId])
   @@index([status])
+  @@index([nodeId])
 }
 
 model Order {
@@ -151,18 +213,98 @@ model Order {
   osImage       String?
   stackPreset   String?
   hostname      String?
+  /// First term, excl. GST, in paise.
   amount        Int
+  /// In paise. 0 while the business isn't GST-registered.
   gstAmount     Int         @default(0)
+  /// Payment processing charge on the first term, in paise.
+  processingFee Int         @default(0)
+  /// True when the first term was charged at the intro rate.
+  isIntroPrice  Boolean     @default(false)
+  /// Monthly autopay amount after the first term (plan renewal rate + addons), excl. GST, in paise.
+  renewalAmount Int?
+  /// Price breakdown shown to the customer at order time (see PriceQuote in src/lib/pricing.ts).
+  quote         Json?
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
-  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  plan    Plan     @relation(fields: [planId], references: [id])
-  payments Payment[]
-  service Service?
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          Plan           @relation(fields: [planId], references: [id])
+  payments      Payment[]
+  service       Service?
+  subscriptions Subscription[]
 
   @@index([userId])
   @@index([status])
+}
+
+/// Optional extras priced per month and charged for the whole billing cycle.
+model Addon {
+  id             String         @id @default(cuid())
+  /// Stable key used in orders and the API, e.g. "dailyBackup"
+  slug           String         @unique
+  name           String
+  description    String
+  /// Monthly price in PAISE.
+  priceMonthly   Int
+  /// Plan categories the addon can be added to.
+  categories     PlanCategory[]
+  /// Addons sharing a group are mutually exclusive (e.g. daily vs weekly backup).
+  exclusiveGroup String?
+  isActive       Boolean        @default(true)
+  sortOrder      Int            @default(0)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+}
+
+/// A Razorpay autopay subscription. A service can have several over time
+/// (each "restart autopay" creates a new one); the newest is the current one.
+model Subscription {
+  id                     String             @id @default(cuid())
+  userId                 String
+  /// Null until the first charge creates the service.
+  serviceId              String?
+  orderId                String?
+  razorpaySubscriptionId String             @unique
+  razorpayPlanId         String
+  status                 SubscriptionStatus @default(CREATED)
+  /// Months covered by each recurring charge.
+  billingCycle           Int
+  /// Per recurring charge, excl. GST and processing fee, in paise.
+  amount                 Int
+  /// In paise.
+  gstAmount              Int
+  /// Payment processing charge per recurring charge, in paise.
+  processingFee          Int                @default(0)
+  shortUrl               String?
+  currentStart           DateTime?
+  currentEnd             DateTime?
+  chargeAt               DateTime?
+  paidCount              Int                @default(0)
+  cancelledAt            DateTime?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  service  Service?  @relation(fields: [serviceId], references: [id])
+  order    Order?    @relation(fields: [orderId], references: [id])
+  payments Payment[]
+
+  @@index([userId])
+  @@index([serviceId])
+  @@index([status])
+}
+
+/// Razorpay plans are immutable, so one is created per (cycle, amount) and reused.
+model RazorpayPlan {
+  id             String   @id @default(cuid())
+  /// "{period}-{interval}-{amountPaise}", e.g. "yearly-1-1131528"
+  key            String   @unique
+  razorpayPlanId String   @unique
+  period         String
+  interval       Int
+  amountPaise    Int
+  createdAt      DateTime @default(now())
 }
 
 model Payment {
@@ -170,7 +312,11 @@ model Payment {
   userId            String
   serviceId         String?
   orderId           String?
+  subscriptionId    String?
+  /// Excl. GST and processing fee, in paise.
   amount            Int
+  /// Payment processing charge, in paise.
+  processingFee     Int           @default(0)
   currency          String        @default("INR")
   razorpayOrderId   String?       @unique
   razorpayPaymentId String?       @unique
@@ -180,13 +326,15 @@ model Payment {
   createdAt         DateTime      @default(now())
   updatedAt         DateTime      @updatedAt
 
-  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  service Service? @relation(fields: [serviceId], references: [id])
-  order   Order?   @relation(fields: [orderId], references: [id])
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  service      Service?      @relation(fields: [serviceId], references: [id])
+  order        Order?        @relation(fields: [orderId], references: [id])
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
 
   @@index([userId])
   @@index([status])
   @@index([razorpayOrderId])
+  @@index([subscriptionId])
 }
 
 model Ticket {
@@ -218,4 +366,187 @@ model Notification {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, isRead])
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Resource engine (src/engine) — infrastructure inventory, metrics,
+// automatic actions, overages and migrations. All money in PAISE.
+// ═══════════════════════════════════════════════════════════════════
+
+enum NodeStatus {
+  PROVISIONING
+  READY
+  WARNING
+  CRITICAL
+  DECOMMISSIONING
+}
+
+/// A Proxmox host (one Hetzner Cloud server).
+model ProxmoxNode {
+  id              String     @id @default(cuid())
+  /// Proxmox node name, e.g. "sowsi-proxmox-01".
+  name            String     @unique
+  ip              String
+  /// Hetzner private-network IP; null until the node joins the private network.
+  privateIp       String?
+  hetznerServerId String     @unique
+  /// e.g. "nbg1". Floating IPs can only move between servers in the same location.
+  location        String     @default("nbg1")
+  /// The node's own routed /64 (e.g. "2a01:4f8:1c16:5f1d"). Container IPv6
+  /// addresses come from it, so they change if a container moves node.
+  ipv6Subnet      String?
+  status          NodeStatus @default(READY)
+
+  // Physical specs
+  physicalRamMB  Int @default(8192)
+  physicalDiskGB Int @default(160)
+  physicalCpu    Int @default(4)
+
+  // Current usage (written by ServerMonitor)
+  usedRamMB  Int   @default(0)
+  usedDiskGB Int   @default(0)
+  usedCpuPct Float @default(0)
+
+  // Sum of container limits (overcommit = allocated > physical)
+  allocatedRamMB  Int @default(0)
+  allocatedDiskGB Int @default(0)
+
+  containerCount   Int       @default(0)
+  maxContainers    Int       @default(6)
+  acceptNewClients Boolean   @default(true)
+  lastSeenAt       DateTime?
+
+  /// Monthly Hetzner cost, in paise.
+  monthlyCost Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  services Service[]
+  volumes  HetznerVolume[]
+
+  @@index([status])
+}
+
+/// A Hetzner Cloud Volume attached to a node (extra disk space).
+model HetznerVolume {
+  id              String   @id @default(cuid())
+  hetznerVolumeId String   @unique
+  nodeId          String
+  sizeGB          Int
+  usedGB          Int      @default(0)
+  mountPath       String
+  /// Proxmox storage ID the volume is registered as (where container disks can live).
+  proxmoxStorage  String?
+  /// Monthly cost, in paise.
+  costPerMonth    Int
+  /// ATTACHING | ACTIVE | DETACHING | DELETED
+  status          String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  node ProxmoxNode @relation(fields: [nodeId], references: [id])
+
+  @@index([nodeId])
+}
+
+/// Every decision and action the engine takes (audit trail).
+model EngineLog {
+  id        String   @id @default(cuid())
+  action    String
+  serviceId String?
+  vmid      String?
+  fromNode  String?
+  toNode    String?
+  before    Json?
+  after     Json?
+  /// In paise.
+  cost      Int?
+  /// AUTO_ENGINE | MANUAL | SCHEDULED
+  trigger   String
+  /// True when the engine only logged what it would have done (dry-run mode).
+  dryRun    Boolean  @default(false)
+  success   Boolean  @default(true)
+  error     String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([serviceId, createdAt])
+  @@index([action, createdAt])
+}
+
+/// Per-container usage samples (written by ContainerMonitor).
+model ResourceMetric {
+  id          String   @id @default(cuid())
+  serviceId   String
+  vmid        String
+  ramUsedMB   Int
+  ramLimitMB  Int
+  diskUsedGB  Float
+  diskLimitGB Float
+  cpuPct      Float
+  netInBytes  BigInt?
+  netOutBytes BigInt?
+  recordedAt  DateTime @default(now())
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, recordedAt])
+  @@index([recordedAt])
+}
+
+/// Usage above the plan, charged on the next invoice.
+model Overage {
+  id              String    @id @default(cuid())
+  serviceId       String
+  /// DISK | RAM | S4_STORAGE
+  type            String
+  /// "2026-10"
+  month           String
+  overageGB       Float
+  /// In paise.
+  cost            Int
+  invoiced        Boolean   @default(false)
+  invoicedAt      DateTime?
+  /// Razorpay subscription addon that carries the charge to the next invoice.
+  razorpayAddonId String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([serviceId, type, month])
+  @@index([month, invoiced])
+}
+
+enum MigrationStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// A container move between nodes (planned for the night window).
+model Migration {
+  id              String          @id @default(cuid())
+  serviceId       String
+  /// Node names.
+  fromNode        String
+  toNode          String
+  status          MigrationStatus @default(SCHEDULED)
+  scheduledFor    DateTime
+  startedAt       DateTime?
+  completedAt     DateTime?
+  downtimeMinutes Int?
+  reason          String
+  notifiedAt      DateTime?
+  error           String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+  @@index([serviceId])
 }

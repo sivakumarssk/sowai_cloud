@@ -56,13 +56,36 @@ function isUpid(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("UPID:");
 }
 
+/** One container from GET /nodes/{node}/lxc (all sizes in bytes, cpu as a 0–1 fraction). */
+export type LXCListEntry = {
+  vmid: number;
+  name?: string;
+  status: string;
+  mem: number;
+  maxmem: number;
+  disk: number;
+  maxdisk: number;
+  cpu: number;
+  cpus: number;
+  netin: number;
+  netout: number;
+  uptime: number;
+};
+
 export class ProxmoxService {
   private client: AxiosInstance | null = null;
+
+  /**
+   * Without a target, talks to the node in PROXMOX_NODE / PROXMOX_HOST.
+   * With one, talks to that node's API directly (nodes aren't clustered, so
+   * each has its own API; the same API token must exist on every node).
+   */
+  constructor(private readonly target: { node?: string; host?: string } = {}) {}
 
   // Config is read on first use rather than at import time so a missing env
   // var doesn't break `next build` for every route that imports this module.
   private get node(): string {
-    return requireEnv("PROXMOX_NODE");
+    return this.target.node ?? requireEnv("PROXMOX_NODE");
   }
 
   /** Where container root disks live. */
@@ -83,7 +106,7 @@ export class ProxmoxService {
   private api(): AxiosInstance {
     if (this.client) return this.client;
 
-    const host = requireEnv("PROXMOX_HOST");
+    const host = this.target.host ?? requireEnv("PROXMOX_HOST");
     const port = process.env.PROXMOX_PORT || "8006";
     const user = requireEnv("PROXMOX_USER");
     const tokenId = requireEnv("PROXMOX_TOKEN_ID");
@@ -263,6 +286,19 @@ export class ProxmoxService {
     await this.runTask("post", `/nodes/${this.node}/lxc/${vmid}/status/stop`);
   }
 
+  /** Clean shutdown; forces a stop if the container hasn't halted after `timeoutSeconds`. */
+  async shutdownLXC(vmid: number, timeoutSeconds = 60): Promise<void> {
+    await this.runTask("post", `/nodes/${this.node}/lxc/${vmid}/status/shutdown`, {
+      timeout: timeoutSeconds,
+      forceStop: true,
+    });
+  }
+
+  /** Whether the container starts automatically when the host boots. */
+  async setLXCOnboot(vmid: number, onboot: boolean): Promise<void> {
+    await this.runTask("put", `/nodes/${this.node}/lxc/${vmid}/config`, { onboot });
+  }
+
   /** Stops the container if needed, then destroys it and its disks. A container that no longer exists counts as deleted. */
   async deleteLXC(vmid: number): Promise<void> {
     let status: string;
@@ -278,6 +314,25 @@ export class ProxmoxService {
       purge: true,
       "destroy-unreferenced-disks": true,
     });
+  }
+
+  /** Every container on the node with live usage, in one call. */
+  async listLXC(): Promise<LXCListEntry[]> {
+    const list = await this.request<Partial<LXCListEntry & { vmid: number | string }>[]>("get", `/nodes/${this.node}/lxc`);
+    return list.map((c) => ({
+      vmid: Number(c.vmid),
+      name: c.name,
+      status: c.status ?? "unknown",
+      mem: c.mem ?? 0,
+      maxmem: c.maxmem ?? 0,
+      disk: c.disk ?? 0,
+      maxdisk: c.maxdisk ?? 0,
+      cpu: c.cpu ?? 0,
+      cpus: c.cpus ?? 0,
+      netin: c.netin ?? 0,
+      netout: c.netout ?? 0,
+      uptime: c.uptime ?? 0,
+    }));
   }
 
   async getLXCStatus(vmid: number): Promise<LXCStatus> {
@@ -332,3 +387,13 @@ function toProxmoxError(err: unknown, context: string): ProxmoxError {
 }
 
 export const proxmox = new ProxmoxService();
+
+const nodeClients = new Map<string, ProxmoxService>();
+
+/** Client for a specific node (ProxmoxNode.name / .ip), reused across calls. */
+export function proxmoxForNode(node: { name: string; ip: string }): ProxmoxService {
+  const key = `${node.name}@${node.ip}`;
+  let client = nodeClients.get(key);
+  if (!client) nodeClients.set(key, (client = new ProxmoxService({ node: node.name, host: node.ip })));
+  return client;
+}

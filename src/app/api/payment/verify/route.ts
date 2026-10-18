@@ -3,39 +3,51 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { verifyRazorpaySignature } from "@/lib/razorpay";
 import { apiSuccess, apiError } from "@/lib/types";
+import { fulfillPayment, fulfillSubscriptionPayment } from "@/lib/fulfillPayment";
+import { verifySubscriptionSignature } from "@/lib/billing/subscriptions";
 
 /**
- * Client-side confirmation only. The Razorpay checkout widget calls this
- * right after payment so the browser can move on to a waiting screen — but
- * the source of truth for "payment succeeded, provision the server" is the
- * server-to-server webhook (/api/payment/webhook), not this route. A user
- * closing the tab before this fires must not skip provisioning.
+ * Called by the Razorpay checkout widget right after payment. Once the
+ * signature checks out it creates the Service and starts provisioning in the
+ * background, then returns immediately. The webhook (/api/payment/webhook)
+ * runs the same idempotent fulfilment, so a customer closing the tab before
+ * this fires still gets their server.
  */
 export async function POST(req: NextRequest) {
   const session = await getSession();
   if (!session) return apiError("Unauthorized", 401);
 
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = await req.json();
-
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+  const { razorpay_payment_id, razorpay_signature, razorpay_subscription_id, razorpay_order_id } = await req.json();
+  if (!razorpay_payment_id || !razorpay_signature || !(razorpay_subscription_id || razorpay_order_id)) {
     return apiError("Missing payment verification data");
   }
 
-  const isValid = verifyRazorpaySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature);
-  if (!isValid) return apiError("Payment verification failed. Please contact support.", 400);
+  let result: Awaited<ReturnType<typeof fulfillPayment>>;
 
-  const payment = await prisma.payment.findFirst({
-    where: { razorpayOrderId: razorpay_order_id },
-    include: { order: true },
-  });
-
-  if (!payment || payment.userId !== session.userId) {
-    return apiError("Payment record not found", 404);
+  if (razorpay_subscription_id) {
+    // Autopay checkout (the normal path).
+    if (!verifySubscriptionSignature(razorpay_payment_id, razorpay_subscription_id, razorpay_signature)) {
+      return apiError("Payment verification failed. Please contact support.", 400);
+    }
+    const subscription = await prisma.subscription.findUnique({
+      where: { razorpaySubscriptionId: razorpay_subscription_id },
+      select: { userId: true },
+    });
+    if (!subscription || subscription.userId !== session.userId) return apiError("Payment record not found", 404);
+    result = await fulfillSubscriptionPayment(razorpay_subscription_id, razorpay_payment_id);
+  } else {
+    // One-time order checkout started before autopay was introduced.
+    if (!verifyRazorpaySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
+      return apiError("Payment verification failed. Please contact support.", 400);
+    }
+    const payment = await prisma.payment.findFirst({
+      where: { razorpayOrderId: razorpay_order_id },
+      select: { userId: true },
+    });
+    if (!payment || payment.userId !== session.userId) return apiError("Payment record not found", 404);
+    result = await fulfillPayment(razorpay_order_id, razorpay_payment_id);
   }
 
-  return apiSuccess({
-    orderId: payment.orderId,
-    // The webhook may not have landed yet — the frontend should poll
-    // /api/orders/[id]/status rather than assume the service exists here.
-  });
+  if (!result) return apiError("Order not found for this payment", 404);
+  return apiSuccess({ orderId: result.orderId, serviceId: result.serviceId });
 }

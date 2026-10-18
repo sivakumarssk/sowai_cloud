@@ -1,31 +1,24 @@
-import type { ServiceStatus } from "@prisma/client";
+import type { Plan, ServiceStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { proxmox, ProxmoxError } from "@/lib/proxmox";
 import { hetzner } from "@/lib/hetzner";
 import { vmSetup, type SetupStep } from "@/lib/vmSetup";
 import { encrypt } from "@/lib/crypto";
 import { razorpay } from "@/lib/razorpay";
-import { sendCredentialsEmail, sendProvisioningFailedEmail, sendAdminAlertEmail } from "@/lib/email";
+import { getOsImage } from "@/lib/provisioning/catalog";
+import { planFeatures } from "@/lib/plans";
+import { sendCredentialsEmail, sendProvisioningFailedEmail } from "@/lib/email";
+import { alertAdmins } from "@/lib/adminAlert";
+import { cancelAutopayForService } from "@/lib/billing/subscriptions";
 
 export type PlanResources = { cores: number; memory: number; disk: number };
 
-/**
- * Reads cores / RAM (MB) / disk (GB) from the plan's advertised features
- * ("2 vCPU Cores", "4 GB RAM", "80 GB NVMe SSD"), so the container always matches
- * what the customer paid for.
- */
-export function getPlanResources(features: unknown): PlanResources {
-  const f = (features ?? {}) as Record<string, unknown>;
-  const num = (key: string, pattern: RegExp) => {
-    const match = String(f[key] ?? "").match(pattern);
-    if (!match) throw new Error(`Plan feature "${key}" is missing or unparseable: ${JSON.stringify(f[key])}`);
-    return Number(match[1]);
-  };
-  return {
-    cores: num("cpu", /(\d+)\s*vCPU/i),
-    memory: num("ram", /(\d+)\s*GB/i) * 1024,
-    disk: num("storage", /(\d+)\s*GB/i),
-  };
+/** Container size from the plan's spec fields (memory in MB, disk in GB). */
+export function getPlanResources(plan: Pick<Plan, "name" | "vcpu" | "ramGB" | "storageGB">): PlanResources {
+  if (!plan.vcpu || !plan.ramGB || !plan.storageGB) {
+    throw new Error(`Plan "${plan.name}" is missing vcpu / ramGB / storageGB`);
+  }
+  return { cores: plan.vcpu, memory: plan.ramGB * 1024, disk: plan.storageGB };
 }
 
 /** "2a01:4f8:1c16:5f1d" + vmid 100 → "2a01:4f8:1c16:5f1d::100" */
@@ -45,24 +38,25 @@ async function updateStatus(serviceId: string, status: ServiceStatus, step: stri
 }
 
 const SETUP_PROGRESS: Record<SetupStep, [string, number]> = {
-  connecting: ["Connecting to your server...", 50],
-  updating: ["Installing system updates...", 58],
-  firewall: ["Configuring security & firewall...", 65],
-  user: ["Creating your login...", 72],
-  coolify: ["Installing Coolify panel...", 80],
-  hardening: ["Running final configuration...", 90],
+  connecting: ["Configuring security...", 60],
+  updating: ["Installing system updates...", 62],
+  firewall: ["Configuring firewall...", 65],
+  user: ["Creating your login...", 68],
+  coolify: ["Installing Coolify...", 70],
+  hardening: ["Final configuration...", 90],
 };
 
 /**
- * Turns a paid PENDING VPS service into a running, configured server.
- * Never throws: failures roll back the container and IP, refund the payment, and
- * alert admins.
+ * Turns a paid VPS service (created by fulfillPayment with status
+ * PROVISIONING, 0%) into a running, configured LXC container.
+ * Never throws: on failure it deletes the container, releases the Floating
+ * IP, marks the service FAILED, refunds the payment and alerts admins.
  */
 export async function provisionVPS(serviceId: string): Promise<void> {
-  // Claim the job atomically so a duplicate enqueue can't provision twice.
+  // Claim the job atomically (0% = not started) so a duplicate call can't provision twice.
   const claimed = await prisma.service.updateMany({
-    where: { id: serviceId, status: "PENDING" },
-    data: { status: "PROVISIONING", provisioningPct: 0, provisioningStep: "Queued", provisionError: null },
+    where: { id: serviceId, status: "PROVISIONING", provisioningPct: 0 },
+    data: { provisioningPct: 10, provisioningStep: "Allocating resources...", provisionError: null },
   });
   if (claimed.count === 0) return;
 
@@ -74,27 +68,30 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       where: { id: serviceId },
       include: { user: true, plan: true },
     });
-    const resources = getPlanResources(service.plan.features);
-    const panelFeature = String((service.plan.features as Record<string, unknown>)?.panel ?? "");
-    const hasCoolify = service.hasCoolify || /coolify/i.test(panelFeature);
+    const resources = getPlanResources(service.plan);
+    // Included in the plan (VPS Pro/Elite) or bought as an addon (set on the service at checkout).
+    const hasCoolify = service.hasCoolify || planFeatures(service.plan).some((f) => /coolify/i.test(f));
     const osImage = service.osImage || "ubuntu-22.04";
+    const osLabel = getOsImage(osImage)?.label.replace(/\s*\(.*\)$/, "") ?? osImage;
     // Fail before buying an IP if the OS can't be installed.
     if (!(await proxmox.hasOSTemplate(osImage))) {
       throw new Error(`LXC template for OS "${osImage}" is not available on the Proxmox host`);
     }
 
-    await updateStatus(serviceId, "PROVISIONING", "Allocating server resources...", 10);
-
+    // b. Buy the Floating IP — saved immediately so it can be released even if we crash.
     const ip = await hetzner.buyFloatingIP(`sowsi-${serviceId}`);
     floatingIpId = ip.id;
-    // Persist immediately so the IP can be found and released even if we crash.
     await prisma.service.update({
       where: { id: serviceId },
       data: { hetznerFloatingIpId: String(ip.id), serverIp: ip.ip, hasCoolify },
     });
+
+    // c–d. Route it to the Proxmox server.
+    await updateStatus(serviceId, "PROVISIONING", "Assigning IP address...", 20);
     await hetzner.assignFloatingIP(ip.id);
 
-    await updateStatus(serviceId, "PROVISIONING", "Creating your server...", 20);
+    // e–f. Create the container — this is where the OS is installed from the template.
+    await updateStatus(serviceId, "INSTALLING", `Installing ${osLabel}...`, 40);
 
     // /cluster/nextid isn't reserved, so a concurrent provision can grab the
     // same ID first — retry with a fresh one if that happens.
@@ -125,12 +122,12 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       break;
     }
 
-    await updateStatus(serviceId, "INSTALLING", "Starting your server...", 35);
+    // g. Wait for it to run, then route its IPs on the host.
     await proxmox.waitForLXC(vmid);
-
-    await updateStatus(serviceId, "INSTALLING", "Configuring network...", 45);
     await vmSetup.syncHostRoutes();
 
+    // h–k. SSH in: updates, UFW, client user, Coolify, SSH hardening.
+    await updateStatus(serviceId, "INSTALLING", ...SETUP_PROGRESS.connecting);
     const credentials = await vmSetup.setupVM({
       ipAddress: ip.ip,
       hasCoolify,
@@ -138,27 +135,21 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       onStep: (step) => updateStatus(serviceId, "INSTALLING", ...SETUP_PROGRESS[step]),
     });
 
+    // l. Save everything.
     await prisma.service.update({
       where: { id: serviceId },
       data: {
         status: "ACTIVE",
         provisioningPct: 100,
         provisioningStep: "Server is ready!",
-        sshUsername: credentials.sshUsername,
+        sshUsername: encrypt(credentials.sshUsername),
         sshPassword: encrypt(credentials.sshPassword),
         panelUrl: credentials.coolifyUrl,
         panelPassword: credentials.coolifyPassword ? encrypt(credentials.coolifyPassword) : null,
       },
     });
 
-    await prisma.notification.create({
-      data: {
-        userId: service.userId,
-        title: "Server is ready",
-        message: `Your ${service.plan.name} server is now active. Login credentials have been emailed to you.`,
-      },
-    });
-
+    // m. Welcome email with credentials.
     await sendCredentialsEmail(service.user.email, service.user.name, {
       planName: service.plan.name,
       hostname: service.hostname || ip.ip,
@@ -170,6 +161,17 @@ export async function provisionVPS(serviceId: string): Promise<void> {
         ? { email: service.user.email, password: credentials.coolifyPassword }
         : undefined,
     }).catch((err) => console.error("[provisioning] credentials email failed:", err));
+
+    // n. In-app notification.
+    await prisma.notification
+      .create({
+        data: {
+          userId: service.userId,
+          title: "Server is ready",
+          message: `Your ${service.plan.name} server is now active. Login credentials have been emailed to you.`,
+        },
+      })
+      .catch((err) => console.error("[provisioning] notification failed:", err));
   } catch (error) {
     await handleFailure(serviceId, error, { vmid, floatingIpId });
   }
@@ -228,6 +230,12 @@ async function handleFailure(
     include: { user: true, plan: true },
   });
 
+  // Stop autopay before refunding, so the customer isn't charged again for a server that doesn't exist.
+  const autopayError = await cancelAutopayForService(serviceId).then(
+    () => null,
+    (err) => errorMessage(err)
+  );
+
   let refundError: string | null = null;
   const payment = await prisma.payment.findFirst({
     where: { serviceId, status: "SUCCESS", razorpayPaymentId: { not: null } },
@@ -235,7 +243,7 @@ async function handleFailure(
   if (payment?.razorpayPaymentId) {
     try {
       await razorpay.payments.refund(payment.razorpayPaymentId, {
-        amount: (payment.amount + payment.gstAmount) * 100, // paise
+        amount: payment.amount + payment.gstAmount + payment.processingFee, // paise
         speed: "normal",
         notes: { reason: "provisioning_failed", serviceId },
       });
@@ -272,6 +280,7 @@ async function handleFailure(
       `Plan: ${service.plan.name}`,
       `Error: ${errorMessage(error)}`,
       `Refund: ${refunded ? "issued" : `NOT issued — ${refundError}`}`,
+      `Autopay: ${autopayError ? `NOT cancelled — ${autopayError} (cancel it in the Razorpay dashboard!)` : "cancelled"}`,
       cleanedUp
         ? "Cleanup: container and IP released"
         : `Cleanup FAILED — remove manually:\n  ${cleanupErrors.join("\n  ")}`,
@@ -280,17 +289,8 @@ async function handleFailure(
   );
 }
 
-async function sendAdminAlert(serviceId: string, details: string) {
-  try {
-    const configured = process.env.ADMIN_ALERT_EMAIL?.split(",").map((e) => e.trim()).filter(Boolean);
-    const recipients =
-      configured && configured.length > 0
-        ? configured
-        : (await prisma.user.findMany({ where: { role: "ADMIN" }, select: { email: true } })).map((u) => u.email);
-    await sendAdminAlertEmail(recipients, `Service ${serviceId} needs attention`, details);
-  } catch (err) {
-    console.error("[provisioning] admin alert failed:", err);
-  }
+function sendAdminAlert(serviceId: string, details: string) {
+  return alertAdmins(`Service ${serviceId} needs attention`, details);
 }
 
 // Statuses a service can be cancelled from. PROVISIONING/INSTALLING are
@@ -312,6 +312,17 @@ export async function deprovisionVPS(serviceId: string): Promise<void> {
   });
   if (claimed.count === 0) {
     throw new CancelNotAllowedError("This service can't be cancelled right now (it's being set up or already deleted).");
+  }
+
+  // Stop billing first: if autopay can't be cancelled, keep the server rather
+  // than keep charging for one that no longer exists. Retrying is safe.
+  try {
+    await cancelAutopayForService(serviceId);
+  } catch (err) {
+    const message = `Cancellation incomplete: could not cancel autopay — ${errorMessage(err)}`;
+    await prisma.service.update({ where: { id: serviceId }, data: { provisionError: message } });
+    await sendAdminAlert(serviceId, `${message}\nThe server was NOT deleted.`);
+    throw new Error(message);
   }
 
   const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId } });

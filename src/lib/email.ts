@@ -1,24 +1,12 @@
-import { Resend } from "resend";
+import { formatINR } from "@/lib/pricing";
+import { sendMail } from "@/lib/mailer";
 
-const FROM = process.env.EMAIL_FROM || "noreply@sowsicloud.com";
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://sowsicloud.com";
 
-// Resend's constructor throws on a missing/empty key. Building it lazily
-// (only when an email actually needs to go out) keeps a missing key from
-// crashing `next build`'s page-data collection for every route that
-// imports this module, and from taking down unrelated requests at runtime.
-let resend: Resend | null = null;
-function getResendClient(): Resend | null {
-  if (!process.env.RESEND_API_KEY) return null;
-  if (!resend) resend = new Resend(process.env.RESEND_API_KEY);
-  return resend;
-}
+// Templates only — delivery (Microsoft 365, or Resend as a fallback) lives in mailer.ts.
 
 export async function sendWelcomeEmail(to: string, name: string) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping welcome email to", to);
-  await client.emails.send({
-    from: FROM,
+  await sendMail({
     to,
     subject: "Welcome to Sowsi Cloud Services!",
     html: `
@@ -40,11 +28,8 @@ export async function sendPasswordResetEmail(
   name: string,
   token: string
 ) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping password reset email to", to);
   const resetUrl = `${APP_URL}/reset-password?token=${token}`;
-  await client.emails.send({
-    from: FROM,
+  await sendMail({
     to,
     subject: "Reset Your Sowsi Cloud Password",
     html: `
@@ -73,10 +58,7 @@ export async function sendCredentialsEmail(
     panelLogin?: { email: string; password: string };
   }
 ) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping credentials email to", to);
-  await client.emails.send({
-    from: FROM,
+  await sendMail({
     to,
     subject: `Your ${server.planName} server is ready`,
     html: `
@@ -112,57 +94,49 @@ export async function sendCredentialsEmail(
   });
 }
 
+/** Amounts in paise. */
 export async function sendInvoiceEmail(
   to: string,
   name: string,
-  invoiceNumber: string,
-  planName: string,
-  amount: number,
-  gstAmount: number
+  invoice: { invoiceNumber: string; planName: string; amount: number; gstAmount: number; processingFee: number }
 ) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping invoice email to", to);
-  const total = amount + gstAmount;
-  await client.emails.send({
-    from: FROM,
+  const total = invoice.amount + invoice.gstAmount + invoice.processingFee;
+  const row = (label: string, paise: number) => `
+          <div style="display:flex;justify-content:space-between;margin-top:8px;">
+            <span style="color:#9CA3AF;">${label}</span>
+            <span style="color:#fff;">${formatINR(paise)}</span>
+          </div>`;
+  await sendMail({
     to,
-    subject: `Invoice #${invoiceNumber} - Sowsi Cloud Services`,
+    subject: `Invoice #${invoice.invoiceNumber} - Sowsi Cloud Services`,
     html: `
       <div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto;background:#0A0F1E;color:#fff;padding:40px;border-radius:12px;">
         <h1 style="color:#1B4FE8;font-size:24px;">Payment Confirmed</h1>
         <p style="color:#D1D5DB;">Hi ${name}, your payment has been processed successfully.</p>
         <div style="background:#111827;border-radius:8px;padding:24px;margin:24px 0;">
           <p style="color:#9CA3AF;margin:0 0 8px;">Invoice Number</p>
-          <p style="color:#fff;font-weight:600;font-size:18px;margin:0 0 16px;">#${invoiceNumber}</p>
+          <p style="color:#fff;font-weight:600;font-size:18px;margin:0 0 16px;">#${invoice.invoiceNumber}</p>
           <p style="color:#9CA3AF;margin:0 0 4px;">Plan</p>
-          <p style="color:#fff;margin:0 0 16px;">${planName}</p>
+          <p style="color:#fff;margin:0 0 16px;">${invoice.planName}</p>
           <hr style="border-color:#1F2937;margin:16px 0;" />
-          <div style="display:flex;justify-content:space-between;">
-            <span style="color:#9CA3AF;">Subtotal</span>
-            <span style="color:#fff;">₹${amount.toLocaleString("en-IN")}</span>
-          </div>
-          <div style="display:flex;justify-content:space-between;margin-top:8px;">
-            <span style="color:#9CA3AF;">GST (18%)</span>
-            <span style="color:#fff;">₹${gstAmount.toLocaleString("en-IN")}</span>
-          </div>
+          ${row("Subtotal", invoice.amount)}
+          ${row("Payment processing", invoice.processingFee)}
+          ${invoice.gstAmount > 0 ? row("GST", invoice.gstAmount) : ""}
           <hr style="border-color:#1F2937;margin:16px 0;" />
           <div style="display:flex;justify-content:space-between;">
             <span style="color:#fff;font-weight:600;">Total</span>
-            <span style="color:#1B4FE8;font-weight:700;font-size:18px;">₹${total.toLocaleString("en-IN")}</span>
+            <span style="color:#1B4FE8;font-weight:700;font-size:18px;">${formatINR(total)}</span>
           </div>
         </div>
         <a href="${APP_URL}/dashboard/billing" style="display:inline-block;background:#1B4FE8;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;">View Invoice</a>
-        <p style="color:#4B5563;font-size:12px;margin-top:32px;">© 2024 Sowsi Cloud Services, Hyderabad, India. GSTIN: XXXXXXXXXXXX</p>
+        <p style="color:#4B5563;font-size:12px;margin-top:32px;">© 2024 Sowsi Cloud Services, Hyderabad, India.</p>
       </div>
     `,
   });
 }
 
 export async function sendProvisioningFailedEmail(to: string, name: string, planName: string, refunded: boolean) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping provisioning failure email to", to);
-  await client.emails.send({
-    from: FROM,
+  await sendMail({
     to,
     subject: `We couldn't set up your ${planName} server`,
     html: `
@@ -182,14 +156,38 @@ export async function sendProvisioningFailedEmail(to: string, name: string, plan
 }
 
 export async function sendAdminAlertEmail(to: string[], subject: string, details: string) {
-  const client = getResendClient();
-  if (!client) return console.warn("[email] RESEND_API_KEY not set — skipping admin alert:", subject);
   if (to.length === 0) return console.warn("[email] no admin recipients — skipping admin alert:", subject);
   const escaped = details.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  await client.emails.send({
-    from: FROM,
+  await sendMail({
     to,
     subject: `[Sowsi Admin] ${subject}`,
     html: `<div style="font-family:monospace;white-space:pre-wrap;">${escaped}</div>`,
+  });
+}
+
+/** Autopay / billing notices (payment retrying, suspended, resumed, cancelled, deleted). */
+export async function sendBillingNoticeEmail(
+  to: string,
+  name: string,
+  notice: { subject: string; heading: string; paragraphs: string[]; tone?: "info" | "warning" | "danger"; cta?: { label: string; url: string } }
+) {
+  const color = notice.tone === "danger" ? "#F87171" : notice.tone === "warning" ? "#FBBF24" : "#1B4FE8";
+  await sendMail({
+    to,
+    subject: notice.subject,
+    html: `
+      <div style="font-family:Inter,sans-serif;max-width:600px;margin:0 auto;background:#0A0F1E;color:#fff;padding:40px;border-radius:12px;">
+        <h1 style="color:${color};font-size:24px;">${notice.heading}</h1>
+        <p style="color:#D1D5DB;">Hi ${name},</p>
+        ${notice.paragraphs.map((p) => `<p style="color:#D1D5DB;">${p}</p>`).join("")}
+        ${
+          notice.cta
+            ? `<a href="${notice.cta.url}" style="display:inline-block;background:#1B4FE8;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;margin-top:16px;font-weight:600;">${notice.cta.label}</a>`
+            : ""
+        }
+        <p style="color:#6B7280;font-size:14px;margin-top:32px;">Questions? Contact us at support@sowsicloud.com</p>
+        <p style="color:#4B5563;font-size:12px;">© 2024 Sowsi Cloud Services, Hyderabad, India</p>
+      </div>
+    `,
   });
 }

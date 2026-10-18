@@ -1,20 +1,24 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import Script from "next/script";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/landing/Navbar";
+import { Button } from "@/components/ui/Button";
+import { OrderSteps } from "@/components/order/OrderSteps";
+import { OrderSummary, MobileOrderBar, PaymentNote } from "@/components/order/OrderSummary";
 import { useAuthStore } from "@/store/authStore";
-import { getRegion } from "@/lib/provisioning/catalog";
+import { type PriceQuote, CYCLES, formatINR } from "@/lib/pricing";
 
 type OrderData = {
   id: string;
   planName: string;
-  billingCycle: number;
+  category: string;
   hostname: string;
   region: string;
-  amount: number;
-  gstAmount: number;
+  os: string | null;
+  stack: string | null;
 };
 
 declare global {
@@ -23,35 +27,70 @@ declare global {
   }
 }
 
+type PayError = { message: string; paymentId?: string };
+
 export default function CheckoutClient({
-  planId,
+  planSlug,
   order,
+  quote,
+  planHref,
+  configureHref,
   razorpayKeyId,
 }: {
-  planId: string;
+  planSlug: string;
   order: OrderData;
+  quote: PriceQuote;
+  planHref: string;
+  configureHref: string;
   razorpayKeyId: string;
 }) {
   const router = useRouter();
   const user = useAuthStore((s) => s.user);
   const [scriptReady, setScriptReady] = useState(false);
+  const [scriptFailed, setScriptFailed] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PayError | null>(null);
 
-  const total = order.amount + order.gstAmount;
-  const regionLabel = getRegion(order.region)?.label || order.region;
+  const isStorage = order.category === "STORAGE";
+  const total = formatINR(quote.total);
+  const unavailable = !razorpayKeyId
+    ? "Online payments aren't available right now. Please contact support to complete your order."
+    : scriptFailed
+    ? "Couldn't load the Razorpay payment window. Check your connection or disable content blockers, then reload this page."
+    : null;
+
+  async function confirmPayment(response: {
+    razorpay_subscription_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+  }) {
+    try {
+      const verifyRes = await fetch("/api/payment/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(response),
+      });
+      const verifyData = await verifyRes.json();
+      if (verifyRes.ok && verifyData.success) {
+        const serviceId = verifyData.data?.serviceId;
+        router.push(`/order/${planSlug}/provisioning?orderId=${order.id}${serviceId ? `&serviceId=${serviceId}` : ""}`);
+        return;
+      }
+    } catch {
+      // Fall through: the payment itself went through, only our confirmation failed.
+    }
+    // Razorpay's webhook will usually still activate the order, so never invite a second payment here.
+    setError({
+      message:
+        "Your payment went through, but we couldn't confirm it yet. Please don't pay again — your server will appear in My Servers within a few minutes. If it doesn't, contact support with this payment ID.",
+      paymentId: response.razorpay_payment_id,
+    });
+    setLoading(false);
+  }
 
   async function handlePay() {
     setError(null);
-
-    if (!razorpayKeyId) {
-      setError("Payments are not configured yet. Please contact support.");
-      return;
-    }
-    if (!scriptReady || typeof window.Razorpay === "undefined") {
-      setError("Payment widget is still loading. Please try again in a moment.");
-      return;
-    }
+    if (unavailable || !scriptReady) return;
 
     setLoading(true);
     try {
@@ -62,122 +101,124 @@ export default function CheckoutClient({
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setError(data.error || "Could not start payment. Please try again.");
+        setError({ message: data.error || "Couldn't start the payment. You haven't been charged — please try again." });
         setLoading(false);
         return;
       }
 
+      // Autopay: the widget authorises a recurring mandate and charges the
+      // first billing cycle; Razorpay then renews automatically.
       const rzp = new window.Razorpay({
         key: razorpayKeyId,
-        amount: data.data.amount,
-        currency: data.data.currency,
+        subscription_id: data.data.razorpaySubscriptionId,
         name: "Sowsi Cloud Services",
         description: `${data.data.planName} — ${order.hostname}`,
-        order_id: data.data.razorpayOrderId,
         prefill: { name: user?.name, email: user?.email },
-        theme: { color: "#1B4FE8" },
-        handler: async function (response: {
-          razorpay_order_id: string;
-          razorpay_payment_id: string;
-          razorpay_signature: string;
-        }) {
-          const verifyRes = await fetch("/api/payment/verify", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(response),
-          });
-          const verifyData = await verifyRes.json();
-          if (verifyRes.ok && verifyData.success) {
-            router.push(`/order/${planId}/provisioning?orderId=${order.id}`);
-          } else {
-            setError("Payment succeeded but confirmation failed. Please contact support with your payment ID.");
-            setLoading(false);
-          }
-        },
+        theme: { color: "#2563EB" }, // --color-primary
+        handler: confirmPayment,
         modal: {
-          ondismiss: function () {
-            setLoading(false);
-          },
+          ondismiss: () => setLoading(false),
         },
       });
       rzp.open();
     } catch {
-      setError("Network error. Please try again.");
+      setError({ message: "Couldn't reach Sowsi Cloud. You haven't been charged — check your connection and try again." });
       setLoading(false);
     }
   }
 
+  const payLabel = !scriptReady && !unavailable ? "Loading secure payment…" : `Pay ${total}`;
+  const payDisabled = !!unavailable || !scriptReady;
+
+  const errorBox = error && (
+    <div role="alert" className="text-sm text-danger rounded-lg bg-danger/10 border border-danger/30 px-3 py-2.5">
+      <p>{error.message}</p>
+      {error.paymentId && (
+        <p className="mt-2 text-fg">
+          Payment ID: <code className="font-mono select-all">{error.paymentId}</code>
+        </p>
+      )}
+      {error.paymentId && (
+        <Link href="/dashboard/services" className="inline-block mt-2 font-medium text-link hover:underline">
+          Go to My Servers
+        </Link>
+      )}
+    </div>
+  );
+
+  const rows: { label: string; value: React.ReactNode }[] = [
+    { label: "Plan", value: `${order.planName} · ${CYCLES[quote.cycle].label}` },
+    { label: isStorage ? "Bucket name" : "Hostname", value: <code className="font-mono">{order.hostname}</code> },
+    ...(order.os ? [{ label: "Operating system", value: order.os }] : []),
+    ...(order.stack ? [{ label: "Pre-installed", value: order.stack }] : []),
+    { label: "Location", value: order.region },
+  ];
+
   return (
-    <div style={{ background: "linear-gradient(135deg, #0B1120 0%, #0F172A 50%, #0B1120 100%)", minHeight: "100vh" }}>
-      <Script src="https://checkout.razorpay.com/v1/checkout.js" onLoad={() => setScriptReady(true)} />
+    <div className="min-h-screen bg-canvas pb-24 lg:pb-0">
+      <Script
+        src="https://checkout.razorpay.com/v1/checkout.js"
+        onLoad={() => setScriptReady(true)}
+        onError={() => setScriptFailed(true)}
+      />
       <Navbar />
 
-      <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
-        <h1 className="text-2xl sm:text-3xl font-bold text-white mb-1">Payment</h1>
-        <p className="text-gray-400 text-sm mb-8">Review your order and complete payment to activate your server.</p>
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
+        <OrderSteps current="Pay" hrefs={{ Plan: planHref, Configure: configureHref }} />
 
-        <div className="rounded-2xl p-6 mb-6" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)" }}>
-          <div className="flex justify-between text-sm mb-3">
-            <span className="text-gray-400">Plan</span>
-            <span className="text-white font-medium">{order.planName}</span>
-          </div>
-          <div className="flex justify-between text-sm mb-3">
-            <span className="text-gray-400">Hostname</span>
-            <span className="text-white font-medium">{order.hostname}</span>
-          </div>
-          <div className="flex justify-between text-sm mb-3">
-            <span className="text-gray-400">Region</span>
-            <span className="text-white font-medium">{regionLabel}</span>
-          </div>
-          <div className="flex justify-between text-sm mb-3">
-            <span className="text-gray-400">Billing Cycle</span>
-            <span className="text-white font-medium">
-              {order.billingCycle === 1 ? "Monthly" : order.billingCycle === 12 ? "1 Year" : "2 Years"}
-            </span>
-          </div>
-
-          <div className="mt-4 pt-4" style={{ borderTop: "1px solid rgba(255,255,255,0.1)" }}>
-            <div className="flex justify-between text-sm mb-2">
-              <span className="text-gray-400">Subtotal</span>
-              <span className="text-white font-medium">₹{order.amount.toLocaleString("en-IN")}</span>
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-2 flex flex-col gap-6">
+            <div>
+              <h1 className="text-2xl font-semibold text-fg">Review and pay</h1>
+              <p className="text-fg-muted text-sm mt-1">Setup starts as soon as you pay.</p>
             </div>
-            <div className="flex justify-between text-sm mb-3">
-              <span className="text-gray-400">GST (18%)</span>
-              <span className="text-white font-medium">₹{order.gstAmount.toLocaleString("en-IN")}</span>
-            </div>
-            <div className="flex justify-between pt-3" style={{ borderTop: "1px solid rgba(255,255,255,0.1)" }}>
-              <span className="text-white font-bold text-lg">Total</span>
-              <span className="text-white font-black text-xl">₹{total.toLocaleString("en-IN")}</span>
-            </div>
+
+            <section aria-labelledby="review-heading" className="rounded-xl bg-surface border border-line">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-line">
+                <h2 id="review-heading" className="text-fg font-semibold">
+                  {isStorage ? "Storage" : "Server"}
+                </h2>
+                <Link href={configureHref} className="text-sm font-medium text-link hover:underline">
+                  Edit
+                </Link>
+              </div>
+              <dl className="divide-y divide-line">
+                {rows.map((r) => (
+                  <div key={r.label} className="flex justify-between gap-4 px-5 py-3 text-sm">
+                    <dt className="text-fg-muted">{r.label}</dt>
+                    <dd className="text-fg text-right min-w-0 break-all">{r.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+
+            {unavailable && (
+              <p role="alert" className="text-sm text-warning rounded-lg bg-warning/10 border border-warning/30 px-3 py-2.5">
+                {unavailable}
+              </p>
+            )}
+            <div className="lg:hidden">{errorBox}</div>
           </div>
-        </div>
 
-        {error && (
-          <p className="text-sm text-red-400 rounded-lg px-4 py-3 mb-6" style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.25)" }}>
-            {error}
-          </p>
-        )}
-
-        <button
-          onClick={handlePay}
-          disabled={loading}
-          className="w-full py-3.5 rounded-xl font-semibold text-white text-sm transition-all hover:opacity-90 active:scale-[0.98] disabled:opacity-50"
-          style={{ background: "linear-gradient(135deg, #1B4FE8, #0EA5E9)", boxShadow: "0 4px 20px rgba(27,79,232,0.35)" }}
-        >
-          {loading ? "Opening payment..." : `Pay ₹${total.toLocaleString("en-IN")}`}
-        </button>
-
-        <div className="flex items-center justify-center gap-4 mt-4">
-          {[
-            { icon: "🔒", label: "Secured by Razorpay" },
-            { icon: "🧾", label: "GST Invoice" },
-          ].map((b) => (
-            <div key={b.label} className="flex items-center gap-1 text-gray-600 text-[10px]">
-              <span>{b.icon}</span>{b.label}
+          <aside className="lg:col-span-1" aria-label="Order summary">
+            <div className="lg:sticky lg:top-24">
+              <OrderSummary planName={order.planName} quote={quote}>
+                {error && <div className="hidden lg:block mt-5">{errorBox}</div>}
+                <Button size="lg" className="w-full mt-5" onClick={handlePay} loading={loading} disabled={payDisabled}>
+                  {payLabel}
+                </Button>
+                <PaymentNote />
+              </OrderSummary>
             </div>
-          ))}
+          </aside>
         </div>
       </div>
+
+      <MobileOrderBar total={quote.total}>
+        <Button size="lg" onClick={handlePay} loading={loading} disabled={payDisabled}>
+          {payLabel}
+        </Button>
+      </MobileOrderBar>
     </div>
   );
 }

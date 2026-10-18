@@ -32,12 +32,7 @@ export default function Navbar() {
 
   return (
     <nav
-      className="sticky top-0 z-50"
-      style={{
-        backgroundColor: "#111827",
-        borderBottom: "1px solid #1F2937",
-        boxShadow: "0 1px 20px rgba(0,0,0,0.5)",
-      }}
+      className="sticky top-0 z-50 bg-surface border-b border-line shadow-lg shadow-black/30"
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between h-16">
@@ -46,7 +41,7 @@ export default function Navbar() {
           <Link href="/" className="flex items-center gap-2.5 shrink-0">
             <Image src={sowsiLogo} alt="Sowsi Cloud" className="h-8 w-auto shrink-0" priority />
             <div className="flex flex-col">
-              <span className="font-bold text-white text-base leading-tight">Cloud</span>
+              <span className="font-bold text-fg text-base leading-tight">Cloud</span>
             </div>
           </Link>
 
@@ -56,10 +51,10 @@ export default function Navbar() {
               <Link
                 key={link.href}
                 href={link.href}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors duration-150 ${
                   pathname === link.href
-                    ? "text-[#60A5FA] bg-[#1B4FE8]/20"
-                    : "text-gray-300 hover:text-white hover:bg-white/5"
+                    ? "text-link bg-primary/15"
+                    : "text-fg-muted hover:text-fg hover:bg-surface-2"
                 }`}
               >
                 {link.label}
@@ -82,18 +77,17 @@ export default function Navbar() {
               </>
             ) : (
               <>
-                <Link href="/login">
-                  <button className="px-4 py-2 text-sm font-medium text-gray-300 hover:text-white transition-colors rounded-lg hover:bg-white/5">
-                    Sign in
-                  </button>
+                <Link
+                  href="/login"
+                  className="inline-flex items-center h-8 px-3 text-sm font-medium rounded-lg text-fg-muted hover:text-fg hover:bg-surface-2 transition-colors duration-150"
+                >
+                  Sign in
                 </Link>
-                <Link href="/signup">
-                  <button
-                    className="px-4 py-2 text-sm font-semibold text-white rounded-lg transition-all hover:opacity-90 active:scale-95"
-                    style={{ background: "linear-gradient(135deg, #1B4FE8, #0EA5E9)" }}
-                  >
-                    Get Started
-                  </button>
+                <Link
+                  href="/signup"
+                  className="inline-flex items-center h-8 px-3 text-sm font-semibold rounded-lg bg-primary text-on-primary hover:bg-primary-hover active:bg-primary-active transition-colors duration-150"
+                >
+                  Get Started
                 </Link>
               </>
             )}
@@ -101,7 +95,7 @@ export default function Navbar() {
 
           {/* Mobile hamburger */}
           <button
-            className="md:hidden p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
+            className="md:hidden p-2 rounded-lg text-fg-muted hover:text-fg hover:bg-surface-2 transition-colors duration-150"
             onClick={() => setMobileOpen(!mobileOpen)}
             aria-label="Toggle menu"
           >
@@ -119,49 +113,49 @@ export default function Navbar() {
 
         {/* Mobile menu */}
         {mobileOpen && (
-          <div className="md:hidden border-t border-[#1F2937] py-4 flex flex-col gap-1">
+          <div className="md:hidden border-t border-line py-4 flex flex-col gap-1">
             {navLinks.map((link) => (
               <Link
                 key={link.href}
                 href={link.href}
-                className="block px-4 py-2.5 text-sm text-gray-300 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
+                className="block px-4 py-2.5 text-sm text-fg-muted hover:text-fg hover:bg-surface-2 rounded-lg transition-colors duration-150"
                 onClick={() => setMobileOpen(false)}
               >
                 {link.label}
               </Link>
             ))}
-            <div className="flex flex-col gap-2 mt-3 pt-3 border-t border-[#1F2937]">
+            <div className="flex flex-col gap-2 mt-3 pt-3 border-t border-line">
               {user ? (
                 <>
                   <Link
                     href={user.role === "ADMIN" ? "/admin" : "/dashboard"}
                     onClick={() => setMobileOpen(false)}
+                    className="w-full px-4 py-2.5 text-center text-sm font-medium text-fg border border-line-strong rounded-lg hover:border-fg-subtle hover:bg-surface-2 transition-colors duration-150"
                   >
-                    <button className="w-full px-4 py-2.5 text-sm font-medium text-white border border-[#374151] rounded-lg hover:border-[#1B4FE8] transition-colors">
-                      {user.role === "ADMIN" ? "Admin Panel" : "Dashboard"}
-                    </button>
+                    {user.role === "ADMIN" ? "Admin Panel" : "Dashboard"}
                   </Link>
                   <button
                     onClick={handleLogout}
-                    className="w-full px-4 py-2.5 text-sm font-medium text-gray-400 hover:text-white rounded-lg transition-colors"
+                    className="w-full px-4 py-2.5 text-sm font-medium text-fg-muted hover:text-fg rounded-lg transition-colors duration-150"
                   >
                     Sign out
                   </button>
                 </>
               ) : (
                 <>
-                  <Link href="/login" onClick={() => setMobileOpen(false)}>
-                    <button className="w-full px-4 py-2.5 text-sm font-medium text-gray-300 hover:text-white border border-[#374151] rounded-lg hover:border-[#4B5563] transition-colors">
-                      Sign in
-                    </button>
+                  <Link
+                    href="/login"
+                    onClick={() => setMobileOpen(false)}
+                    className="w-full px-4 py-2.5 text-center text-sm font-medium text-fg border border-line-strong rounded-lg hover:border-fg-subtle hover:bg-surface-2 transition-colors duration-150"
+                  >
+                    Sign in
                   </Link>
-                  <Link href="/signup" onClick={() => setMobileOpen(false)}>
-                    <button
-                      className="w-full px-4 py-2.5 text-sm font-semibold text-white rounded-lg"
-                      style={{ background: "linear-gradient(135deg, #1B4FE8, #0EA5E9)" }}
-                    >
-                      Get Started
-                    </button>
+                  <Link
+                    href="/signup"
+                    onClick={() => setMobileOpen(false)}
+                    className="w-full px-4 py-2.5 text-center text-sm font-semibold text-on-primary bg-primary rounded-lg hover:bg-primary-hover active:bg-primary-active transition-colors duration-150"
+                  >
+                    Get Started
                   </Link>
                 </>
               )}

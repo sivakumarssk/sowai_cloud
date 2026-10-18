@@ -1,142 +1,207 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import Navbar from "@/components/landing/Navbar";
+import { Button } from "@/components/ui/Button";
+import { CopyButton } from "@/components/ui/CopyButton";
+import { OrderSteps } from "@/components/order/OrderSteps";
 
-type ServiceInfo = {
-  id: string;
+type ProvisioningStatus = {
   status: string;
+  provisioningStep: string | null;
+  provisioningPct: number;
   serverIp: string | null;
-  hostname: string | null;
-  panelUrl: string | null;
-  provisionError: string | null;
-} | null;
+  ipv6Address: string | null;
+};
 
-const STAGES = [
-  { key: "PENDING", label: "Payment confirmed" },
-  { key: "PROVISIONING", label: "Setting up your server" },
-  { key: "ACTIVE", label: "Server is ready" },
-];
+const POLL_MS = 3000;
+/** After this long without a service, the payment webhook is probably delayed. */
+const SLOW_CONFIRM_MS = 2 * 60 * 1000;
+/** Setup normally finishes well within this. */
+const SLOW_SETUP_MS = 15 * 60 * 1000;
+const DASHBOARD_URL = "/dashboard/services";
 
-export default function ProvisioningClient({ orderId }: { orderId: string }) {
-  const [service, setService] = useState<ServiceInfo>(null);
-  const [orderStatus, setOrderStatus] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+export default function ProvisioningClient({
+  orderId,
+  initialServiceId,
+}: {
+  orderId: string;
+  initialServiceId: string | null;
+}) {
+  const [serviceId, setServiceId] = useState(initialServiceId);
+  const [info, setInfo] = useState<ProvisioningStatus | null>(null);
+  const [startedAt] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
 
+  const isActive = info?.status === "ACTIVE";
+  const failed = info?.status === "FAILED";
+  const finished = isActive || failed;
+
+  // Poll every 3s. Chained timeouts (not setInterval) so a slow response can't
+  // stack overlapping requests. Until the service exists (webhook/verify still
+  // landing), look it up from the order.
   useEffect(() => {
+    if (finished) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
     async function poll() {
       try {
-        const res = await fetch(`/api/orders/${orderId}/status`);
-        const data = await res.json();
-        if (res.ok && data.success) {
-          setOrderStatus(data.data.orderStatus);
-          setService(data.data.service);
-          if (data.data.service?.status === "ACTIVE" || data.data.service?.status === "FAILED") {
-            if (pollRef.current) clearInterval(pollRef.current);
+        if (!serviceId) {
+          const res = await fetch(`/api/orders/${orderId}/status`, { cache: "no-store" });
+          const data = await res.json();
+          const id: string | undefined = data.data?.service?.id;
+          if (!cancelled && id) {
+            setServiceId(id); // re-runs this effect against the service endpoint
+            return;
+          }
+        } else {
+          const res = await fetch(`/api/services/${serviceId}/status`, { cache: "no-store" });
+          const data = await res.json();
+          if (!cancelled && res.ok && data.success) {
+            const next: ProvisioningStatus = data.data;
+            setInfo(next);
+            if (next.status === "ACTIVE" || next.status === "FAILED") return;
           }
         }
       } catch {
         // Keep polling — transient network errors shouldn't stop the loop.
       }
+      if (!cancelled) {
+        setNow(Date.now());
+        timer = setTimeout(poll, POLL_MS);
+      }
     }
 
     poll();
-    pollRef.current = setInterval(poll, 3000);
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+      cancelled = true;
+      clearTimeout(timer);
     };
-  }, [orderId]);
+  }, [orderId, serviceId, finished]);
 
-  const currentStageIndex = !service
-    ? 0
-    : service.status === "ACTIVE"
-    ? 2
-    : service.status === "PROVISIONING"
-    ? 1
-    : 0;
-
-  const failed = service?.status === "FAILED";
+  const elapsed = now - startedAt;
+  const slowConfirm = !serviceId && elapsed > SLOW_CONFIRM_MS;
+  const slowSetup = !!serviceId && !finished && elapsed > SLOW_SETUP_MS;
+  const pct = isActive ? 100 : info?.provisioningPct ?? 0;
+  const step = isActive
+    ? "Server is ready"
+    : info?.provisioningStep || (serviceId ? "Starting…" : "Confirming your payment…");
 
   return (
-    <div style={{ background: "linear-gradient(135deg, #0B1120 0%, #0F172A 50%, #0B1120 100%)", minHeight: "100vh" }}>
+    <div className="min-h-screen bg-canvas">
       <Navbar />
 
-      <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-12 lg:py-20">
-        <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2 text-center">
-          {failed ? "Something went wrong" : service?.status === "ACTIVE" ? "Your server is ready!" : "Setting up your server"}
-        </h1>
-        <p className="text-gray-400 text-sm mb-10 text-center">
-          {failed
-            ? "Our team has been notified and will resolve this shortly."
-            : "This usually takes under a minute. You can leave this page — we'll email you when it's done."}
-        </p>
+      <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:py-12">
+        <OrderSteps current="Deploy" />
+
+        <div className="text-center mb-8">
+          {isActive && (
+            <span className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-success/10 text-success mb-4" aria-hidden>
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            </span>
+          )}
+          <h1 className="text-2xl sm:text-3xl font-semibold text-fg mb-2">
+            {failed ? "We couldn't finish setting up your server" : isActive ? "Your server is ready" : "Setting up your server"}
+          </h1>
+          <p className="text-fg-muted text-sm max-w-md mx-auto" aria-live="polite">
+            {failed
+              ? "Our team has been notified, and we've emailed you about your refund."
+              : isActive
+              ? "Your SSH login details are in your dashboard and have been emailed to you."
+              : "This usually takes a few minutes. You can leave this page — we'll email you when it's ready."}
+          </p>
+        </div>
 
         {!failed && (
-          <div className="flex flex-col gap-4 mb-10">
-            {STAGES.map((stage, i) => {
-              const isDone = i < currentStageIndex || service?.status === "ACTIVE";
-              const isCurrent = i === currentStageIndex && service?.status !== "ACTIVE";
-              return (
-                <div key={stage.key} className="flex items-center gap-4 rounded-xl p-4"
-                  style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}>
-                  <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0"
-                    style={{
-                      background: isDone ? "#059669" : isCurrent ? "#1B4FE8" : "rgba(255,255,255,0.06)",
-                    }}>
-                    {isDone ? (
-                      <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
-                        <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                      </svg>
-                    ) : isCurrent ? (
-                      <div className="w-3 h-3 rounded-full bg-white animate-pulse" />
-                    ) : (
-                      <div className="w-2 h-2 rounded-full bg-gray-600" />
-                    )}
-                  </div>
-                  <span className={`text-sm font-medium ${isDone || isCurrent ? "text-white" : "text-gray-500"}`}>
-                    {stage.label}
-                  </span>
-                </div>
-              );
-            })}
+          <div className="rounded-xl bg-surface border border-line p-5 sm:p-6 mb-6">
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <span className="flex items-center gap-2 text-sm font-medium text-fg min-w-0">
+                {!isActive && <span className="w-2 h-2 rounded-full bg-link animate-pulse shrink-0" aria-hidden />}
+                <span className="truncate">{step}</span>
+              </span>
+              <span className={`text-sm font-semibold tabular-nums ${isActive ? "text-success" : "text-link"}`}>{pct}%</span>
+            </div>
+            <div
+              className="h-2 w-full rounded-full overflow-hidden bg-surface-2"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={pct}
+              aria-label="Server setup progress"
+            >
+              <div
+                className={`h-full rounded-full transition-[width] duration-700 ease-out ${isActive ? "bg-success" : "bg-link"}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+
+            {slowConfirm && (
+              <p className="text-sm text-fg-muted mt-4">
+                Confirming your payment with Razorpay is taking longer than usual. You won&apos;t be charged again, and
+                it&apos;s safe to leave — your server will appear in{" "}
+                <Link href={DASHBOARD_URL} className="text-link hover:underline">
+                  My Servers
+                </Link>{" "}
+                once it&apos;s confirmed.
+              </p>
+            )}
+            {slowSetup && (
+              <p className="text-sm text-fg-muted mt-4">
+                This is taking longer than usual. We&apos;ll email you when it&apos;s ready, or you can{" "}
+                <Link href="/dashboard/support" className="text-link hover:underline">
+                  contact support
+                </Link>
+                .
+              </p>
+            )}
           </div>
         )}
 
-        {service?.status === "ACTIVE" && (
-          <div className="rounded-2xl p-6 mb-8" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)" }}>
-            <div className="flex justify-between text-sm mb-3">
-              <span className="text-gray-400">Hostname</span>
-              <span className="text-white font-mono">{service.hostname}</span>
-            </div>
-            <div className="flex justify-between text-sm mb-3">
-              <span className="text-gray-400">Server IP</span>
-              <span className="text-white font-mono">{service.serverIp}</span>
-            </div>
-            <p className="text-gray-500 text-xs mt-4">
-              Full login credentials have been sent to your email.
-            </p>
-          </div>
+        {isActive && (info?.serverIp || info?.ipv6Address) && (
+          <dl className="rounded-xl bg-surface border border-line divide-y divide-line mb-6">
+            <IpRow label="IPv4" value={info?.serverIp} />
+            <IpRow label="IPv6" value={info?.ipv6Address} />
+          </dl>
         )}
 
         {failed && (
-          <p className="text-sm text-red-400 rounded-lg px-4 py-3 mb-8" style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.25)" }}>
-            {service?.provisionError || "Provisioning failed. Please contact support."}
+          <p className="text-sm text-danger rounded-lg bg-danger/10 border border-danger/30 px-4 py-3 mb-6">
+            {info?.provisioningStep || "Provisioning failed."}
           </p>
         )}
 
-        <div className="flex justify-center">
-          <Link href="/dashboard/services"
-            className="px-6 py-3 rounded-xl text-sm font-semibold text-white transition-all hover:opacity-90"
-            style={{ background: "linear-gradient(135deg, #1B4FE8, #0EA5E9)" }}>
-            Go to Dashboard
+        <div className="flex flex-col sm:flex-row justify-center gap-3">
+          <Link href={DASHBOARD_URL}>
+            <Button size="lg" variant={isActive ? "primary" : "secondary"} className="w-full sm:w-auto">
+              {isActive ? "Open my servers" : "Go to my servers"}
+            </Button>
           </Link>
+          {failed && (
+            <Link href="/dashboard/support">
+              <Button size="lg" className="w-full sm:w-auto">
+                Contact support
+              </Button>
+            </Link>
+          )}
         </div>
-
-        {orderStatus === "PAID" && !service && (
-          <p className="text-gray-500 text-xs text-center mt-6">Waiting for server setup to begin...</p>
-        )}
       </div>
+    </div>
+  );
+}
+
+function IpRow({ label, value }: { label: string; value: string | null | undefined }) {
+  if (!value) return null;
+  return (
+    <div className="flex items-center justify-between gap-4 px-5 py-3 text-sm">
+      <dt className="text-fg-muted shrink-0">{label}</dt>
+      <dd className="flex items-center gap-1 min-w-0">
+        <code className="font-mono text-fg select-all break-all text-right">{value}</code>
+        <CopyButton value={value} label={`${label} address`} />
+      </dd>
     </div>
   );
 }

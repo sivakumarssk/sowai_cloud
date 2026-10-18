@@ -1,0 +1,21 @@
+import crypto from "node:crypto";
+import { runBillingJob } from "@/lib/billing/billingJob";
+
+/**
+ * Billing sweep — call every 15 minutes from cron on the app server:
+ *   *\/15 * * * * curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET" https://<app>/api/cron/billing
+ */
+export async function POST(req: Request) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return Response.json({ error: "CRON_SECRET is not configured" }, { status: 503 });
+
+  const given = Buffer.from(req.headers.get("authorization") ?? "");
+  const expected = Buffer.from(`Bearer ${secret}`);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const summary = await runBillingJob();
+  if (summary.errors.length > 0) console.error("[cron/billing]", summary.errors);
+  return Response.json(summary);
+}

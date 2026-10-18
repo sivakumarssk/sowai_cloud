@@ -1,6 +1,7 @@
 import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiError } from "@/lib/types";
+import { CYCLES, cycleKeyFromMonths, formatINR, type PriceQuote } from "@/lib/pricing";
 
 export async function GET(
   _req: Request,
@@ -16,12 +17,39 @@ export async function GET(
     include: {
       user: { select: { name: true, email: true, phone: true, company: true } },
       service: { include: { plan: true } },
+      order: { select: { billingCycle: true, quote: true } },
+      subscription: { select: { billingCycle: true } },
     },
   });
 
   if (!payment) return apiError("Invoice not found", 404);
 
-  const total = payment.amount + payment.gstAmount;
+  const total = payment.amount + payment.gstAmount + payment.processingFee;
+  const planName = payment.service?.plan?.name || "Hosting Service";
+  const periodText = (months: number) => (months === 1 ? "1 month" : CYCLES[cycleKeyFromMonths(months)].label);
+
+  // First payment of an order: itemise from the quote the customer accepted. Renewals: one line.
+  const quote = payment.order?.quote as PriceQuote | null | undefined;
+  const lines: { description: string; period: string; amount: number }[] = quote
+    ? [
+        {
+          description: `${planName} (${formatINR(quote.planRate)}/mo${quote.isIntro ? ", intro price" : ""})`,
+          period: periodText(quote.months),
+          amount: quote.planTotal,
+        },
+        ...quote.addons.map((a) => ({
+          description: `${a.name} (${formatINR(a.rate)}/mo)`,
+          period: periodText(quote.months),
+          amount: a.total,
+        })),
+      ]
+    : [
+        {
+          description: `${planName}${payment.subscription ? " — autopay renewal" : ""}`,
+          period: periodText(payment.subscription?.billingCycle ?? payment.order?.billingCycle ?? 1),
+          amount: payment.amount,
+        },
+      ];
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -56,10 +84,9 @@ export async function GET(
     <div class="logo">Sowsi Cloud Services</div>
     <div class="logo-sub">sowsicloud.com</div>
     <div class="logo-sub" style="margin-top:4px">Hyderabad, Telangana, India</div>
-    <div class="logo-sub">GSTIN: XXXXXXXXXXXX</div>
   </div>
   <div>
-    <div class="invoice-title">TAX INVOICE</div>
+    <div class="invoice-title">${payment.gstAmount > 0 ? "TAX INVOICE" : "INVOICE"}</div>
     <div class="invoice-meta">
       Invoice #${payment.invoiceNumber}<br>
       Date: ${new Date(payment.createdAt).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}<br>
@@ -87,24 +114,28 @@ export async function GET(
     </tr>
   </thead>
   <tbody>
-    <tr>
-      <td>${payment.service?.plan?.name || "Hosting Service"}</td>
-      <td>1 Month</td>
-      <td style="text-align:right">₹${payment.amount.toLocaleString("en-IN")}</td>
-    </tr>
+${lines
+  .map(
+    (l) => `    <tr>
+      <td>${l.description}</td>
+      <td>${l.period}</td>
+      <td style="text-align:right">${formatINR(l.amount)}</td>
+    </tr>`
+  )
+  .join("\n")}
   </tbody>
 </table>
 
 <table class="totals">
-  <tr><td>Subtotal</td><td style="text-align:right">₹${payment.amount.toLocaleString("en-IN")}</td></tr>
-  <tr><td>GST (18%)</td><td style="text-align:right">₹${payment.gstAmount.toLocaleString("en-IN")}</td></tr>
-  <tr class="total-row"><td>Total</td><td style="text-align:right">₹${total.toLocaleString("en-IN")}</td></tr>
+  <tr><td>Subtotal</td><td style="text-align:right">${formatINR(payment.amount)}</td></tr>
+  <tr><td>Payment processing</td><td style="text-align:right">${formatINR(payment.processingFee)}</td></tr>
+  ${payment.gstAmount > 0 ? `<tr><td>GST</td><td style="text-align:right">${formatINR(payment.gstAmount)}</td></tr>` : ""}
+  <tr class="total-row"><td>Total</td><td style="text-align:right">${formatINR(total)}</td></tr>
 </table>
 
 <div class="footer">
   This is a computer generated invoice. No signature required.<br>
-  Sowsi Cloud Services · Hyderabad, Telangana 500001 · support@sowsicloud.com<br>
-  GSTIN: XXXXXXXXXXXX
+  Sowsi Cloud Services · Hyderabad, Telangana 500001 · support@sowsicloud.com
 </div>
 </body>
 </html>`;

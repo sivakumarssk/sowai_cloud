@@ -34,7 +34,7 @@ export async function PATCH(
     where: { id },
     data: {
       ...(serverIp !== undefined && { serverIp }),
-      ...(sshUsername !== undefined && { sshUsername }),
+      ...(sshUsername !== undefined && { sshUsername: sshUsername ? encrypt(sshUsername) : null }),
       ...(sshPassword !== undefined && { sshPassword: sshPassword ? encrypt(sshPassword) : null }),
       ...(panelUrl !== undefined && { panelUrl }),
       ...(panelPassword !== undefined && { panelPassword: panelPassword ? encrypt(panelPassword) : null }),

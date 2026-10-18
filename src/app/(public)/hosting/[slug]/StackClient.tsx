@@ -3,12 +3,11 @@
 import { useState } from "react";
 import Link from "next/link";
 import Navbar from "@/components/landing/Navbar";
-import { type Plan, type BillingCycle, BILLING_OPTIONS, PlanGrid } from "@/components/pricing/PlanCards";
+import { type PublicPlan, type CycleKey, CyclePicker, PlanGrid } from "@/components/pricing/PlanCards";
 import type { HostingStack } from "@/lib/hostingStacks";
 
-export default function StackClient({ stack, plans }: { stack: HostingStack; plans: Plan[] }) {
-  const [cycle, setCycle] = useState<BillingCycle>(12);
-  const premium = stack.category === "DEDICATED";
+export default function StackClient({ stack, plans }: { stack: HostingStack; plans: PublicPlan[] }) {
+  const [cycle, setCycle] = useState<CycleKey>("1year");
 
   const faqJsonLd = {
     "@context": "https://schema.org",
@@ -45,33 +44,7 @@ export default function StackClient({ stack, plans }: { stack: HostingStack; pla
 
       {/* ── Billing cycle switcher ── */}
       <section className="pb-2 text-center px-4">
-        <div className="inline-flex flex-col items-center gap-3">
-          <div className="flex items-center p-1 gap-1 rounded-2xl"
-            style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)" }}>
-            {BILLING_OPTIONS.map((opt) => {
-              const isActive = cycle === opt.months;
-              return (
-                <button
-                  key={opt.months}
-                  onClick={() => setCycle(opt.months)}
-                  className="relative flex flex-col items-center px-5 py-3 rounded-xl transition-all duration-200"
-                  style={{
-                    minWidth: 100,
-                    background: isActive ? "linear-gradient(135deg, #1B4FE8, #0EA5E9)" : "transparent",
-                    boxShadow: isActive ? "0 4px 20px rgba(27,79,232,0.4)" : "none",
-                  }}
-                >
-                  <span className={`text-sm font-bold ${isActive ? "text-white" : "text-gray-300"}`}>
-                    {opt.label}
-                  </span>
-                  <span className={`text-xs mt-0.5 ${isActive ? "text-blue-100" : "text-gray-500"}`}>
-                    {opt.sublabel}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
+        {plans.length > 0 && <CyclePicker plans={plans} cycle={cycle} onChange={setCycle} />}
       </section>
 
       {/* ── Plans ── */}
@@ -80,7 +53,7 @@ export default function StackClient({ stack, plans }: { stack: HostingStack; pla
           {plans.length === 0 ? (
             <div className="text-center py-16 text-gray-500">Plans coming soon for this category.</div>
           ) : (
-            <PlanGrid plans={plans} cycle={cycle} premium={premium} />
+            <PlanGrid plans={plans} cycle={cycle} />
           )}
         </div>
       </section>

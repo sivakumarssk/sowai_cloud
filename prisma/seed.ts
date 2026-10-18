@@ -25,243 +25,348 @@ async function main() {
   });
   console.log("Admin created:", admin.email);
 
-  // Plans
-  const plans = [
-    // Shared Hosting - Standard
+  // ── Plans — all prices in PAISE per month (₹599 = 59900) ──
+  // Standard plans: intro rate for a prepaid first term, then monthly at priceRenewal.
+  // Dedicated plans: flat monthly price (= renewal), plus 1/2-year term prices
+  // (~10% / ~20% off) that every customer gets, not just new ones.
+  type SeedPlan = {
+    slug: string;
+    name: string;
+    category: "VPS" | "STORAGE";
+    sortOrder: number;
+    isPopular?: boolean;
+    isDedicated?: boolean;
+    priceMonthly: number;
+    priceIntro1Year?: number;
+    priceIntro2Year?: number;
+    priceRenewal: number;
+    vcpu?: number;
+    ramGB?: number;
+    storageGB: number;
+    bandwidthTB?: number;
+    features: string[];
+  };
+
+  const plans: SeedPlan[] = [
     {
-      name: "Shared Starter",
-      category: "SHARED" as const,
-      tier: "STANDARD" as const,
-      price: 99,
-      features: {
-        websites: "1 Website",
-        storage: "10 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificate",
-        emails: "1 Email Account",
-        backups: "Weekly Backup",
-        support: "Email Support",
-      },
-    },
-    {
-      name: "Shared Business",
-      category: "SHARED" as const,
-      tier: "STANDARD" as const,
-      price: 199,
-      features: {
-        websites: "5 Websites",
-        storage: "30 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificate",
-        emails: "10 Email Accounts",
-        backups: "Daily Backup",
-        support: "Priority Email Support",
-        database: "Unlimited MySQL Databases",
-      },
-    },
-    {
-      name: "Shared Enterprise",
-      category: "SHARED" as const,
-      tier: "STANDARD" as const,
-      price: 299,
-      features: {
-        websites: "Unlimited Websites",
-        storage: "100 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificate",
-        emails: "Unlimited Email Accounts",
-        backups: "Daily Backup (7-day retention)",
-        support: "24/7 Priority Support",
-        database: "Unlimited MySQL Databases",
-        staging: "Free Staging Environment",
-      },
-    },
-    // VPS Hosting - Standard
-    {
+      slug: "VPS_BASIC",
       name: "VPS Basic",
-      category: "VPS" as const,
-      tier: "STANDARD" as const,
-      price: 799,
-      features: {
-        cpu: "2 vCPU Cores",
-        ram: "4 GB RAM",
-        storage: "80 GB NVMe SSD",
-        bandwidth: "3 TB Bandwidth",
-        os: "Choice of Linux OS",
-        panel: "Coolify Panel Included",
-        support: "Email Support",
-        ip: "1 Dedicated IP",
-      },
+      category: "VPS",
+      sortOrder: 1,
+      priceMonthly: 149900,
+      priceIntro1Year: 59900,
+      priceIntro2Year: 79900,
+      priceRenewal: 129900,
+      vcpu: 1,
+      ramGB: 2,
+      storageGB: 40,
+      bandwidthTB: 3,
+      features: [
+        "1 vCPU Core",
+        "2 GB RAM",
+        "40 GB NVMe SSD",
+        "3 TB Bandwidth",
+        "1 Dedicated IP",
+        "Full Root SSH Access",
+        "Choice of OS",
+        "Email Support",
+        "Free SSL Certificate",
+      ],
     },
     {
+      slug: "VPS_PRO",
       name: "VPS Pro",
-      category: "VPS" as const,
-      tier: "STANDARD" as const,
-      price: 1299,
-      features: {
-        cpu: "4 vCPU Cores",
-        ram: "8 GB RAM",
-        storage: "160 GB NVMe SSD",
-        bandwidth: "6 TB Bandwidth",
-        os: "Choice of Linux OS",
-        panel: "Coolify Panel Included",
-        support: "Priority Support",
-        ip: "2 Dedicated IPs",
-        backups: "Weekly Snapshots",
-      },
+      category: "VPS",
+      sortOrder: 2,
+      isPopular: true,
+      priceMonthly: 229900,
+      priceIntro1Year: 99900,
+      priceIntro2Year: 129900,
+      priceRenewal: 199900,
+      vcpu: 2,
+      ramGB: 4,
+      storageGB: 80,
+      bandwidthTB: 6,
+      features: [
+        "2 vCPU Cores",
+        "4 GB RAM",
+        "80 GB NVMe SSD",
+        "6 TB Bandwidth",
+        "2 Dedicated IPs",
+        "Full Root SSH Access",
+        "Choice of OS",
+        "Coolify Panel Included",
+        "Priority Support",
+        "Free SSL Certificate",
+        "Weekly Snapshots",
+      ],
     },
     {
+      slug: "VPS_ELITE",
       name: "VPS Elite",
-      category: "VPS" as const,
-      tier: "STANDARD" as const,
-      price: 1999,
-      features: {
-        cpu: "8 vCPU Cores",
-        ram: "16 GB RAM",
-        storage: "320 GB NVMe SSD",
-        bandwidth: "12 TB Bandwidth",
-        os: "Choice of Linux OS",
-        panel: "Coolify Panel Included",
-        support: "24/7 Priority Support",
-        ip: "3 Dedicated IPs",
-        backups: "Daily Snapshots",
-        monitoring: "Advanced Monitoring",
-      },
-    },
-    // WordPress Hosting - Standard
-    {
-      name: "WordPress Starter",
-      category: "WORDPRESS" as const,
-      tier: "STANDARD" as const,
-      price: 199,
-      features: {
-        websites: "1 WordPress Site",
-        storage: "25 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificate",
-        staging: "Staging Environment",
-        updates: "Auto WordPress Updates",
-        backups: "Daily Backup",
-        support: "Email Support",
-      },
+      category: "VPS",
+      sortOrder: 3,
+      priceMonthly: 399900,
+      priceIntro1Year: 179900,
+      priceIntro2Year: 229900,
+      priceRenewal: 349900,
+      vcpu: 4,
+      ramGB: 8,
+      storageGB: 160,
+      bandwidthTB: 12,
+      features: [
+        "4 vCPU Cores",
+        "8 GB RAM",
+        "160 GB NVMe SSD",
+        "12 TB Bandwidth",
+        "3 Dedicated IPs",
+        "Full Root SSH Access",
+        "Choice of OS",
+        "Coolify Panel Included",
+        "24/7 Priority Support",
+        "Free SSL Certificate",
+        "Daily Snapshots",
+        "Advanced Monitoring",
+      ],
     },
     {
-      name: "WordPress Business",
-      category: "WORDPRESS" as const,
-      tier: "STANDARD" as const,
-      price: 399,
-      features: {
-        websites: "5 WordPress Sites",
-        storage: "75 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificates",
-        staging: "Staging Environments",
-        updates: "Auto WordPress Updates",
-        backups: "Daily Backup (14-day retention)",
-        support: "Priority Support",
-        caching: "Built-in Redis Cache",
-      },
+      slug: "S4_STARTER",
+      name: "S4 Starter",
+      category: "STORAGE",
+      sortOrder: 1,
+      priceMonthly: 44900,
+      priceIntro1Year: 9900,
+      priceRenewal: 39900,
+      storageGB: 100,
+      features: ["100 GB Storage", "S3 Compatible API", "Unlimited Bandwidth", "UPI Payment", "Email Support"],
     },
     {
-      name: "WordPress Enterprise",
-      category: "WORDPRESS" as const,
-      tier: "STANDARD" as const,
-      price: 599,
-      features: {
-        websites: "Unlimited WordPress Sites",
-        storage: "200 GB NVMe SSD",
-        bandwidth: "Unlimited Bandwidth",
-        ssl: "Free SSL Certificates",
-        staging: "Unlimited Staging Environments",
-        updates: "Auto WordPress Updates",
-        backups: "Daily Backup (30-day retention)",
-        support: "24/7 Priority Support",
-        caching: "Built-in Redis + Varnish Cache",
-        cdn: "Free CDN Included",
-      },
-    },
-    // Object Storage - Standard
-    {
-      name: "Storage Basic",
-      category: "STORAGE" as const,
-      tier: "STANDARD" as const,
-      price: 299,
-      features: {
-        storage: "500 GB Object Storage",
-        bandwidth: "1 TB Egress/month",
-        api: "S3-Compatible API",
-        redundancy: "3x Redundancy",
-        access: "Public/Private Buckets",
-        support: "Email Support",
-      },
+      slug: "S4_BASIC",
+      name: "S4 Basic",
+      category: "STORAGE",
+      sortOrder: 2,
+      priceMonthly: 79900,
+      priceIntro1Year: 24900,
+      priceRenewal: 69900,
+      storageGB: 250,
+      features: [
+        "250 GB Storage",
+        "S3 Compatible API",
+        "Unlimited Bandwidth",
+        "UPI Payment",
+        "Email Support",
+        "Versioning Support",
+      ],
     },
     {
-      name: "Storage Pro",
-      category: "STORAGE" as const,
-      tier: "STANDARD" as const,
-      price: 599,
-      features: {
-        storage: "2 TB Object Storage",
-        bandwidth: "5 TB Egress/month",
-        api: "S3-Compatible API",
-        redundancy: "3x Redundancy",
-        access: "Public/Private Buckets",
-        support: "Priority Support",
-        versioning: "Object Versioning",
-        cdn: "CDN Integration",
-      },
+      slug: "S4_PRO",
+      name: "S4 Pro",
+      category: "STORAGE",
+      sortOrder: 3,
+      isPopular: true,
+      priceMonthly: 149900,
+      priceIntro1Year: 44900,
+      priceRenewal: 129900,
+      storageGB: 500,
+      features: [
+        "500 GB Storage",
+        "S3 Compatible API",
+        "Unlimited Bandwidth",
+        "UPI Payment",
+        "Priority Support",
+        "Versioning Support",
+        "CDN Ready",
+      ],
     },
     {
-      name: "Storage Max",
-      category: "STORAGE" as const,
-      tier: "STANDARD" as const,
-      price: 999,
-      features: {
-        storage: "5 TB Object Storage",
-        bandwidth: "Unlimited Egress",
-        api: "S3-Compatible API",
-        redundancy: "3x Redundancy + Cross-region",
-        access: "Public/Private Buckets",
-        support: "24/7 Priority Support",
-        versioning: "Object Versioning",
-        cdn: "Free CDN Included",
-        lifecycle: "Lifecycle Policies",
-      },
+      slug: "S4_BUSINESS",
+      name: "S4 Business",
+      category: "STORAGE",
+      sortOrder: 4,
+      priceMonthly: 299900,
+      priceIntro1Year: 79900,
+      priceRenewal: 249900,
+      storageGB: 1024,
+      features: [
+        "1 TB Storage",
+        "S3 Compatible API",
+        "Unlimited Bandwidth",
+        "UPI Payment",
+        "24/7 Priority Support",
+        "Versioning Support",
+        "CDN Ready",
+        "Dedicated Bucket",
+        "SLA Support",
+      ],
     },
-    // Dedicated Server Plans
+    // ── Dedicated VPS — guaranteed resources, flat monthly price ──
+    // TODO(confirm): Starter and Pro specs are placeholders (2/4/80 and 8/16/320).
     {
-      name: "Dedicated Server Basic",
-      category: "DEDICATED" as const,
-      tier: "PREMIUM" as const,
-      price: 3000,
-      features: {
-        cpu: "8 Cores Dedicated CPU",
-        ram: "16 GB RAM",
-        storage: "1 TB NVMe SSD",
-        bandwidth: "Unmetered Bandwidth",
-        access: "Full Root Access",
-        network: "1 Gbps Network Port",
-        setup: "Free Setup & Migration",
-        support: "24/7 Priority Support",
-        sla: "99.9% Uptime SLA",
-      },
+      slug: "DEDICATED_STARTER",
+      name: "Dedicated Starter",
+      category: "VPS",
+      isDedicated: true,
+      sortOrder: 11,
+      priceMonthly: 249900,
+      priceIntro1Year: 219900,
+      priceIntro2Year: 199900,
+      priceRenewal: 249900,
+      vcpu: 2,
+      ramGB: 4,
+      storageGB: 80,
+      bandwidthTB: 4,
+      features: [
+        "2 vCPU (Guaranteed)",
+        "4 GB RAM",
+        "80 GB NVMe SSD",
+        "Daily Backups Included",
+        "Coolify Panel Included",
+        "24/7 Priority Support",
+        "99.9% SLA Uptime",
+        "Managed Setup",
+      ],
     },
     {
-      name: "Dedicated Server Pro",
-      category: "DEDICATED" as const,
-      tier: "PREMIUM" as const,
-      price: 5000,
-      features: {
-        cpu: "16 Cores Dedicated CPU",
-        ram: "64 GB RAM",
-        storage: "2 TB NVMe SSD (RAID 1)",
-        bandwidth: "Unmetered Bandwidth",
-        access: "Full Root Access + IPMI/KVM",
-        network: "10 Gbps Network Port",
-        setup: "Free Setup & Migration",
-        support: "Dedicated Account Manager",
-        sla: "99.99% Uptime SLA",
-      },
+      slug: "DEDICATED_BUSINESS",
+      name: "Dedicated Business",
+      category: "VPS",
+      isDedicated: true,
+      isPopular: true,
+      sortOrder: 12,
+      priceMonthly: 499900,
+      priceIntro1Year: 449900,
+      priceIntro2Year: 399900,
+      priceRenewal: 499900,
+      vcpu: 4,
+      ramGB: 8,
+      storageGB: 160,
+      bandwidthTB: 8,
+      features: [
+        "4 vCPU (Guaranteed)",
+        "8 GB RAM",
+        "160 GB NVMe SSD",
+        "Daily Backups Included",
+        "Coolify Panel Included",
+        "24/7 Priority Support",
+        "99.9% SLA Uptime",
+        "Managed Setup",
+      ],
+    },
+    {
+      slug: "DEDICATED_PRO",
+      name: "Dedicated Pro",
+      category: "VPS",
+      isDedicated: true,
+      sortOrder: 13,
+      priceMonthly: 899900,
+      priceIntro1Year: 799900,
+      priceIntro2Year: 719900,
+      priceRenewal: 899900,
+      vcpu: 8,
+      ramGB: 16,
+      storageGB: 320,
+      bandwidthTB: 16,
+      features: [
+        "8 vCPU (Guaranteed)",
+        "16 GB RAM",
+        "320 GB NVMe SSD",
+        "Daily Backups Included",
+        "Coolify Panel Included",
+        "24/7 Priority Support",
+        "99.9% SLA Uptime",
+        "Managed Setup",
+      ],
+    },
+
+    // ── Dedicated S4 — flat monthly price ──
+    {
+      slug: "S4_DEDICATED_500GB",
+      name: "S4 Dedicated 500GB",
+      category: "STORAGE",
+      isDedicated: true,
+      sortOrder: 10,
+      priceMonthly: 199900,
+      priceIntro1Year: 179900,
+      priceIntro2Year: 159900,
+      priceRenewal: 199900,
+      storageGB: 500,
+      features: [
+        "500 GB Dedicated Storage",
+        "Dedicated Bucket",
+        "Guaranteed Throughput",
+        "Priority Egress",
+        "S3 Compatible API",
+        "Versioning Support",
+        "SLA Backed",
+        "24/7 Priority Support",
+      ],
+    },
+    {
+      slug: "S4_DEDICATED_1TB",
+      name: "S4 Dedicated 1TB",
+      category: "STORAGE",
+      isDedicated: true,
+      sortOrder: 11,
+      priceMonthly: 299900,
+      priceIntro1Year: 269900,
+      priceIntro2Year: 239900,
+      priceRenewal: 299900,
+      storageGB: 1024,
+      features: [
+        "1 TB Dedicated Storage",
+        "Dedicated Bucket",
+        "Guaranteed Throughput",
+        "Priority Egress",
+        "S3 Compatible API",
+        "Versioning Support",
+        "SLA Backed",
+        "24/7 Priority Support",
+      ],
+    },
+    {
+      slug: "S4_DEDICATED_5TB",
+      name: "S4 Dedicated 5TB",
+      category: "STORAGE",
+      isDedicated: true,
+      isPopular: true,
+      sortOrder: 12,
+      priceMonthly: 799900,
+      priceIntro1Year: 719900,
+      priceIntro2Year: 639900,
+      priceRenewal: 799900,
+      storageGB: 5120,
+      features: [
+        "5 TB Dedicated Storage",
+        "Dedicated Bucket",
+        "Guaranteed Throughput",
+        "Priority Egress",
+        "S3 Compatible API",
+        "Versioning Support",
+        "SLA Backed",
+        "24/7 Priority Support",
+      ],
+    },
+    {
+      slug: "S4_DEDICATED_10TB",
+      name: "S4 Dedicated 10TB",
+      category: "STORAGE",
+      isDedicated: true,
+      sortOrder: 13,
+      priceMonthly: 1399900,
+      priceIntro1Year: 1259900,
+      priceIntro2Year: 1119900,
+      priceRenewal: 1399900,
+      storageGB: 10240,
+      features: [
+        "10 TB Dedicated Storage",
+        "Dedicated Bucket",
+        "Guaranteed Throughput",
+        "Priority Egress",
+        "S3 Compatible API",
+        "Versioning Support",
+        "SLA Backed",
+        "24/7 Priority Support",
+      ],
     },
   ];
 
@@ -275,20 +380,120 @@ async function main() {
   ];
   await prisma.plan.deleteMany({ where: { id: { in: staleIds } } });
 
+  const currentIds: string[] = [];
   for (const plan of plans) {
-    await prisma.plan.upsert({
-      where: {
-        id: `${plan.category}_${plan.name.replace(/\s+/g, "_").toUpperCase()}`,
-      },
-      update: plan,
-      create: {
-        id: `${plan.category}_${plan.name.replace(/\s+/g, "_").toUpperCase()}`,
-        ...plan,
-      },
-    });
+    const id = `${plan.category}_${plan.name.replace(/\s+/g, "_").toUpperCase()}`;
+    currentIds.push(id);
+    const data = {
+      ...plan,
+      tier: plan.isDedicated ? ("PREMIUM" as const) : ("STANDARD" as const),
+      isActive: true,
+      isPopular: plan.isPopular ?? false,
+      isDedicated: plan.isDedicated ?? false,
+      priceIntro1Year: plan.priceIntro1Year ?? null,
+      priceIntro2Year: plan.priceIntro2Year ?? null,
+      vcpu: plan.vcpu ?? null,
+      ramGB: plan.ramGB ?? null,
+      bandwidthTB: plan.bandwidthTB ?? null,
+      // Legacy column, kept in sync with the headline rate.
+      price: plan.priceIntro1Year ?? plan.priceMonthly,
+    };
+    await prisma.plan.upsert({ where: { id }, update: data, create: { id, ...data } });
   }
 
-  console.log(`Seeded ${plans.length} plans`);
+  // Shared / WordPress / Dedicated / old Storage plans: hidden, not deleted,
+  // because old orders and services may still reference them.
+  const retired = await prisma.plan.updateMany({
+    where: { id: { notIn: currentIds }, isActive: true },
+    data: { isActive: false },
+  });
+
+  console.log(`Seeded ${plans.length} plans, retired ${retired.count}`);
+
+  // ── Addons — monthly prices in PAISE ──
+  const addons = [
+    {
+      slug: "dailyBackup",
+      name: "Daily Backup",
+      description: "Automatic daily backups with 7-day retention",
+      priceMonthly: 19900,
+      categories: ["VPS" as const],
+      exclusiveGroup: "backup",
+      sortOrder: 1,
+    },
+    {
+      slug: "weeklyBackup",
+      name: "Weekly Backup",
+      description: "Automatic weekly backups with 4-week retention",
+      priceMonthly: 9900,
+      categories: ["VPS" as const],
+      exclusiveGroup: "backup",
+      sortOrder: 2,
+    },
+    {
+      slug: "coolify",
+      name: "Coolify Panel",
+      description: "Deploy apps with a GUI — no command line needed",
+      priceMonthly: 9900,
+      categories: ["VPS" as const],
+      exclusiveGroup: null,
+      sortOrder: 3,
+    },
+    {
+      slug: "extraIp",
+      name: "Extra IP",
+      description: "Additional dedicated IP address for your server",
+      priceMonthly: 14900,
+      categories: ["VPS" as const],
+      exclusiveGroup: null,
+      sortOrder: 4,
+    },
+    {
+      slug: "s4Versioning",
+      name: "S4 Versioning",
+      description: "Keep previous versions of every object",
+      priceMonthly: 9900,
+      categories: ["STORAGE" as const],
+      exclusiveGroup: null,
+      sortOrder: 5,
+    },
+  ];
+  for (const addon of addons) {
+    await prisma.addon.upsert({ where: { slug: addon.slug }, update: addon, create: addon });
+  }
+  console.log(`Seeded ${addons.length} addons`);
+
+  // ── Resource engine: register the existing Proxmox host from .env ──
+  const nodeName = process.env.PROXMOX_NODE;
+  const nodeHost = process.env.PROXMOX_HOST;
+  const hetznerServerId = process.env.HETZNER_SERVER_ID;
+  if (nodeName && nodeHost && hetznerServerId) {
+    const nodeData = {
+      ip: nodeHost,
+      hetznerServerId,
+      location: process.env.HETZNER_LOCATION || "nbg1",
+      ipv6Subnet: process.env.PROXMOX_IPV6_SUBNET || null,
+      // Hetzner CPX32: 4 vCPU, 8 GB RAM, 160 GB disk, ~₹3,300/month.
+      physicalRamMB: 8192,
+      physicalDiskGB: 160,
+      physicalCpu: 4,
+      monthlyCost: Number(process.env.PROXMOX_NODE_MONTHLY_COST_PAISE || 330000),
+    };
+    const node = await prisma.proxmoxNode.upsert({
+      where: { name: nodeName },
+      update: nodeData,
+      create: { name: nodeName, ...nodeData },
+    });
+    // Containers created before the engine existed all live on this node.
+    const linked = await prisma.service.updateMany({
+      where: { proxmoxVmId: { not: null }, nodeId: null },
+      data: { nodeId: node.id },
+    });
+    console.log(`Registered node ${node.name} (${node.ip}); linked ${linked.count} existing containers`);
+  } else {
+    console.log("PROXMOX_NODE / PROXMOX_HOST / HETZNER_SERVER_ID not set — skipped node registration");
+  }
+
   console.log("Done!");
 }
 
