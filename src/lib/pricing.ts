@@ -20,12 +20,14 @@ export function cycleKeyFromMonths(months: number): CycleKey {
 }
 
 /**
- * Payment charges passed on to the customer (no GST while unregistered).
+ * Payment charges passed on to the customer.
  * 4% because Razorpay charges 3-4% on autopay (subscription) payments.
  */
 export const PROCESSING_FEE_PERCENT = 4;
-/** Set when GST registration is in place; 0 means no GST is charged. */
-export const GST_PERCENT = 0;
+/** GST on the plan + add-ons subtotal. Stored separately (invoices list it) but shown inside "Charges" in the UI. */
+export const GST_PERCENT = 18;
+/** What the UI calls "Charges": payment fee + GST, as one percentage of the subtotal. */
+export const CHARGES_PERCENT = PROCESSING_FEE_PERCENT + GST_PERCENT;
 
 export function processingFeeOn(subtotal: number): number {
   return Math.round((subtotal * PROCESSING_FEE_PERCENT) / 100);

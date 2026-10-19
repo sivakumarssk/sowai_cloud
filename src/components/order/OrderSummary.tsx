@@ -1,4 +1,4 @@
-import { type PriceQuote, CYCLES, GST_PERCENT, formatINR } from "@/lib/pricing";
+import { type PriceQuote, CYCLES, formatINR } from "@/lib/pricing";
 
 /**
  * Price breakdown shown on every step of the deploy flow (DESIGN.md §9).
@@ -50,16 +50,11 @@ export function OrderSummary({
             <dt className="text-fg-muted">Subtotal</dt>
             <dd className="text-fg tabular-nums">{formatINR(quote.subtotal)}</dd>
           </div>
+          {/* Payment fee + GST, shown as one line */}
           <div className="flex justify-between">
             <dt className="text-fg-muted">Charges</dt>
-            <dd className="text-fg tabular-nums">{formatINR(quote.processingFee)}</dd>
+            <dd className="text-fg tabular-nums">{formatINR(quote.processingFee + quote.gst)}</dd>
           </div>
-          {quote.gst > 0 && (
-            <div className="flex justify-between">
-              <dt className="text-fg-muted">GST ({GST_PERCENT}%)</dt>
-              <dd className="text-fg tabular-nums">{formatINR(quote.gst)}</dd>
-            </div>
-          )}
         </div>
 
         <div className="border-t border-line mt-3 pt-3 flex items-baseline justify-between">

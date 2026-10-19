@@ -37,10 +37,9 @@ export async function POST(req: NextRequest) {
   // Renew on the charges the customer was quoted (the rate may have changed since);
   // orders without a saved quote use the current rate.
   const quotedRenewal = (order.quote as PriceQuote | null)?.renewal;
-  const recurringFee =
-    quotedRenewal && quotedRenewal.monthlySubtotal === recurringAmount
-      ? quotedRenewal.processingFee
-      : processingFeeOn(recurringAmount);
+  const quoted = quotedRenewal && quotedRenewal.monthlySubtotal === recurringAmount ? quotedRenewal : null;
+  const recurringFee = quoted ? quoted.processingFee : processingFeeOn(recurringAmount);
+  const recurringGst = quoted ? quoted.gst : gstOn(recurringAmount);
 
   // Reuse the subscription from an earlier "Pay" click that wasn't completed.
   let subscription = await prisma.subscription.findFirst({
@@ -55,7 +54,7 @@ export async function POST(req: NextRequest) {
         orderId: order.id,
         billingCycle: recurringCycle,
         amount: recurringAmount,
-        gstAmount: gstOn(recurringAmount),
+        gstAmount: recurringGst,
         processingFee: recurringFee,
         ...(prepaid && {
           startAt: addMonths(new Date(), order.billingCycle),

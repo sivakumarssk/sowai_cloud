@@ -25,6 +25,8 @@ async function getPlans() {
 
 export default async function PricingPage({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
   const [plans, { tab }] = await Promise.all([getPlans(), searchParams]);
-  const initialTab = tab === "storage" ? "STORAGE" : tab === "dedicated" ? "DEDICATED" : "VPS";
+  // Object storage tab is hidden for now, so ?tab=storage falls back to VPS.
+  // const initialTab = tab === "storage" ? "STORAGE" : tab === "dedicated" ? "DEDICATED" : "VPS";
+  const initialTab = tab === "dedicated" ? "DEDICATED" : "VPS";
   return <PricingClient plans={plans} initialTab={initialTab} />;
 }

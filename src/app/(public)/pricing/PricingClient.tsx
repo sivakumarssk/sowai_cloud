@@ -5,6 +5,7 @@ import Link from "next/link";
 import Navbar from "@/components/landing/Navbar";
 import { type CycleKey, type PublicPlan, CyclePicker, PlanGrid, DedicatedGrid } from "@/components/pricing/PlanCards";
 import {
+  CHARGES_PERCENT,
   PROCESSING_FEE_PERCENT,
   GST_PERCENT,
   CYCLES,
@@ -20,7 +21,8 @@ type Tab = "VPS" | "STORAGE" | "DEDICATED";
 
 const TABS: { key: Tab; label: string; query: string }[] = [
   { key: "VPS", label: "VPS Hosting", query: "vps" },
-  { key: "STORAGE", label: "Object Storage", query: "storage" },
+  // Object storage is hidden for now; uncomment to bring the tab back.
+  // { key: "STORAGE", label: "Object Storage", query: "storage" },
   { key: "DEDICATED", label: "Dedicated", query: "dedicated" },
 ];
 
@@ -106,10 +108,8 @@ const FAQ: { q: string; a: string }[] = [
     a: "You pay the first term at checkout and set up autopay with UPI, a card or netbanking. Cancel anytime from your dashboard; your server runs until the paid period ends.",
   },
   {
-    q: `What are the ${PROCESSING_FEE_PERCENT}% charges?`,
-    a: `Payment gateway charges, shown before you pay.${
-      GST_PERCENT > 0 ? ` GST at ${GST_PERCENT}% is also added.` : ""
-    } Nothing else is added.`,
+    q: `What are the ${CHARGES_PERCENT}% charges?`,
+    a: `${PROCESSING_FEE_PERCENT}% payment gateway charges and ${GST_PERCENT}% GST, shown as one line before you pay. Nothing else is added.`,
   },
   {
     q: "Where are the servers located?",
@@ -256,8 +256,7 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
         <h1 className="text-3xl sm:text-4xl font-bold text-fg tracking-tight max-w-2xl mx-auto">{HEADLINES[tab].title}</h1>
         <p className="text-fg-muted text-base sm:text-lg max-w-2xl mx-auto mt-4">{HEADLINES[tab].sub}</p>
         <p className="text-xs text-fg-muted mt-4">
-          Prices in INR · {PROCESSING_FEE_PERCENT}% charges at checkout
-          {GST_PERCENT > 0 && ` · GST ${GST_PERCENT}% extra`}
+          Prices in INR · {CHARGES_PERCENT}% charges at checkout
         </p>
       </section>
 

@@ -252,7 +252,8 @@ export default function LandingPage() {
 
           <div className="text-center mt-8">
             <Link href="/pricing" className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors">
-              See VPS, WordPress & Object Storage plans →
+              {/* Object storage hidden for now — was "See VPS, WordPress & Object Storage plans →" */}
+              See VPS & Dedicated plans →
             </Link>
           </div>
         </div>
@@ -395,7 +396,7 @@ export default function LandingPage() {
                   { href: "/pricing", label: "Shared Hosting" },
                   { href: "/pricing", label: "VPS Hosting" },
                   { href: "/pricing", label: "WordPress Hosting" },
-                  { href: "/pricing", label: "Object Storage" },
+                  // { href: "/pricing", label: "Object Storage" }, // hidden for now
                   { href: "/pricing", label: "Dedicated Servers" },
                 ],
               },
