@@ -27,8 +27,8 @@ async function main() {
 
   // ── Plans — all prices in PAISE per month (₹599 = 59900) ──
   // Standard plans: intro rate for a prepaid first term, then monthly at priceRenewal.
-  // Dedicated plans: flat monthly price (= renewal), plus 1/2-year term prices
-  // (~10% / ~20% off) that every customer gets, not just new ones.
+  // Dedicated plans: flat monthly price (= renewal), plus 1/2-year term prices that
+  // every customer gets, not just new ones: Dedicated VPS 30% / 50% off, Dedicated S4 ~10% / ~20% off.
   type SeedPlan = {
     slug: string;
     name: string;
@@ -208,8 +208,8 @@ async function main() {
       isDedicated: true,
       sortOrder: 11,
       priceMonthly: 249900,
-      priceIntro1Year: 219900,
-      priceIntro2Year: 199900,
+      priceIntro1Year: 174900,
+      priceIntro2Year: 124900,
       priceRenewal: 249900,
       vcpu: 2,
       ramGB: 4,
@@ -234,8 +234,8 @@ async function main() {
       isPopular: true,
       sortOrder: 12,
       priceMonthly: 499900,
-      priceIntro1Year: 449900,
-      priceIntro2Year: 399900,
+      priceIntro1Year: 349900,
+      priceIntro2Year: 249900,
       priceRenewal: 499900,
       vcpu: 4,
       ramGB: 8,
@@ -259,8 +259,8 @@ async function main() {
       isDedicated: true,
       sortOrder: 13,
       priceMonthly: 899900,
-      priceIntro1Year: 799900,
-      priceIntro2Year: 719900,
+      priceIntro1Year: 629900,
+      priceIntro2Year: 449900,
       priceRenewal: 899900,
       vcpu: 8,
       ramGB: 16,
