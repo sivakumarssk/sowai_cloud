@@ -193,6 +193,20 @@ echo "restrict,command=\"/usr/local/sbin/sowsi-host\" $PROVISIONING_PUBKEY" >> "
 cat "$TMP" > "$AUTH"
 rm -f "$TMP"
 
+echo "== 9. Container storage can list orphaned disks"
+# Proxmox labels a disk "rootdir" only while its container exists; a disk left
+# behind by a deleted container is labelled "images". A storage without the
+# "images" content type hides those orphans from every listing (pvesm list and
+# the API), so the engine's leftover-disk check couldn't see them.
+CONTAINER_STORAGE=${CONTAINER_STORAGE:-local}
+content=$(pvesh get "/storage/$CONTAINER_STORAGE" --output-format json | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
+if [[ ",$content," != *",images,"* ]]; then
+  pvesm set "$CONTAINER_STORAGE" --content "${content:+$content,}images"
+  echo "added 'images' content to $CONTAINER_STORAGE (was: ${content:-none})"
+else
+  echo "$CONTAINER_STORAGE already lists images ($content)"
+fi
+
 echo
 echo "== Done"
 ip -br link show vmbr1

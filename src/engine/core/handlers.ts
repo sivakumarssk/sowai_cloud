@@ -45,6 +45,7 @@ export function buildHandlers(deps: HandlerDeps): Partial<Record<ActionKind, Act
       const plan = await deps.diskExpander.plan(await deps.target(p.serviceId), { purpose: p.purpose, addGB: p.addGB, reason: "engine decision" });
       if (!plan.ok) return `skipped: ${plan.reason}`;
       const after = await deps.diskExpander.execute(plan, trigger(ctx));
+      if (after.queuedUntilRestart) return `${plan.summary} → queued until the container restarts (${after.queuedUntilRestart})`;
       return `${plan.summary} → root ${after.rootGB} GB, /data ${after.dataGB} GB`;
     },
 

@@ -86,6 +86,27 @@ export type StorageStatus = { total: number; used: number; avail: number; active
 /** One disk image on a storage; `size` is the allocated (provisioned) size in bytes. */
 export type StorageVolume = { volid: string; vmid: number | null; size: number; used: number | null };
 
+/**
+ * One key of a container's config from GET …/lxc/{vmid}/pending: `value` is
+ * what the container runs with now, `pending` what it gets at the next
+ * restart, `delete` = 1/2 when the key is removed at the next restart.
+ */
+export type LXCPendingEntry = { key: string; value?: string | number; pending?: string | number; delete?: number };
+
+type ContentItem = { volid: string; content?: string; vmid?: number | string; size?: number; used?: number };
+
+/**
+ * Disk images from a storage content listing. Proxmox labels a disk
+ * "rootdir" only while its owner is an existing container; once the
+ * container is gone (or for a VM) the same file is labelled "images". Both
+ * are kept so orphans of deleted containers are never missed.
+ */
+export function diskVolumes(items: ContentItem[]): StorageVolume[] {
+  return items
+    .filter((i) => i.content === "images" || i.content === "rootdir")
+    .map((i) => ({ volid: i.volid, vmid: i.vmid === undefined ? null : Number(i.vmid), size: i.size ?? 0, used: i.used ?? null }));
+}
+
 export class ProxmoxService {
   private client: AxiosInstance | null = null;
 
@@ -353,19 +374,13 @@ export class ProxmoxService {
     return { total: s.total ?? 0, used: s.used ?? 0, avail: s.avail ?? 0, active: Boolean(s.active) };
   }
 
-  /** Container disk images (root disks and mount points) on a storage. */
+  /**
+   * Every disk image on a storage — container disks and orphans of deleted
+   * containers alike. No content filter: `content=rootdir` hides a disk
+   * whose container no longer exists (see diskVolumes).
+   */
   async listStorageVolumes(storage: string): Promise<StorageVolume[]> {
-    const items = await this.request<{ volid: string; vmid?: number | string; size?: number; used?: number }[]>(
-      "get",
-      `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/content`,
-      { content: "rootdir" }
-    );
-    return items.map((i) => ({
-      volid: i.volid,
-      vmid: i.vmid === undefined ? null : Number(i.vmid),
-      size: i.size ?? 0,
-      used: i.used ?? null,
-    }));
+    return diskVolumes(await this.request<ContentItem[]>("get", `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/content`));
   }
 
   /** Active storages on the node that can hold container disks (local, attached Volumes, …). */
@@ -380,16 +395,26 @@ export class ProxmoxService {
 
   /**
    * Destroys a disk image on a storage (the API equivalent of `pvesm free`).
-   * Works for disks no container references any more — e.g. a /data mount
-   * detached from a running container, which leaves no "unused" config entry.
+   * DANGER: Proxmox does not check whether the disk is in use — it unlinks
+   * the file even while a running container has it mounted. Only call this
+   * through freeContainerDisks, which refuses disks a config still references.
    */
   async deleteStorageVolume(storage: string, volid: string): Promise<void> {
     await this.runTask("delete", `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/content/${encodeURIComponent(volid)}`);
   }
 
-  /** Raw container config (memory, cores, rootfs, mpN, …). */
+  /**
+   * Container config as it runs now (memory, cores, rootfs, mpN, unusedN, …).
+   * Proxmox's default is the config *with pending changes applied*, which
+   * hides a mount point queued for removal while it's still mounted.
+   */
   async getLXCConfig(vmid: number): Promise<Record<string, string | number>> {
-    return this.request("get", `/nodes/${this.node}/lxc/${vmid}/config`);
+    return this.request("get", `/nodes/${this.node}/lxc/${vmid}/config`, { current: true });
+  }
+
+  /** Current and pending (applied at the next restart) value of every config key. */
+  async getLXCPending(vmid: number): Promise<LXCPendingEntry[]> {
+    return this.request("get", `/nodes/${this.node}/lxc/${vmid}/pending`);
   }
 
   /**

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readContainerDisks, sizeToGB } from "./lxcConfig";
+import { currentConfig, pendingDiskChanges, readContainerDisks, sizeToGB } from "./lxcConfig";
 
 test("sizeToGB handles Proxmox size units", () => {
   assert.equal(sizeToGB("20G"), 20);
@@ -28,4 +28,22 @@ test("no /data mount yet → mp0 is free", () => {
   const disks = readContainerDisks({ rootfs: "local:101/vm-101-disk-0.raw,size=40G" });
   assert.equal(disks.data, null);
   assert.equal(disks.freeMountKey, "mp0");
+});
+
+test("pending listing: current values stay current; queued disk changes are reported separately", () => {
+  const entries = [
+    { key: "rootfs", value: "local:100/vm-100-disk-0.raw,size=20G" },
+    { key: "mp0", value: "local:100/vm-100-disk-1.raw,mp=/data,backup=1,size=10G", delete: 1 },
+    { key: "mp1", pending: "local:10,mp=/srv,backup=1" },
+    { key: "memory", value: 2048, pending: 4096 },
+  ];
+  const config = currentConfig(entries);
+  assert.deepEqual(Object.keys(config), ["rootfs", "mp0", "memory"]);
+  assert.deepEqual(pendingDiskChanges(entries), [
+    { key: "mp0", from: "local:100/vm-100-disk-1.raw,mp=/data,backup=1,size=10G", to: null },
+    { key: "mp1", from: null, to: "local:10,mp=/srv,backup=1" },
+  ]);
+  const disks = readContainerDisks(config, entries);
+  assert.equal(disks.data?.sizeGB, 10, "still mounted until restart");
+  assert.equal(disks.freeMountKey, "mp2", "mp1 is taken by the queued mount");
 });

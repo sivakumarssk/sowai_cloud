@@ -4,7 +4,7 @@ import type { EngineConfig } from "../config";
 import type { ContainerTarget } from "../actions/types";
 import type { RamScalerDeps } from "../actions/RamScaler";
 import type { DiskExpanderDeps } from "../actions/DiskExpander";
-import { readContainerDisks } from "../actions/lxcConfig";
+import { currentConfig, readContainerDisks } from "../actions/lxcConfig";
 import { prismaEngineLog } from "./engineLog";
 
 /** Target for a client service (its node, container and plan sizes). */
@@ -65,7 +65,11 @@ export function prismaDiskDeps(config: Pick<EngineConfig, "containerStorage">): 
     (await proxmoxForNode(node).listStorageVolumes(storage)).reduce((sum, v) => sum + v.size, 0);
 
   return {
-    readDisks: async (t) => readContainerDisks(await proxmoxForNode(t.node).getLXCConfig(t.vmid)),
+    async readDisks(t) {
+      // One call gives both what runs now and what's queued for the next restart.
+      const entries = await proxmoxForNode(t.node).getLXCPending(t.vmid);
+      return readContainerDisks(currentConfig(entries), entries);
+    },
 
     async poolStatus(node) {
       const [status, allocatedBytes] = await Promise.all([

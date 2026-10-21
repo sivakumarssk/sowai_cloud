@@ -42,21 +42,51 @@ export type ContainerDisks = {
   data: DiskEntry | null;
   /** First unused mpN key, for creating /data. */
   freeMountKey: string | null;
+  /** Disk changes Proxmox has queued until the container restarts (e.g. a mount point removal or addition). */
+  pending: PendingDiskChange[];
 };
 
-export function readContainerDisks(config: Record<string, string | number>): ContainerDisks {
+/** `to` null = the key is removed at the next restart. */
+export type PendingDiskChange = { key: string; from: string | null; to: string | null };
+
+/** One key from GET …/lxc/{vmid}/pending (same shape as LXCPendingEntry in lib/proxmox). */
+type PendingEntry = { key: string; value?: string | number; pending?: string | number; delete?: number };
+
+const DISK_KEY = /^(rootfs|mp\d+)$/;
+
+/** The config as the container runs now, from a pending listing. */
+export function currentConfig(entries: PendingEntry[]): Record<string, string | number> {
+  return Object.fromEntries(entries.filter((e) => e.value !== undefined).map((e) => [e.key, e.value!]));
+}
+
+/** Disk keys whose change only takes effect at the next restart. */
+export function pendingDiskChanges(entries: PendingEntry[]): PendingDiskChange[] {
+  return entries
+    .filter((e) => DISK_KEY.test(e.key) && (Boolean(e.delete) || (e.pending !== undefined && String(e.pending) !== String(e.value ?? ""))))
+    .map((e) => ({ key: e.key, from: e.value === undefined ? null : String(e.value), to: e.delete ? null : String(e.pending) }));
+}
+
+/**
+ * Disks as the container runs now. Pass the pending listing to also learn
+ * what's queued for the next restart; never read pending values as current.
+ */
+export function readContainerDisks(config: Record<string, string | number>, pendingEntries: PendingEntry[] = []): ContainerDisks {
   if (!config.rootfs) throw new Error("container config has no rootfs");
   const root = parseDisk("rootfs", String(config.rootfs));
   const mounts = Object.entries(config)
     .filter(([k]) => /^mp\d+$/.test(k))
     .map(([k, v]) => parseDisk(k, String(v)));
   const data = mounts.find((m) => m.mountPath === DATA_MOUNT_PATH) ?? null;
+  const taken = new Set([...Object.keys(config), ...pendingEntries.map((e) => e.key)]);
   let freeMountKey: string | null = null;
   for (let i = 0; i < MAX_MOUNT_POINTS; i++) {
-    if (!(`mp${i}` in config)) {
+    if (!taken.has(`mp${i}`)) {
       freeMountKey = `mp${i}`;
       break;
     }
   }
-  return { root, data, freeMountKey };
+  return { root, data, freeMountKey, pending: pendingDiskChanges(pendingEntries) };
 }
+
+export const describePending = (changes: PendingDiskChange[]) =>
+  changes.map((c) => (c.to === null ? `remove ${c.key}` : c.from === null ? `add ${c.key}: ${c.to}` : `change ${c.key}: ${c.to}`)).join("; ");

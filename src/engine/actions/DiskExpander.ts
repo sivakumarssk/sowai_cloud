@@ -1,5 +1,5 @@
 import type { EngineConfig } from "../config";
-import { DATA_MOUNT_PATH, type ContainerDisks } from "./lxcConfig";
+import { DATA_MOUNT_PATH, describePending, type ContainerDisks } from "./lxcConfig";
 import type { Blocked, ContainerTarget, EngineLogEntry, EngineLogWriter } from "./types";
 
 const GB = 1024 ** 3;
@@ -7,7 +7,7 @@ const GB = 1024 ** 3;
 export type VolumeSpace = { id: string; storage: string; sizeGB: number; allocatedGB: number };
 
 export type DiskExpanderDeps = {
-  /** Root disk, /data mount and next free mount key, from the container config. */
+  /** Root disk, /data mount and next free mount key as the container runs now, plus changes queued for its next restart. */
   readDisks(target: ContainerTarget): Promise<ContainerDisks>;
   /** Container storage of the node (the free pool): size and space promised to containers, bytes. */
   poolStatus(node: ContainerTarget["node"]): Promise<{ totalBytes: number; allocatedBytes: number }>;
@@ -83,6 +83,7 @@ export class DiskExpander {
 
   async plan(target: ContainerTarget, request: DiskRequest): Promise<DiskPlan | Blocked> {
     const disks = await this.deps.readDisks(target);
+    if (disks.pending.length > 0) return pendingRestart(disks);
     const before = { rootGB: disks.root.sizeGB, dataGB: disks.data?.sizeGB ?? 0 };
     const poolFree = await this.poolFreeGB(target.node);
     const pool = this.config.containerStorage;
@@ -171,7 +172,7 @@ export class DiskExpander {
   }
 
   /** Applies a plan: re-checks the disks are unchanged, changes them online, verifies, records, logs. */
-  async execute(plan: DiskPlan, trigger: EngineLogEntry["trigger"]): Promise<{ rootGB: number; dataGB: number }> {
+  async execute(plan: DiskPlan, trigger: EngineLogEntry["trigger"]): Promise<DiskResult> {
     const { target } = plan;
     const entry = {
       action: `DISK_${plan.operation}`,
@@ -184,6 +185,7 @@ export class DiskExpander {
     };
     try {
       const current = await this.deps.readDisks(target);
+      if (current.pending.length > 0) throw new Error(`${pendingRestart(current).reason}; re-plan after the restart`);
       const now = { rootGB: current.root.sizeGB, dataGB: current.data?.sizeGB ?? 0 };
       if (now.rootGB !== plan.before.rootGB || now.dataGB !== plan.before.dataGB) {
         throw new Error(`disks changed since planning (${JSON.stringify(plan.before)} → ${JSON.stringify(now)}); re-plan`);
@@ -194,6 +196,18 @@ export class DiskExpander {
       else await this.deps.growDisk(target, plan.diskKey, `+${plan.addGB}G`);
 
       const result = await this.deps.readDisks(target);
+      // Proxmox can't always apply a disk change to a running container: it queues it for the
+      // next restart. That isn't a failure, and the engine never restarts a client's container.
+      const queued = result.pending.filter((c) => c.key === plan.diskKey);
+      if (queued.length > 0) {
+        const unchanged = { rootGB: result.root.sizeGB, dataGB: result.data?.sizeGB ?? 0 };
+        await this.deps.log({
+          ...entry,
+          action: `${entry.action}_QUEUED`,
+          after: { ...unchanged, queuedUntilRestart: describePending(queued), source: plan.source, storage: plan.storage, reason: plan.reason },
+        });
+        return { ...unchanged, queuedUntilRestart: describePending(queued) };
+      }
       const got = { rootGB: result.root.sizeGB, dataGB: result.data?.sizeGB ?? 0 };
       if (got.rootGB !== plan.after.rootGB || got.dataGB !== plan.after.dataGB) {
         throw new Error(`Proxmox reports ${JSON.stringify(got)} after expanding to ${JSON.stringify(plan.after)}`);
@@ -231,3 +245,14 @@ export class DiskExpander {
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
+
+/** Sizes after execute. `queuedUntilRestart`: Proxmox queued the change; it takes effect when the container next restarts. */
+export type DiskResult = { rootGB: number; dataGB: number; queuedUntilRestart?: string };
+
+function pendingRestart(disks: ContainerDisks): Blocked {
+  return {
+    ok: false,
+    code: "PENDING_RESTART",
+    reason: `disk changes are queued until the container restarts (${describePending(disks.pending)}) — the engine never restarts a client's container`,
+  };
+}

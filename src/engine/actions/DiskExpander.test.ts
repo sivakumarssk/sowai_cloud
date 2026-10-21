@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { DiskExpander, type DiskExpanderDeps, type DiskPlan, type VolumeSpace } from "./DiskExpander";
 import { readContainerDisks } from "./lxcConfig";
 import type { Blocked, ContainerTarget, EngineLogEntry } from "./types";
+import type { LXCPendingEntry } from "@/lib/proxmox";
 
 const GB = 1024 ** 3;
 const config = { containerStorage: "local", diskPoolReserveGB: 20, diskExpandChunkGB: 10, volumeCostPerGbPaise: 530 };
@@ -17,18 +18,31 @@ const target = (over: Partial<ContainerTarget> = {}): ContainerTarget => ({
 });
 
 /** In-memory container + node. Pool: 150 GB storage with `allocatedGB` promised. */
-function fake(opts: { rootGB?: number; data?: { storage: string; gb: number }; allocatedGB?: number; volumes?: VolumeSpace[]; optIn?: boolean; failGrow?: boolean } = {}) {
+function fake(
+  opts: {
+    rootGB?: number;
+    data?: { storage: string; gb: number };
+    allocatedGB?: number;
+    volumes?: VolumeSpace[];
+    optIn?: boolean;
+    failGrow?: boolean;
+    /** Proxmox queues new mount points until restart (e.g. the key is still being removed). */
+    queueMounts?: boolean;
+    pending?: LXCPendingEntry[];
+  } = {}
+) {
   const config_: Record<string, string> = { rootfs: `local:101/vm-101-disk-0.raw,size=${opts.rootGB ?? 40}G` };
   if (opts.data) config_.mp0 = `${opts.data.storage}:101/vm-101-disk-1.raw,mp=/data,backup=1,size=${opts.data.gb}G`;
-  const state = { config: config_, logs: [] as EngineLogEntry[], recorded: [] as unknown[], calls: [] as string[] };
+  const state = { config: config_, pending: opts.pending ?? ([] as LXCPendingEntry[]), logs: [] as EngineLogEntry[], recorded: [] as unknown[], calls: [] as string[] };
   const setSize = (key: string, gb: number) => (state.config[key] = state.config[key].replace(/size=\d+G/, `size=${gb}G`));
   const deps: DiskExpanderDeps = {
-    readDisks: async () => readContainerDisks(state.config),
+    readDisks: async () => readContainerDisks(state.config, state.pending),
     poolStatus: async () => ({ totalBytes: 150 * GB, allocatedBytes: (opts.allocatedGB ?? 60) * GB }),
     volumes: async () => opts.volumes ?? [],
     overageOptIn: async () => opts.optIn ?? false,
     createMount: async (_t, key, storage, gb, path) => {
       state.calls.push(`create ${key} ${storage} ${gb}G ${path}`);
+      if (opts.queueMounts) return void state.pending.push({ key, pending: `${storage}:${gb},mp=${path},backup=1` });
       state.config[key] = `${storage}:101/vm-101-disk-9.raw,mp=${path},backup=1,size=${gb}G`;
     },
     growDisk: async (_t, key, size) => {
@@ -150,5 +164,24 @@ test("logPlanOnly records a dry run", async () => {
   await expander.logPlanOnly(plan, "AUTO_ENGINE", "DISK_EXPAND is set to ASSISTED");
   assert.equal(state.logs[0].dryRun, true);
   assert.equal(state.logs[0].action, "DISK_CREATE_DATA_PLANNED");
+  assert.deepEqual(state.calls, []);
+});
+
+test("bug 3: a new /data that Proxmox queues until restart is reported as queued, not as a size mismatch", async () => {
+  const { expander, state } = fake({ optIn: true, queueMounts: true });
+  const plan = (await expander.plan(target(), { purpose: "EXTRA_SPACE", reason: "re-add /data" })) as DiskPlan;
+  const result = await expander.execute(plan, "MANUAL");
+  assert.deepEqual(result, { rootGB: 40, dataGB: 0, queuedUntilRestart: "add mp0: local:10,mp=/data,backup=1" });
+  assert.deepEqual(state.recorded, [], "nothing recorded as allocated yet");
+  assert.equal(state.logs[0].action, "DISK_CREATE_DATA_QUEUED");
+  assert.equal(state.logs[0].success, undefined, "not a failure");
+});
+
+test("no disk plan while a disk change is queued for restart (e.g. /data removal pending)", async () => {
+  const pending: LXCPendingEntry[] = [{ key: "mp0", value: "local:101/vm-101-disk-1.raw,mp=/data,backup=1,size=10G", delete: 1 }];
+  const { expander, state } = fake({ optIn: true, data: { storage: "local", gb: 10 }, pending });
+  const r = await expander.plan(target(), { purpose: "EXTRA_SPACE", reason: "x" });
+  assert.equal(blocked(r), "PENDING_RESTART");
+  if (!r.ok) assert.match(r.reason, /remove mp0.*never restarts/);
   assert.deepEqual(state.calls, []);
 });

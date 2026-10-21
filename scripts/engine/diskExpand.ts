@@ -4,8 +4,8 @@
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20                          # plan /data +10 GB
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20 --opt-in --execute       # create /data (test container)
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20 --opt-in --add 5 --execute  # grow /data by 5 GB
- *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --remove-data                          # test cleanup: remove /data + destroy its disk
- *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --free-orphans                         # destroy vm-100-* disks the container no longer uses
+ *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --remove-data                          # test cleanup: remove /data (running → queued until restart, nothing destroyed)
+ *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --free-orphans                         # destroy detached vm-100-* disks (unusedN entries + stray files)
  *   npx tsx scripts/engine/diskExpand.ts --service <id> [--purpose grow|extra] [--add N] [--execute]
  *
  * --opt-in pretends a TEST container's client enabled overage (refused for
@@ -35,10 +35,9 @@ const numberArg = (name: string) => {
   const { loadEngineConfig } = await import("../../src/engine/config");
   const { loadEngineSettings, gate } = await import("../../src/engine/core/policy");
   const { DiskExpander } = await import("../../src/engine/actions/DiskExpander");
-  const { readContainerDisks } = await import("../../src/engine/actions/lxcConfig");
   const { prismaDiskDeps, targetForService, targetForContainer } = await import("../../src/engine/data/actionDeps");
   const { proxmoxForNode } = await import("../../src/lib/proxmox");
-  const { findContainerDisks, freeContainerDisks } = await import("../../src/lib/containerDisks");
+  const { detachDataDisk, freeContainerDisks } = await import("../../src/lib/containerDisks");
   const { prismaEngineLog } = await import("../../src/engine/data/engineLog");
   const { prisma } = await import("../../src/lib/prisma");
 
@@ -55,7 +54,7 @@ const numberArg = (name: string) => {
     // storage API and verified against the storage listing — never the
     // container config, which can forget a disk that still exists. ──
     const report = async (action: string, freed: string[], leftover: string[], errors: string[]) => {
-      for (const v of freed) console.log(`✓ destroyed ${v} (gone from storage listing)`);
+      for (const v of freed) console.log(`✓ destroyed ${v} (gone from storage listing and config)`);
       if (leftover.length === 0) return;
       const error = `still on storage after delete: ${leftover.join(", ")}${errors.length ? ` (${errors.join("; ")})` : ""}`;
       await prismaEngineLog({ action, vmid: target.vmid, fromNode: target.node.name, after: { leftover, freed }, trigger: "MANUAL", success: false, error });
@@ -68,28 +67,39 @@ const numberArg = (name: string) => {
     }
 
     if (flag("--remove-data")) {
-      const before = readContainerDisks(await pve.getLXCConfig(target.vmid));
-      if (!before.data) return console.log(`Container ${target.vmid} has no /data mount. Nothing to remove.`);
-      await pve.updateLXCConfig(target.vmid, { delete: before.data.key });
-      const after = await pve.getLXCConfig(target.vmid);
-      if (before.data.key in after) {
-        return console.log(`Removal of ${before.data.key} is pending until the container restarts. Run: pct reboot ${target.vmid}, then this command again.`);
+      const r = await detachDataDisk(pve, target.vmid);
+      if (r.status === "NO_DATA") {
+        console.log(`Container ${target.vmid} has no /data mount.`);
+        if (r.unused.length) console.log(`Detached disks still in its config: ${r.unused.join(", ")} — run --free-orphans to destroy them.`);
+        return;
       }
-      // Detaching from a running container leaves no "unusedN" entry, so destroy the file directly.
-      const unused = Object.keys(after).filter((k) => /^unused\d+$/.test(k) && String(after[k]) === before.data!.volume);
-      if (unused.length) await pve.updateLXCConfig(target.vmid, { delete: unused.join(",") });
-      const result = await freeContainerDisks(pve, target.vmid, [before.data.volume]);
-      console.log(`✓ /data (${before.data.key}) unmounted`);
-      await report("DATA_DISK_LEFT_OVER", result.freed, result.leftover, result.errors);
+      if (r.status === "PENDING_RESTART") {
+        // Never restart the container ourselves (downtime) and never destroy a disk it still has mounted.
+        await prismaEngineLog({
+          action: "DATA_DISK_DETACH_PENDING",
+          vmid: target.vmid,
+          fromNode: target.node.name,
+          after: { key: r.key, volume: r.volume, detail: r.detail },
+          trigger: "MANUAL",
+        });
+        console.log(`… pending restart: ${r.detail}.`);
+        console.log(`  Nothing destroyed — ${r.volume ?? "the disk"} stays on storage and mounted until the container restarts.`);
+        console.log(`  After the next restart run: npx tsx scripts/engine/diskExpand.ts --vmid ${target.vmid} --free-orphans`);
+        return;
+      }
+      console.log(`✓ /data (${r.key}) detached — container was stopped, so it applied immediately`);
+      await report("DATA_DISK_LEFT_OVER", r.cleanup.freed, r.cleanup.leftover, r.cleanup.errors);
       return;
     }
 
     if (flag("--free-orphans")) {
-      const config = await pve.getLXCConfig(target.vmid).catch(() => ({}) as Record<string, string | number>);
-      const inUse = new Set(Object.entries(config).filter(([k]) => /^(rootfs|mp\d+)$/.test(k)).map(([, v]) => String(v).split(",")[0]));
-      const orphans = (await findContainerDisks(pve, target.vmid)).filter((d) => !inUse.has(d.volid)).map((d) => d.volid);
-      if (orphans.length === 0) return console.log(`No orphaned vm-${target.vmid}-* disks on any container storage.`);
-      const result = await freeContainerDisks(pve, target.vmid, orphans);
+      // Every vm-<vmid>-* disk not attached by rootfs/mpN (now or after restart): unusedN entries and stray files.
+      const result = await freeContainerDisks(pve, target.vmid);
+      const kept = result.kept.filter((k) => !k.keys.includes("rootfs"));
+      for (const k of kept) console.log(`• kept ${k.volid} — still attached as ${k.keys.join(", ")}`);
+      if (result.freed.length === 0 && result.leftover.length === 0) {
+        console.log(`No orphaned vm-${target.vmid}-* disks (storage listings and config unusedN entries checked).`);
+      }
       await report("ORPHAN_DISK_LEFT_OVER", result.freed, result.leftover, result.errors);
       return;
     }
@@ -130,6 +140,11 @@ const numberArg = (name: string) => {
     }
     const started = Date.now();
     const result = await expander.execute(plan, "MANUAL");
+    if (result.queuedUntilRestart) {
+      console.log(`
+… queued until restart: ${result.queuedUntilRestart}. Proxmox applies it when the container next restarts (the engine never restarts it). Logged to EngineLog.`);
+      return;
+    }
     console.log(`\n✓ Applied in ${Date.now() - started} ms — root ${result.rootGB} GB, /data ${result.dataGB} GB (verified, logged to EngineLog)`);
     if (plan.operation === "CREATE_DATA") console.log(`  Check inside the container: pct exec ${target.vmid} -- df -h /data`);
   } finally {

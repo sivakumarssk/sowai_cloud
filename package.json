@@ -11,7 +11,7 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:studio": "prisma studio",
     "db:generate": "prisma generate",
-    "test:engine": "tsx --test \"src/engine/**/*.test.ts\" \"src/lib/**/*.test.ts\""
+    "test:engine": "node scripts/run-tests.mjs"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
