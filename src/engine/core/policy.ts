@@ -23,7 +23,13 @@ export type ActionKind =
   | "VOLUME_PURCHASE"
   | "SERVER_PURCHASE"
   | "MIGRATION"
-  | "OVERAGE_BILLING";
+  | "OVERAGE_BILLING"
+  | "NOTIFY_CLIENT"
+  | "ALERT_ADMIN"
+  | "STOP_SIGNUPS";
+
+/** Buying infrastructure: never runs without an admin, whatever the settings say. */
+export const PURCHASES: ReadonlySet<ActionKind> = new Set(["VOLUME_PURCHASE", "SERVER_PURCHASE"]);
 
 export const DEFAULT_ACTION_MODES: Record<ActionKind, ActionMode> = {
   RAM_SCALE: "AUTO", // instant, no cost
@@ -32,6 +38,9 @@ export const DEFAULT_ACTION_MODES: Record<ActionKind, ActionMode> = {
   SERVER_PURCHASE: "MANUAL", // ₹3,300/month
   MIGRATION: "ASSISTED", // causes downtime
   OVERAGE_BILLING: "OFF", // client must opt in
+  NOTIFY_CLIENT: "ASSISTED", // clients aren't emailed without an admin's OK
+  ALERT_ADMIN: "AUTO",
+  STOP_SIGNUPS: "AUTO", // stop placing new clients on a full node
 };
 
 export const DEFAULT_SPEND_CAP_PAISE = 500_000; // ₹5,000 / month
@@ -91,6 +100,7 @@ export function gate({ kind, settings, monthlyCostPaise, spentThisMonthPaise, tr
   const why = effective === actionMode ? `${kind} is set to ${actionMode}` : `engine is in ${settings.mode} mode`;
   switch (effective) {
     case "AUTO":
+      if (PURCHASES.has(kind)) return { verdict: "REQUEST_APPROVAL", reason: "purchases always need admin approval" };
       return { verdict: "EXECUTE", reason: why };
     case "ASSISTED":
       return { verdict: "REQUEST_APPROVAL", reason: why };

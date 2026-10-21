@@ -4,7 +4,7 @@ import { EventBus } from "../core/EventBus";
 import type { EngineEvent } from "../core/events";
 import { loadEngineConfig } from "../config";
 import { silentLogger } from "../log";
-import { ContainerMonitor, nextLevel } from "./ContainerMonitor";
+import { ContainerMonitor, INITIAL_STATE, evaluateContainer, nextLevel, toSample } from "./ContainerMonitor";
 import { SimulatedCluster, flat, steps, type SimContainer } from "../testing/simulatedProxmox";
 
 const POLL_MS = 30_000;
@@ -185,4 +185,22 @@ test("config rejects thresholds that don't increase", () => {
   assert.throws(() => loadEngineConfig({ RAM_WARNING_PCT: "90", RAM_CRITICAL_PCT: "85" }), /must increase/);
   assert.throws(() => loadEngineConfig({ DISK_FULL_PCT: "120" }), /≤ 100/);
   assert.equal(loadEngineConfig({ CPU_ALERT_DURATION: "300  # 5 minutes" }).cpuAlertDurationMs, 300_000);
+});
+
+test("CPU is clamped to 0–100% of the container's cores; a negative delta can never raise CPU_HIGH", () => {
+  const node = { id: "node_1", name: "sowsi-proxmox-01", ip: "10.0.0.1" };
+  const raw = { vmid: 100, status: "running", mem: 36 * 1024 ** 2, maxmem: 2048 * 1024 ** 2, disk: 0.6 * 1024 ** 3, maxdisk: 20 * 1024 ** 3, cpus: 1, netin: 0, netout: 0 };
+  const managed = { vmid: 100, serviceId: "svc_a", clientId: "u", planRamMB: 2048, planDiskGB: 20, planVcpu: 1 };
+
+  // The live sample that showed "-0.4% of 1"
+  const negative = toSample(node, { ...raw, cpu: -0.004 }, managed, 0);
+  assert.equal(negative.cpuUsed, 0);
+  assert.equal(toSample(node, { ...raw, cpu: 1.7 }, managed, 0).cpuUsed, 1, "never above 100% of its cores");
+  assert.equal(toSample(node, { ...raw, cpu: Number.NaN }, managed, 0).cpuUsed, 0);
+
+  // Even with the most sensitive possible settings (alert above 0%, no wait), a clamped bad sample can't fire.
+  const twitchy = { ...config, cpuAlertPct: 0, cpuAlertDurationMs: 0 };
+  const result = evaluateContainer(negative, INITIAL_STATE, twitchy, 1_000);
+  assert.deepEqual(result.events, []);
+  assert.equal(result.state.cpuHighSince, null);
 });

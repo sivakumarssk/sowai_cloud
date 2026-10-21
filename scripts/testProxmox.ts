@@ -97,10 +97,16 @@ async function askDelete(vmid: number): Promise<boolean> {
   rl.close();
   if (!answer.trim().toLowerCase().startsWith("y")) return false;
 
-  step(`Deleting container ${vmid}...`);
-  await proxmox.deleteLXC(vmid);
+  step(`Deleting container ${vmid} and its disks...`);
+  const { destroyContainerAndDisks } = await import("../src/lib/containerDisks");
+  const disks = await destroyContainerAndDisks(proxmox, vmid);
   await syncRoutes();
-  console.log("    Deleted");
+  if (disks.leftover.length) {
+    console.log(`    ✗ Container deleted but disks are still on storage: ${disks.leftover.join(", ")}`);
+    console.log(`      Retry: npx tsx scripts/engine/diskExpand.ts --vmid ${vmid} --free-orphans`);
+  } else {
+    console.log(`    Deleted — no vm-${vmid}-* disk left on any storage${disks.freed.length ? ` (also removed ${disks.freed.join(", ")})` : ""}`);
+  }
   return true;
 }
 

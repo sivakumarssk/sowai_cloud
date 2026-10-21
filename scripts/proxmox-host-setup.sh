@@ -129,11 +129,69 @@ EOF
 systemctl daemon-reload
 systemctl enable --now sowsi-routes.service
 
-echo "== 7. Provisioning key (restricted to running sowsi-routes)"
-KEY_BODY=$(awk '{print $2}' <<<"$PROVISIONING_PUBKEY")
-if ! grep -qF "$KEY_BODY" /root/.ssh/authorized_keys 2>/dev/null; then
-  echo "restrict,command=\"/usr/local/sbin/sowsi-routes\" $PROVISIONING_PUBKEY" >> /root/.ssh/authorized_keys
+echo "== 7. Host command dispatcher (the only thing the provisioning key may run)"
+cat > /usr/local/sbin/sowsi-host <<'SCRIPT'
+#!/usr/bin/env bash
+# Forced command for the Sowsi provisioning SSH key. Only these are allowed:
+#   routes | sowsi-routes          re-sync container routes
+#   mount-volume <hetzner-id>      mount an attached Hetzner Volume and register it as Proxmox storage
+#   unmount-volume <hetzner-id>    unregister + unmount it (refused while any disk is on it)
+set -euo pipefail
+read -r cmd arg extra <<<"${SSH_ORIGINAL_COMMAND:-routes}"
+if [[ -n "${extra:-}" ]]; then echo "too many arguments" >&2; exit 2; fi
+case "$cmd" in
+  routes|sowsi-routes) exec /usr/local/sbin/sowsi-routes ;;
+  mount-volume|unmount-volume)
+    if ! [[ "${arg:-}" =~ ^[0-9]{1,12}$ ]]; then echo "invalid volume id" >&2; exit 2; fi ;;
+  *) echo "command not allowed: $cmd" >&2; exit 2 ;;
+esac
+logger -t sowsi-host "$cmd $arg"
+
+id=$arg
+dev="/dev/disk/by-id/scsi-0HC_Volume_$id"
+mnt="/mnt/sowsi-vol-$id"
+storage="sowsi-vol-$id"
+
+if [[ $cmd == mount-volume ]]; then
+  for _ in $(seq 1 30); do [[ -b $dev ]] && break; sleep 2; done
+  if [[ ! -b $dev ]]; then echo "device $dev not found — is the volume attached to this server?" >&2; exit 1; fi
+  fstype=$(blkid -o value -s TYPE "$dev" || true)
+  if [[ -z $fstype ]]; then mkfs.ext4 -q -F "$dev"; fstype=ext4; fi
+  if [[ $fstype != ext4 ]]; then echo "unexpected filesystem $fstype on $dev" >&2; exit 1; fi
+  uuid=$(blkid -o value -s UUID "$dev")
+  mkdir -p "$mnt"
+  grep -q "^UUID=$uuid " /etc/fstab || echo "UUID=$uuid $mnt ext4 discard,nofail,defaults 0 2" >> /etc/fstab
+  mountpoint -q "$mnt" || mount "$mnt"
+  pvesm status --storage "$storage" >/dev/null 2>&1 \
+    || pvesm add dir "$storage" --path "$mnt" --content rootdir,images --is_mountpoint yes
+  echo "OK storage=$storage path=$mnt"
+else
+  if pvesm status --storage "$storage" >/dev/null 2>&1; then
+    if [[ -n "$(pvesm list "$storage" | tail -n +2)" ]]; then echo "storage $storage still holds disks — not removing" >&2; exit 1; fi
+    pvesm remove "$storage"
+  fi
+  if mountpoint -q "$mnt"; then umount "$mnt"; fi
+  if [[ -b $dev ]]; then
+    uuid=$(blkid -o value -s UUID "$dev" || true)
+    if [[ -n $uuid ]]; then sed -i "\#^UUID=$uuid #d" /etc/fstab; fi
+  fi
+  rmdir "$mnt" 2>/dev/null || true
+  echo "OK unmounted storage=$storage"
 fi
+SCRIPT
+chmod 755 /usr/local/sbin/sowsi-host
+
+echo "== 8. Provisioning key → restricted to sowsi-host"
+KEY_BODY=$(awk '{print $2}' <<<"$PROVISIONING_PUBKEY")
+AUTH=/root/.ssh/authorized_keys
+touch "$AUTH"
+TMP=$(mktemp)
+# Drop any older line for this key (e.g. restricted to sowsi-routes), then add the current one.
+grep -vF "$KEY_BODY" "$AUTH" > "$TMP" || true
+echo "restrict,command=\"/usr/local/sbin/sowsi-host\" $PROVISIONING_PUBKEY" >> "$TMP"
+# On Proxmox this file is a symlink into /etc/pve: write through it, don't replace it.
+cat "$TMP" > "$AUTH"
+rm -f "$TMP"
 
 echo
 echo "== Done"

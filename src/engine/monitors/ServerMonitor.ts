@@ -268,7 +268,7 @@ export class ServerMonitor {
       allocatedDisk,
       freePoolBytes: freePoolBytes(disk.total, allocatedDisk, this.config.diskPoolReserveGB),
       physicalCpu: status.cpus,
-      physicalCpuPct: round1(status.cpu * 100),
+      physicalCpuPct: round1(Math.min(1, Math.max(0, Number.isFinite(status.cpu) ? status.cpu : 0)) * 100),
       totalContainers: containers.length,
       activeContainers: containers.filter((c) => c.status === "running").length,
       allocatedRam: containers.reduce((sum, c) => sum + c.maxmem, 0),

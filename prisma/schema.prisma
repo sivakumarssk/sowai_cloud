@@ -556,3 +556,40 @@ model Migration {
   @@index([status, scheduledFor])
   @@index([serviceId])
 }
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  DENIED
+  EXPIRED
+  EXECUTED
+  FAILED
+}
+
+/// An engine action waiting for (or decided by) an admin. Created in ASSISTED
+/// mode and for anything over the monthly spend cap; expires if nobody answers.
+model EngineApproval {
+  id               String         @id @default(cuid())
+  /// ActionKind, e.g. "DISK_EXPAND", "VOLUME_PURCHASE"
+  kind             String
+  /// "service:<id>" or "node:<name>" — at most one open request per kind + subject
+  subject          String
+  summary          String
+  /// Why the engine wants it (the triggering event).
+  reason           String
+  /// Everything needed to re-plan and run it after approval.
+  payload          Json
+  /// New monthly spend if approved, in paise.
+  monthlyCostPaise Int            @default(0)
+  status           ApprovalStatus @default(PENDING)
+  expiresAt        DateTime
+  decidedBy        String?
+  decidedAt        DateTime?
+  executedAt       DateTime?
+  result           String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([kind, subject, status])
+}

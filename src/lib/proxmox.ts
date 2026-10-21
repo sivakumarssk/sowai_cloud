@@ -368,6 +368,25 @@ export class ProxmoxService {
     }));
   }
 
+  /** Active storages on the node that can hold container disks (local, attached Volumes, …). */
+  async listContainerStorages(): Promise<string[]> {
+    const list = await this.request<{ storage: string; active?: number | boolean; enabled?: number | boolean }[]>(
+      "get",
+      `/nodes/${this.node}/storage`,
+      { content: "rootdir" }
+    );
+    return list.filter((s) => s.active !== 0 && s.active !== false && s.enabled !== 0 && s.enabled !== false).map((s) => s.storage);
+  }
+
+  /**
+   * Destroys a disk image on a storage (the API equivalent of `pvesm free`).
+   * Works for disks no container references any more — e.g. a /data mount
+   * detached from a running container, which leaves no "unused" config entry.
+   */
+  async deleteStorageVolume(storage: string, volid: string): Promise<void> {
+    await this.runTask("delete", `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/content/${encodeURIComponent(volid)}`);
+  }
+
   /** Raw container config (memory, cores, rootfs, mpN, …). */
   async getLXCConfig(vmid: number): Promise<Record<string, string | number>> {
     return this.request("get", `/nodes/${this.node}/lxc/${vmid}/config`);

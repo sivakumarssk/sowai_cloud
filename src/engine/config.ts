@@ -34,6 +34,8 @@ export type EngineConfig = {
   diskExpandChunkGB: number;
   /** Hetzner Volume cost, paise per GB per month (₹5.30 = 530). */
   volumeCostPerGbPaise: number;
+  /** Size of a Hetzner Volume the engine proposes buying (₹530/month at 100 GB). */
+  volumeSizeGB: number;
 
   /** Default size of one RAM increase. */
   ramExpandChunkMB: number;
@@ -92,6 +94,7 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     diskPoolReserveGB: num(env, "DISK_POOL_RESERVE_GB", 20),
     diskExpandChunkGB: num(env, "DISK_EXPAND_CHUNK_GB", 10),
     volumeCostPerGbPaise: num(env, "VOLUME_COST_PER_GB", 530),
+    volumeSizeGB: num(env, "VOLUME_SIZE_GB", 100),
 
     ramExpandChunkMB: num(env, "RAM_EXPAND_CHUNK_MB", 512),
     ramMaxMultiplier: num(env, "RAM_MAX_MULTIPLIER", 2),
@@ -106,6 +109,7 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
   if (config.diskExpandChunkGB < 1 || config.ramExpandChunkMB < 64) {
     throw new Error("DISK_EXPAND_CHUNK_GB must be ≥ 1 and RAM_EXPAND_CHUNK_MB ≥ 64");
   }
+  if (config.volumeSizeGB < 10 || config.volumeSizeGB > 10_240) throw new Error("VOLUME_SIZE_GB must be 10–10240 (Hetzner limits)");
   if (config.containerPollMs < 5000) throw new Error("CONTAINER_POLL_SECONDS must be at least 5");
   return config;
 }

@@ -1,6 +1,8 @@
 import type { Plan, ServiceStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { proxmox, ProxmoxError } from "@/lib/proxmox";
+import { proxmox, proxmoxForNode, ProxmoxError, type ProxmoxService } from "@/lib/proxmox";
+import { destroyContainerAndDisks } from "@/lib/containerDisks";
+import { prismaEngineLog } from "@/engine/data/engineLog";
 import { hetzner } from "@/lib/hetzner";
 import { vmSetup, type SetupStep } from "@/lib/vmSetup";
 import { encrypt } from "@/lib/crypto";
@@ -117,7 +119,12 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       vmid = candidate;
       await prisma.service.update({
         where: { id: serviceId },
-        data: { proxmoxVmId: String(candidate), ipv6Address: ipv6 },
+        data: {
+          proxmoxVmId: String(candidate),
+          ipv6Address: ipv6,
+          // The resource engine finds containers by node.
+          nodeId: (await prisma.proxmoxNode.findUnique({ where: { name: process.env.PROXMOX_NODE ?? "" }, select: { id: true } }))?.id ?? null,
+        },
       });
       break;
     }
@@ -177,16 +184,41 @@ export async function provisionVPS(serviceId: string): Promise<void> {
   }
 }
 
+/** Prefix of the error reported when a container's disks couldn't all be removed. */
+const LEFTOVER_DISKS = "Leftover disks";
+
 /**
- * Destroys the container, removes its host routes, then releases its Floating
- * IP. The IP is kept if the container couldn't be deleted, so it can't be
- * handed to a new customer while the old container still has it configured.
- * Returns errors instead of throwing.
+ * Destroys the container and every disk it had (verified against the storage
+ * listings), removes its host routes, then releases its Floating IP. The IP
+ * is kept if the container couldn't be deleted, so it can't be handed to a
+ * new customer while the old container still has it configured. Leftover
+ * disks don't block the IP release (the container is gone) but are reported
+ * and logged as a failure. Returns errors instead of throwing.
  */
-async function releaseResources(vmid: number | null, floatingIpId: number | null): Promise<string[]> {
+async function releaseResources(
+  vmid: number | null,
+  floatingIpId: number | null,
+  ctx: { client?: ProxmoxService; serviceId?: string; nodeName?: string } = {}
+): Promise<string[]> {
+  const errors: string[] = [];
   if (vmid !== null) {
+    const client = ctx.client ?? proxmox;
     try {
-      await proxmox.deleteLXC(vmid);
+      const disks = await destroyContainerAndDisks(client, vmid);
+      if (disks.leftover.length > 0) {
+        const message = `${LEFTOVER_DISKS} after deleting container ${vmid}: ${disks.leftover.join(", ")}${disks.errors.length ? ` (${disks.errors.join("; ")})` : ""}`;
+        errors.push(message);
+        await prismaEngineLog({
+          action: "CONTAINER_DISKS_LEFT_OVER",
+          serviceId: ctx.serviceId ?? null,
+          vmid,
+          fromNode: ctx.nodeName,
+          after: { leftover: disks.leftover, freed: disks.freed },
+          trigger: "AUTO_ENGINE",
+          success: false,
+          error: message,
+        });
+      }
     } catch (err) {
       return [
         `Delete container ${vmid}: ${errorMessage(err)}`,
@@ -202,10 +234,16 @@ async function releaseResources(vmid: number | null, floatingIpId: number | null
     try {
       await hetzner.releaseFloatingIP(floatingIpId);
     } catch (err) {
-      return [`Release Floating IP ${floatingIpId}: ${errorMessage(err)}`];
+      errors.push(`Release Floating IP ${floatingIpId}: ${errorMessage(err)}`);
     }
   }
-  return [];
+  return errors;
+}
+
+/** Proxmox client for the node a service's container is on (falls back to the default node). */
+async function clientForService(serviceId: string): Promise<{ client: ProxmoxService; nodeName?: string }> {
+  const service = await prisma.service.findUnique({ where: { id: serviceId }, select: { node: { select: { name: true, ip: true } } } });
+  return service?.node ? { client: proxmoxForNode(service.node), nodeName: service.node.name } : { client: proxmox };
 }
 
 async function handleFailure(
@@ -215,7 +253,7 @@ async function handleFailure(
 ) {
   console.error(`[provisioning] service ${serviceId} failed:`, error);
 
-  const cleanupErrors = await releaseResources(vmid, floatingIpId);
+  const cleanupErrors = await releaseResources(vmid, floatingIpId, { ...(await clientForService(serviceId)), serviceId });
   const cleanedUp = cleanupErrors.length === 0;
 
   const service = await prisma.service.update({
@@ -328,12 +366,14 @@ export async function deprovisionVPS(serviceId: string): Promise<void> {
   const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId } });
   const errors = await releaseResources(
     service.proxmoxVmId ? Number(service.proxmoxVmId) : null,
-    service.hetznerFloatingIpId ? Number(service.hetznerFloatingIpId) : null
+    service.hetznerFloatingIpId ? Number(service.hetznerFloatingIpId) : null,
+    { ...(await clientForService(serviceId)), serviceId }
   );
 
   if (errors.length > 0) {
     // Only clear what's actually gone, so an admin (or a retry) can finish the job.
-    const vmGone = !errors.some((e) => e.startsWith("Delete container"));
+    // Keep the vmid while its container or any of its disks still exist, so a retry can finish the cleanup.
+    const vmGone = !errors.some((e) => e.startsWith("Delete container") || e.startsWith(LEFTOVER_DISKS));
     await prisma.service.update({
       where: { id: serviceId },
       data: {

@@ -94,7 +94,9 @@ export function toSample(node: MonitoredNode, raw: RawContainer, managed: Manage
     memLimit: raw.maxmem,
     memPlanLimit: managed?.planRamMB ? managed.planRamMB * MB : null,
     memPct: pct(raw.mem, raw.maxmem),
-    cpuUsed: raw.cpu,
+    // Proxmox can report a small negative CPU delta (counter jitter) or a
+    // spike above the core count; keep it within 0–100% of the container's cores.
+    cpuUsed: clamp01(raw.cpu),
     cpuCores: raw.cpus,
     cpuPlanLimit: managed?.planVcpu ?? null,
     diskUsed: raw.disk,
@@ -319,3 +321,5 @@ export class ContainerMonitor {
 
 const key = (s: Pick<ContainerSample, "nodeId" | "vmid">) => `${s.nodeId}:${s.vmid}`;
 const round1 = (n: number) => Math.round(n * 10) / 10;
+/** 0–1, treating NaN/negative as 0. */
+const clamp01 = (n: number) => (Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0);

@@ -21,6 +21,14 @@ type ApiFloatingIp = {
   blocked: boolean;
 };
 
+export type HetznerVolume = { id: number; name: string; sizeGB: number; server: number | null; location: string };
+
+type ApiVolume = { id: number; name: string; size: number; server: number | null; location: { name: string } };
+
+function toVolume(v: ApiVolume): HetznerVolume {
+  return { id: v.id, name: v.name, sizeGB: v.size, server: v.server, location: v.location.name };
+}
+
 export class HetznerError extends Error {
   constructor(message: string, readonly status?: number) {
     super(message);
@@ -141,6 +149,52 @@ export class HetznerService {
         await this.waitForAction(action);
       }
       await this.request("delete", `/floating_ips/${floatingIpId}`);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return;
+      throw err;
+    }
+  }
+
+  // ── Volumes (extra disk for a Proxmox node) ──
+  // Billed by Hetzner from creation until deletion. Created ext4-formatted and
+  // NOT auto-mounted: the node mounts it via sowsi-host (see proxmox-host-setup.sh).
+
+  async createVolume(input: { name: string; sizeGB: number; location: string; labels?: Record<string, string> }): Promise<HetznerVolume> {
+    const { volume, action } = await this.request<{ volume: ApiVolume; action: HetznerAction }>("post", "/volumes", {
+      data: { name: input.name, size: input.sizeGB, location: input.location, format: "ext4", automount: false, labels: input.labels },
+    });
+    await this.waitForAction(action);
+    return toVolume(volume);
+  }
+
+  async getVolume(volumeId: number): Promise<HetznerVolume | null> {
+    try {
+      return toVolume((await this.request<{ volume: ApiVolume }>("get", `/volumes/${volumeId}`)).volume);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  async attachVolume(volumeId: number, serverId: number = this.serverId): Promise<void> {
+    const { action } = await this.request<{ action: HetznerAction }>("post", `/volumes/${volumeId}/actions/attach`, {
+      data: { server: serverId, automount: false },
+    });
+    await this.waitForAction(action);
+  }
+
+  async detachVolume(volumeId: number): Promise<void> {
+    const volume = await this.getVolume(volumeId);
+    if (!volume || volume.server === null) return;
+    const { action } = await this.request<{ action: HetznerAction }>("post", `/volumes/${volumeId}/actions/detach`);
+    await this.waitForAction(action);
+  }
+
+  /** Detaches if needed, then deletes. An already-deleted volume is ignored. */
+  async deleteVolume(volumeId: number): Promise<void> {
+    await this.detachVolume(volumeId);
+    try {
+      await this.request("delete", `/volumes/${volumeId}`);
     } catch (err) {
       if (err instanceof HetznerError && err.status === 404) return;
       throw err;

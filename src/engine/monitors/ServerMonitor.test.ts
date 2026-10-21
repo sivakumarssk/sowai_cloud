@@ -132,3 +132,12 @@ test("an unreachable node is reported; others still polled; a failed save doesn'
   assert.match(monitor.stats().nodeErrors["sowsi-proxmox-02"], /ETIMEDOUT/);
   assert.equal(monitor.stats().polls, 1);
 });
+
+test("server CPU is clamped to 0–100%", async () => {
+  const { monitor, poll } = setup([node({ cpuPct: flat(-0.4) })]);
+  await poll();
+  assert.equal(monitor.snapshot()[0].physicalCpuPct, 0);
+  const high = setup([node({ cpuPct: flat(140) })]);
+  await high.poll();
+  assert.equal(high.monitor.snapshot()[0].physicalCpuPct, 100);
+});

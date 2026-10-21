@@ -21,6 +21,9 @@ test("defaults are OBSERVE with the agreed per-action modes and a ₹5,000 cap",
     SERVER_PURCHASE: "MANUAL",
     MIGRATION: "ASSISTED",
     OVERAGE_BILLING: "OFF",
+    NOTIFY_CLIENT: "ASSISTED",
+    ALERT_ADMIN: "AUTO",
+    STOP_SIGNUPS: "AUTO",
   });
   assert.equal(s.spendCapPaise, 500_000);
 });
@@ -52,7 +55,9 @@ test("OFF blocks always — including admin-triggered", () => {
 
 test("anything over the monthly spend cap needs approval, regardless of mode", () => {
   const autoVolumes = settings({ actions: { ...DEFAULT_ACTION_MODES, VOLUME_PURCHASE: "AUTO" } });
-  assert.equal(verdict({ kind: "VOLUME_PURCHASE", settings: autoVolumes, monthlyCostPaise: 53_000, spentThisMonthPaise: 400_000 }), "EXECUTE");
+  const under = gate({ kind: "VOLUME_PURCHASE", settings: autoVolumes, monthlyCostPaise: 53_000, spentThisMonthPaise: 400_000, trigger: "AUTO_ENGINE" });
+  assert.equal(under.verdict, "REQUEST_APPROVAL");
+  assert.match(under.reason, /purchases always need admin approval/);
   const over = gate({
     kind: "VOLUME_PURCHASE",
     settings: autoVolumes,
@@ -76,4 +81,22 @@ test("settings from env are validated", () => {
   assert.throws(() => loadEngineSettings({ ENGINE_MODE: "YOLO" }), /ENGINE_MODE/);
   assert.throws(() => loadEngineSettings({ ENGINE_ACTION_MIGRATION: "sometimes" }), /ENGINE_ACTION_MIGRATION/);
   assert.throws(() => loadEngineSettings({ ENGINE_SPEND_CAP_PAISE: "5k" }), /ENGINE_SPEND_CAP_PAISE/);
+});
+
+test("purchases never run on their own — even set to AUTO, under the cap, in AUTO mode", () => {
+  const allAuto = settings({ actions: { ...DEFAULT_ACTION_MODES, VOLUME_PURCHASE: "AUTO", SERVER_PURCHASE: "AUTO" } });
+  for (const kind of ["VOLUME_PURCHASE", "SERVER_PURCHASE"] as const) {
+    const g = gate({ kind, settings: allAuto, monthlyCostPaise: 53_000, spentThisMonthPaise: 0, trigger: "AUTO_ENGINE" });
+    assert.equal(g.verdict, "REQUEST_APPROVAL", kind);
+    assert.match(g.reason, /always need admin approval/);
+  }
+  // An admin can still start one.
+  assert.equal(verdict({ kind: "VOLUME_PURCHASE", settings: allAuto, monthlyCostPaise: 53_000, trigger: "MANUAL" }), "EXECUTE");
+});
+
+test("non-spend kinds: alerts and stop-signups run in AUTO mode, client emails need approval", () => {
+  assert.equal(verdict({ kind: "ALERT_ADMIN" }), "EXECUTE");
+  assert.equal(verdict({ kind: "STOP_SIGNUPS" }), "EXECUTE");
+  assert.equal(verdict({ kind: "NOTIFY_CLIENT" }), "REQUEST_APPROVAL");
+  assert.equal(verdict({ kind: "ALERT_ADMIN", settings: settings({ mode: "OBSERVE" }) }), "LOG_ONLY");
 });
