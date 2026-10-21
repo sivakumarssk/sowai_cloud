@@ -72,6 +72,20 @@ export type LXCListEntry = {
   uptime: number;
 };
 
+/** GET /nodes/{node}/status (bytes; cpu as a 0–1 fraction of all cores). */
+export type NodeStatus = {
+  memory: { total: number; used: number; free: number };
+  cpu: number;
+  cpus: number;
+  uptime: number;
+};
+
+/** GET /nodes/{node}/storage/{storage}/status (bytes). */
+export type StorageStatus = { total: number; used: number; avail: number; active: boolean };
+
+/** One disk image on a storage; `size` is the allocated (provisioned) size in bytes. */
+export type StorageVolume = { volid: string; vmid: number | null; size: number; used: number | null };
+
 export class ProxmoxService {
   private client: AxiosInstance | null = null;
 
@@ -314,6 +328,62 @@ export class ProxmoxService {
       purge: true,
       "destroy-unreferenced-disks": true,
     });
+  }
+
+  async getNodeStatus(): Promise<NodeStatus> {
+    const s = await this.request<{
+      memory?: { total?: number; used?: number; free?: number };
+      cpu?: number;
+      cpuinfo?: { cpus?: number };
+      uptime?: number;
+    }>("get", `/nodes/${this.node}/status`);
+    return {
+      memory: { total: s.memory?.total ?? 0, used: s.memory?.used ?? 0, free: s.memory?.free ?? 0 },
+      cpu: s.cpu ?? 0,
+      cpus: s.cpuinfo?.cpus ?? 0,
+      uptime: s.uptime ?? 0,
+    };
+  }
+
+  async getStorageStatus(storage: string): Promise<StorageStatus> {
+    const s = await this.request<Partial<StorageStatus> & { active?: number | boolean }>(
+      "get",
+      `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/status`
+    );
+    return { total: s.total ?? 0, used: s.used ?? 0, avail: s.avail ?? 0, active: Boolean(s.active) };
+  }
+
+  /** Container disk images (root disks and mount points) on a storage. */
+  async listStorageVolumes(storage: string): Promise<StorageVolume[]> {
+    const items = await this.request<{ volid: string; vmid?: number | string; size?: number; used?: number }[]>(
+      "get",
+      `/nodes/${this.node}/storage/${encodeURIComponent(storage)}/content`,
+      { content: "rootdir" }
+    );
+    return items.map((i) => ({
+      volid: i.volid,
+      vmid: i.vmid === undefined ? null : Number(i.vmid),
+      size: i.size ?? 0,
+      used: i.used ?? null,
+    }));
+  }
+
+  /** Raw container config (memory, cores, rootfs, mpN, …). */
+  async getLXCConfig(vmid: number): Promise<Record<string, string | number>> {
+    return this.request("get", `/nodes/${this.node}/lxc/${vmid}/config`);
+  }
+
+  /**
+   * Changes container config. Memory, cores and new mount points apply to a
+   * running container without a restart. `delete` takes a comma-separated key list.
+   */
+  async updateLXCConfig(vmid: number, params: Record<string, string | number | boolean | undefined>): Promise<void> {
+    await this.runTask("put", `/nodes/${this.node}/lxc/${vmid}/config`, params);
+  }
+
+  /** Grows a container disk (rootfs or mpN), online. `size` is absolute ("40G") or relative ("+10G"); never shrinks. */
+  async resizeLXCDisk(vmid: number, disk: string, size: string): Promise<void> {
+    await this.runTask("put", `/nodes/${this.node}/lxc/${vmid}/resize`, { disk, size });
   }
 
   /** Every container on the node with live usage, in one call. */

@@ -2,6 +2,10 @@ import type { EventBus } from "../core/EventBus";
 import { subjectForService, type ContainerEventType, type EventInput } from "../core/events";
 import type { EngineConfig } from "../config";
 import { createLogger, type Logger } from "../log";
+import { Poller } from "../core/poller";
+import { nextLevel, sustained, type Level } from "./levels";
+
+export { nextLevel, type Level };
 
 const MB = 1024 ** 2;
 const GB = 1024 ** 3;
@@ -106,27 +110,11 @@ export function toSample(node: MonitoredNode, raw: RawContainer, managed: Manage
 
 // ── Threshold evaluation (pure) ───────────────────────────────────────
 
-/** 0 = normal, 1 = warning, 2 = critical, 3 = emergency/full. */
-export type Level = 0 | 1 | 2 | 3;
-
 export type ContainerState = { ram: Level; disk: Level; cpuHighSince: number | null };
 export const INITIAL_STATE: ContainerState = { ram: 0, disk: 0, cpuHighSince: null };
 
 const RAM_TYPES: Record<1 | 2 | 3, ContainerEventType> = { 1: "RAM_WARNING", 2: "RAM_CRITICAL", 3: "RAM_EMERGENCY" };
 const DISK_TYPES: Record<1 | 2 | 3, ContainerEventType> = { 1: "DISK_WARNING", 2: "DISK_CRITICAL", 3: "DISK_FULL" };
-
-/**
- * Level for a usage percentage. Rising: the highest threshold exceeded.
- * Falling: a level is only left once usage drops `hysteresis` points below its
- * threshold, so 84↔86% doesn't flap between WARNING and CRITICAL.
- */
-export function nextLevel(pct: number, current: Level, thresholds: readonly [number, number, number], hysteresis: number): Level {
-  const raw = thresholds.filter((t) => pct > t).length as Level;
-  if (raw >= current) return raw;
-  let level = current;
-  while (level > raw && pct < thresholds[level - 1] - hysteresis) level = (level - 1) as Level;
-  return level;
-}
 
 export type Evaluation = {
   events: EventInput[];
@@ -183,24 +171,18 @@ export function evaluateContainer(sample: ContainerSample, prev: ContainerState,
   );
 
   const cpuPct = round1(sample.cpuUsed * 100);
-  let cpuHighSince = prev.cpuHighSince;
-  if (cpuPct > config.cpuAlertPct) {
-    cpuHighSince ??= now;
-    const sustainedMs = now - cpuHighSince;
-    if (sustainedMs >= config.cpuAlertDurationMs) {
-      events.push({
-        type: "CPU_HIGH",
-        subject,
-        source: SOURCE,
-        data: { ...base, pct: cpuPct, used: cpuPct, limit: 100, unit: "%", sustainedSeconds: Math.round(sustainedMs / 1000) },
-      });
-    }
-  } else if (cpuHighSince !== null && cpuPct < config.cpuAlertPct - config.hysteresisPct) {
-    cpuHighSince = null;
-    resets.push("CPU_HIGH");
+  const cpu = sustained(cpuPct, prev.cpuHighSince, now, config.cpuAlertPct, config.cpuAlertDurationMs, config.hysteresisPct);
+  if (cpu.firingMs !== null) {
+    events.push({
+      type: "CPU_HIGH",
+      subject,
+      source: SOURCE,
+      data: { ...base, pct: cpuPct, used: cpuPct, limit: 100, unit: "%", sustainedSeconds: Math.round(cpu.firingMs / 1000) },
+    });
   }
+  if (cpu.cleared) resets.push("CPU_HIGH");
 
-  return { events, resets, state: { ram, disk, cpuHighSince } };
+  return { events, resets, state: { ram, disk, cpuHighSince: cpu.since } };
 }
 
 // ── Monitor ───────────────────────────────────────────────────────────
@@ -223,9 +205,7 @@ export type ContainerMonitorStats = {
 export class ContainerMonitor {
   private readonly states = new Map<string, ContainerState>();
   private readonly latest = new Map<string, ContainerSample>();
-  private timer: NodeJS.Timeout | null = null;
-  private inProgress: Promise<ContainerSample[]> | null = null;
-  private stopped = true;
+  private readonly poller: Poller<ContainerSample[]>;
   private readonly counters: ContainerMonitorStats = {
     polls: 0,
     lastPollAt: null,
@@ -246,31 +226,21 @@ export class ContainerMonitor {
   ) {
     this.log = options.log ?? createLogger("containers");
     this.now = options.now ?? Date.now;
+    this.poller = new Poller(() => this.runPoll(), config.containerPollMs, this.log);
   }
 
   /** Polls immediately, then every containerPollMs. Polls never overlap. */
   start(): void {
-    if (!this.stopped) return;
-    this.stopped = false;
-    const loop = async () => {
-      await this.pollOnce().catch((err) => this.log.error("poll failed:", err));
-      if (!this.stopped) this.timer = setTimeout(loop, this.config.containerPollMs);
-    };
-    void loop();
+    this.poller.start();
   }
 
-  async stop(): Promise<void> {
-    this.stopped = true;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
-    await this.inProgress?.catch(() => {});
+  stop(): Promise<void> {
+    return this.poller.stop();
   }
 
   /** One full pass over every node. Returns all samples (managed and unmanaged). */
   pollOnce(): Promise<ContainerSample[]> {
-    // A manual poll while one is running joins it instead of starting another.
-    this.inProgress ??= this.runPoll().finally(() => (this.inProgress = null));
-    return this.inProgress;
+    return this.poller.pollOnce();
   }
 
   /** Latest sample per container. */

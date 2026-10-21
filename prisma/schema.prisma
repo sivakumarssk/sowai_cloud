@@ -179,6 +179,12 @@ model Service {
   /// Current container limits; may exceed the plan after automatic scaling. Null = plan size.
   allocatedRamMB      Int?
   allocatedDiskGB     Int?
+  /// Client agreed to pay for disk beyond the plan (₹/GB/month). Off = disk stops at the plan.
+  overageOptIn        Boolean   @default(false)
+  /// Extra space mounted at /data (root disk always stays at the plan size).
+  dataDiskGB          Int       @default(0)
+  /// Proxmox storage holding /data ("local" = server free pool, else a Hetzner Volume's storage).
+  dataDiskStorage     String?
   lastRamExpansionAt  DateTime?
   lastDiskExpansionAt DateTime?
   lastMigratedAt      DateTime?

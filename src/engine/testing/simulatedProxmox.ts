@@ -8,6 +8,7 @@ import type {
   MonitoredNode,
   RawContainer,
 } from "../monitors/ContainerMonitor";
+import type { NodeUpdate, ServerMonitorDeps, ServerNode } from "../monitors/ServerMonitor";
 
 const MB = 1024 ** 2;
 const GB = 1024 ** 3;
@@ -90,3 +91,62 @@ export class SimulatedCluster {
 /** Helpers for usage curves. */
 export const flat = (pct: number) => () => pct;
 export const steps = (...values: number[]) => (tick: number) => values[Math.min(tick, values.length - 1)];
+
+// ── Physical servers (ServerMonitor) ────────────────────────────────
+
+export type SimServer = ServerNode & {
+  ramTotalMB: number;
+  diskTotalGB: number;
+  cores: number;
+  ramPct: (tick: number) => number;
+  diskPct: (tick: number) => number;
+  cpuPct: (tick: number) => number;
+  /** Disk promised to containers on the container storage, GB. */
+  allocatedDiskGB: number;
+  containers: { vmid: number; running: boolean; ramMB: number }[];
+  volumeAllocatedGB?: Record<string, number>;
+  down?: (tick: number) => boolean;
+  failSave?: boolean;
+};
+
+export class SimulatedServers {
+  tick = 0;
+  readonly saved: NodeUpdate[] = [];
+
+  constructor(readonly nodes: SimServer[]) {}
+
+  advance(): void {
+    this.tick++;
+  }
+
+  deps(): ServerMonitorDeps {
+    const find = (node: ServerNode) => {
+      const sim = this.nodes.find((n) => n.id === node.id)!;
+      if (sim.down?.(this.tick)) throw new Error(`connect ETIMEDOUT ${node.ip}:8006`);
+      return sim;
+    };
+    return {
+      listNodes: async () => this.nodes.map(({ id, name, ip, hetznerServerId, volumes }) => ({ id, name, ip, hetznerServerId, volumes })),
+      nodeStatus: async (node) => {
+        const s = find(node);
+        return { memory: { total: s.ramTotalMB * MB, used: (s.ramPct(this.tick) / 100) * s.ramTotalMB * MB }, cpu: s.cpuPct(this.tick) / 100, cpus: s.cores };
+      },
+      storageStatus: async (node, storage) => {
+        const s = find(node);
+        const volume = s.volumes.find((v) => v.storage === storage);
+        if (volume) return { total: volume.sizeGB * GB, used: (s.volumeAllocatedGB?.[storage] ?? 0) * 0.5 * GB };
+        return { total: s.diskTotalGB * GB, used: (s.diskPct(this.tick) / 100) * s.diskTotalGB * GB };
+      },
+      storageImages: async (node, storage) => {
+        const s = find(node);
+        const gb = s.volumes.some((v) => v.storage === storage) ? s.volumeAllocatedGB?.[storage] ?? 0 : s.allocatedDiskGB;
+        return gb ? [{ vmid: 100, size: gb * GB }] : [];
+      },
+      containers: async (node) => find(node).containers.map((c) => ({ vmid: c.vmid, status: c.running ? "running" : "stopped", maxmem: c.ramMB * MB })),
+      saveNode: async (update) => {
+        if (this.nodes.find((n) => n.id === update.nodeId)?.failSave) throw new Error("db down");
+        this.saved.push(update);
+      },
+    };
+  }
+}
