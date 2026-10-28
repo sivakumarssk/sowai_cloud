@@ -43,7 +43,10 @@ export function verifyRazorpayWebhookSignature(rawBody: string, signature: strin
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
   if (!secret) return false;
   const expectedSignature = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  return expectedSignature === signature;
+  return (
+    expectedSignature.length === signature.length &&
+    crypto.timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(signature))
+  );
 }
 
 export function generateInvoiceNumber(): string {

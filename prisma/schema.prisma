@@ -306,7 +306,7 @@ model Subscription {
 /// Razorpay plans are immutable, so one is created per (cycle, amount) and reused.
 model RazorpayPlan {
   id             String   @id @default(cuid())
-  /// "{period}-{interval}-{amountPaise}", e.g. "yearly-1-1131528"
+  /// "{mode}-{period}-{interval}-{amountPaise}", e.g. "live-monthly-1-609878" (older rows have no mode prefix)
   key            String   @unique
   razorpayPlanId String   @unique
   period         String

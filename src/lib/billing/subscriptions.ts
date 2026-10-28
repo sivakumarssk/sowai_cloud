@@ -52,7 +52,9 @@ export function razorpayErrorMessage(err: unknown): string {
  */
 async function getOrCreateRazorpayPlan(months: number, amountPaise: number): Promise<string> {
   const { period, interval } = cycleToPeriod(months);
-  const key = `${period}-${interval}-${amountPaise}`;
+  // Test- and live-mode plans are separate on Razorpay, so never reuse one across modes.
+  const mode = process.env.RAZORPAY_KEY_ID?.startsWith("rzp_live_") ? "live" : "test";
+  const key = `${mode}-${period}-${interval}-${amountPaise}`;
 
   const existing = await prisma.razorpayPlan.findUnique({ where: { key } });
   if (existing) return existing.razorpayPlanId;
