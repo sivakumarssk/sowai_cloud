@@ -110,11 +110,12 @@ export class HetznerService {
    * Creates a new IPv4 Floating IP. It must be in the same location as the
    * Proxmox server (nbg1) or it can't be assigned to it.
    */
-  async buyFloatingIP(label: string): Promise<{ id: number; ip: string }> {
+  /** Buys an IPv4 Floating IP whose home is `location` (it can only be routed to servers there). */
+  async buyFloatingIP(label: string, location: string = process.env.HETZNER_LOCATION || "nbg1"): Promise<{ id: number; ip: string }> {
     const { floating_ip } = await this.request<{ floating_ip: ApiFloatingIp }>("post", "/floating_ips", {
       data: {
         type: "ipv4",
-        home_location: process.env.HETZNER_LOCATION || "nbg1",
+        home_location: location,
         description: label,
       },
     });

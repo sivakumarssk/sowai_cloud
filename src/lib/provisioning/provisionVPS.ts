@@ -12,6 +12,9 @@ import { planFeatures } from "@/lib/plans";
 import { sendCredentialsEmail, sendProvisioningFailedEmail } from "@/lib/email";
 import { alertAdmins } from "@/lib/adminAlert";
 import { cancelAutopayForService } from "@/lib/billing/subscriptions";
+import { placeOrder } from "@/lib/provisioning/placement";
+import { prismaPlacementDeps } from "@/lib/provisioning/placementDeps";
+import { ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
 
 export type PlanResources = { cores: number; memory: number; disk: number };
 
@@ -23,14 +26,7 @@ export function getPlanResources(plan: Pick<Plan, "name" | "vcpu" | "ramGB" | "s
   return { cores: plan.vcpu, memory: plan.ramGB * 1024, disk: plan.storageGB };
 }
 
-/** "2a01:4f8:1c16:5f1d" + vmid 100 → "2a01:4f8:1c16:5f1d::100" */
-export function ipv6ForVmid(vmid: number): string {
-  const subnet = process.env.PROXMOX_IPV6_SUBNET;
-  if (!subnet) throw new Error("PROXMOX_IPV6_SUBNET is not set");
-  // The VMID's decimal digits are used as the final hextet, which only fits up to 4 digits.
-  if (vmid > 9999) throw new Error(`VMID ${vmid} doesn't fit the ::{vmid} IPv6 scheme`);
-  return `${subnet.replace(/:+$/, "")}::${vmid}`;
-}
+export { ipv6ForVmid };
 
 async function updateStatus(serviceId: string, status: ServiceStatus, step: string, pct: number) {
   await prisma.service.update({
@@ -53,19 +49,24 @@ const SETUP_PROGRESS: Record<SetupStep, [string, number]> = {
  * PROVISIONING, 0%) into a running, configured LXC container.
  * Never throws: on failure it deletes the container, releases the Floating
  * IP, marks the service FAILED, refunds the payment and alerts admins.
+ *
+ * The node comes from the ProxmoxNode table (open, with room for the plan) —
+ * see placement.ts. If none fits, none of the above happens: the paid order
+ * stays PROVISIONING (0%) and waits for capacity.
  */
 export async function provisionVPS(serviceId: string): Promise<void> {
-  // Claim the job atomically (0% = not started) so a duplicate call can't provision twice.
-  const claimed = await prisma.service.updateMany({
-    where: { id: serviceId, status: "PROVISIONING", provisioningPct: 0 },
-    data: { provisioningPct: 10, provisioningStep: "Allocating resources...", provisionError: null },
-  });
-  if (claimed.count === 0) return;
+  // Picks a node and claims the order on it (0% → 10%) under a lock, so a
+  // duplicate call can't provision twice and two orders can't take the last slot.
+  const placement = await placeOrder(serviceId, prismaPlacementDeps());
+  if (placement.status !== "PLACED") return;
 
   let floatingIpId: number | null = null;
   let vmid: number | null = null;
+  let node: NodeTarget | null = null;
 
   try {
+    node = nodeTarget(placement.node);
+    const pve = proxmoxForNode(node);
     const service = await prisma.service.findUniqueOrThrow({
       where: { id: serviceId },
       include: { user: true, plan: true },
@@ -76,21 +77,21 @@ export async function provisionVPS(serviceId: string): Promise<void> {
     const osImage = service.osImage || "ubuntu-22.04";
     const osLabel = getOsImage(osImage)?.label.replace(/\s*\(.*\)$/, "") ?? osImage;
     // Fail before buying an IP if the OS can't be installed.
-    if (!(await proxmox.hasOSTemplate(osImage))) {
-      throw new Error(`LXC template for OS "${osImage}" is not available on the Proxmox host`);
+    if (!(await pve.hasOSTemplate(osImage))) {
+      throw new Error(`LXC template for OS "${osImage}" is not available on ${node.name}`);
     }
 
-    // b. Buy the Floating IP — saved immediately so it can be released even if we crash.
-    const ip = await hetzner.buyFloatingIP(`sowsi-${serviceId}`);
+    // b. Buy the Floating IP in the node's location — saved immediately so it can be released even if we crash.
+    const ip = await hetzner.buyFloatingIP(`sowsi-${serviceId}`, node.location);
     floatingIpId = ip.id;
     await prisma.service.update({
       where: { id: serviceId },
       data: { hetznerFloatingIpId: String(ip.id), serverIp: ip.ip, hasCoolify },
     });
 
-    // c–d. Route it to the Proxmox server.
+    // c–d. Route it to the chosen node's server.
     await updateStatus(serviceId, "PROVISIONING", "Assigning IP address...", 20);
-    await hetzner.assignFloatingIP(ip.id);
+    await hetzner.assignFloatingIP(ip.id, node.hetznerServerId);
 
     // e–f. Create the container — this is where the OS is installed from the template.
     await updateStatus(serviceId, "INSTALLING", `Installing ${osLabel}...`, 40);
@@ -98,10 +99,10 @@ export async function provisionVPS(serviceId: string): Promise<void> {
     // /cluster/nextid isn't reserved, so a concurrent provision can grab the
     // same ID first — retry with a fresh one if that happens.
     for (let attempt = 1; ; attempt++) {
-      const candidate = await proxmox.getNextVMID();
-      const ipv6 = ipv6ForVmid(candidate);
+      const candidate = await pve.getNextVMID();
+      const ipv6 = ipv6ForVmid(node.ipv6Subnet, candidate);
       try {
-        await proxmox.createLXC({
+        await pve.createLXC({
           vmid: candidate,
           hostname: `sowsi-${serviceId}`,
           cores: resources.cores,
@@ -119,19 +120,15 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       vmid = candidate;
       await prisma.service.update({
         where: { id: serviceId },
-        data: {
-          proxmoxVmId: String(candidate),
-          ipv6Address: ipv6,
-          // The resource engine finds containers by node.
-          nodeId: (await prisma.proxmoxNode.findUnique({ where: { name: process.env.PROXMOX_NODE ?? "" }, select: { id: true } }))?.id ?? null,
-        },
+        // nodeId was set when the order was placed.
+        data: { proxmoxVmId: String(candidate), ipv6Address: ipv6 },
       });
       break;
     }
 
     // g. Wait for it to run, then route its IPs on the host.
-    await proxmox.waitForLXC(vmid);
-    await vmSetup.syncHostRoutes();
+    await pve.waitForLXC(vmid);
+    await vmSetup.syncHostRoutes(node.ip);
 
     // h–k. SSH in: updates, UFW, client user, Coolify, SSH hardening.
     await updateStatus(serviceId, "INSTALLING", ...SETUP_PROGRESS.connecting);
@@ -198,7 +195,7 @@ const LEFTOVER_DISKS = "Leftover disks";
 async function releaseResources(
   vmid: number | null,
   floatingIpId: number | null,
-  ctx: { client?: ProxmoxService; serviceId?: string; nodeName?: string } = {}
+  ctx: { client?: ProxmoxService; serviceId?: string; nodeName?: string; routesHost?: string } = {}
 ): Promise<string[]> {
   const errors: string[] = [];
   if (vmid !== null) {
@@ -227,7 +224,7 @@ async function releaseResources(
     }
     // A leftover route to a deleted container is harmless, so this doesn't block the IP release.
     await vmSetup
-      .syncHostRoutes()
+      .syncHostRoutes(ctx.routesHost)
       .catch((err) => console.error(`[provisioning] route sync after deleting ${vmid} failed:`, err));
   }
   if (floatingIpId !== null) {
@@ -240,10 +237,10 @@ async function releaseResources(
   return errors;
 }
 
-/** Proxmox client for the node a service's container is on (falls back to the default node). */
-async function clientForService(serviceId: string): Promise<{ client: ProxmoxService; nodeName?: string }> {
+/** Proxmox client and route-sync host for the node a service's container is on (falls back to the default node). */
+async function clientForService(serviceId: string): Promise<{ client: ProxmoxService; nodeName?: string; routesHost?: string }> {
   const service = await prisma.service.findUnique({ where: { id: serviceId }, select: { node: { select: { name: true, ip: true } } } });
-  return service?.node ? { client: proxmoxForNode(service.node), nodeName: service.node.name } : { client: proxmox };
+  return service?.node ? { client: proxmoxForNode(service.node), nodeName: service.node.name, routesHost: service.node.ip } : { client: proxmox };
 }
 
 async function handleFailure(

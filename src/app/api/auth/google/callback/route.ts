@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { signToken, setAuthCookie } from "@/lib/auth";
+import { signToken, AUTH_COOKIE_OPTIONS } from "@/lib/auth";
+import { GOOGLE_STATE_COOKIE, safeRedirectPath } from "@/lib/googleOAuth";
 
 interface GoogleTokenResponse {
   access_token: string;
@@ -23,10 +24,25 @@ export async function GET(req: NextRequest) {
   const state = searchParams.get("state");
   const error = searchParams.get("error");
 
-  const redirect = state ? decodeURIComponent(state) : "/dashboard";
+  // state is "<nonce>:<redirect path>"; the nonce must match the cookie set by /api/auth/google.
+  const sep = state?.indexOf(":") ?? -1;
+  const nonce = state && sep > 0 ? state.slice(0, sep) : null;
+  const redirect = safeRedirectPath(state && sep > 0 ? state.slice(sep + 1) : null);
+  const expectedNonce = req.cookies.get(GOOGLE_STATE_COOKIE)?.value;
+
+  const fail = (reason: string) => {
+    const res = NextResponse.redirect(new URL(`/login?error=${reason}`, appUrl));
+    res.cookies.delete({ name: GOOGLE_STATE_COOKIE, path: "/api/auth/google" });
+    return res;
+  };
 
   if (error || !code) {
-    return NextResponse.redirect(new URL(`/login?error=google_denied`, appUrl));
+    if (error) console.error("[google-callback] Google returned error:", error);
+    return fail("google_denied");
+  }
+  if (!nonce || !expectedNonce || nonce !== expectedNonce) {
+    console.error("[google-callback] state mismatch (cookie missing or expired)");
+    return fail("google_state");
   }
 
   try {
@@ -45,9 +61,11 @@ export async function GET(req: NextRequest) {
       }),
     });
 
-    const tokens: GoogleTokenResponse = await tokenRes.json();
+    const tokens: GoogleTokenResponse & { error_description?: string } = await tokenRes.json();
     if (tokens.error || !tokens.access_token) {
-      return NextResponse.redirect(new URL(`/login?error=google_token_failed`, appUrl));
+      // e.g. invalid_client (wrong secret) or redirect_uri_mismatch (NEXT_PUBLIC_APP_URL ≠ the URL used to start login)
+      console.error("[google-callback] token exchange failed:", tokens.error, tokens.error_description);
+      return fail("google_token_failed");
     }
 
     // Get user info
@@ -57,7 +75,7 @@ export async function GET(req: NextRequest) {
     const googleUser: GoogleUserInfo = await userRes.json();
 
     if (!googleUser.email || !googleUser.email_verified) {
-      return NextResponse.redirect(new URL(`/login?error=google_email_unverified`, appUrl));
+      return fail("google_email_unverified");
     }
 
     // Upsert user — find by email, create if new
@@ -96,11 +114,13 @@ export async function GET(req: NextRequest) {
       new URL(user.role === "ADMIN" ? "/admin" : redirect, appUrl)
     );
 
-    await setAuthCookie(token);
+    // Set on the redirect itself so the session survives the redirect.
+    response.cookies.set("auth_token", token, AUTH_COOKIE_OPTIONS);
+    response.cookies.delete({ name: GOOGLE_STATE_COOKIE, path: "/api/auth/google" });
 
     return response;
   } catch (err) {
     console.error("[google-callback]", err);
-    return NextResponse.redirect(new URL(`/login?error=google_failed`, appUrl));
+    return fail("google_failed");
   }
 }

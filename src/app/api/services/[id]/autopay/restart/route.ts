@@ -6,6 +6,8 @@ import {
   cancelAutopayForService,
   latestSubscription,
   razorpayErrorMessage,
+  syncSubscription,
+  TERMINAL_STATUSES,
 } from "@/lib/billing/subscriptions";
 import { gstOn, processingFeeOn } from "@/lib/pricing";
 
@@ -36,7 +38,11 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   const inPaidPeriod = service.status === "ACTIVE" && service.nextBillingDate.getTime() > Date.now() + HOUR_MS;
   const timing = { chargesNow: !inPaidPeriod, startsOn: inPaidPeriod ? service.nextBillingDate : null };
 
-  const latest = await latestSubscription(service.id);
+  let latest = await latestSubscription(service.id);
+  // Our row can lag behind Razorpay (missed webhook) — never replace a mandate that's actually live.
+  if (latest && !TERMINAL_STATUSES.includes(latest.status)) {
+    latest = await syncSubscription(latest.razorpaySubscriptionId).catch(() => latest);
+  }
   if (latest && (latest.status === "ACTIVE" || latest.status === "AUTHENTICATED")) {
     return apiError("Autopay is already active for this server", 409);
   }

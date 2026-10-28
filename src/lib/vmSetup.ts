@@ -88,7 +88,7 @@ export async function run(
 
 export class VMSetupService {
   /**
-   * Makes the Proxmox host route every container's public IPs to the routed
+   * Makes a Proxmox host route every container's public IPs to the routed
    * bridge, based on the containers' own net0 config (adds new routes and
    * removes ones for deleted containers). Call after creating or deleting a
    * container.
@@ -97,9 +97,8 @@ export class VMSetupService {
    * this connection can only ever run /usr/local/sbin/sowsi-routes — see
    * scripts/proxmox-host-setup.sh.
    */
-  async syncHostRoutes(): Promise<string> {
-    const host = process.env.PROXMOX_HOST;
-    if (!host) throw new Error("PROXMOX_HOST is not set");
+  async syncHostRoutes(host: string | undefined = process.env.PROXMOX_HOST): Promise<string> {
+    if (!host) throw new Error("no Proxmox host given and PROXMOX_HOST is not set");
     const ssh = await connectWithRetry({ host, username: "root", ...provisioningKey() }, 3);
     try {
       return (await run(ssh, "sync host routes", "sowsi-routes", { timeoutMs: 60_000 })).trim();

@@ -19,10 +19,21 @@ function GoogleIcon() {
   );
 }
 
+const GOOGLE_ERRORS: Record<string, string> = {
+  google_not_configured: "Google sign-in isn't available right now. Please sign in with email.",
+  google_denied: "Google sign-in was cancelled.",
+  google_state: "Your Google sign-in session expired. Please try again.",
+  google_token_failed: "Google sign-in failed. Please try again.",
+  google_email_unverified: "Your Google account's email isn't verified.",
+  google_failed: "Something went wrong signing in with Google. Please try again.",
+};
+
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const redirect = searchParams.get("redirect") || "/dashboard";
+  const errorParam = searchParams.get("error");
+  const googleError = errorParam ? GOOGLE_ERRORS[errorParam] : undefined;
   const setAuth = useAuthStore((s) => s.setAuth);
 
   const [email, setEmail] = useState("");
@@ -76,6 +87,12 @@ function LoginForm() {
           <h1 className="text-2xl font-bold text-white">Welcome back</h1>
           <p className="text-gray-400 mt-1 text-sm">Sign in to your Sowsi Cloud account</p>
         </div>
+
+        {googleError && (
+          <div role="alert" className="mb-5 rounded-lg border border-red-800 bg-red-900/30 px-4 py-3 text-sm text-red-300">
+            {googleError}
+          </div>
+        )}
 
         {/* Google OAuth button */}
         <button

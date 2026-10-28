@@ -13,6 +13,8 @@ export type NodeState = {
   /** Physical RAM in use, % (from the ServerMonitor). Null when unknown or stale. */
   ramPct: number | null;
   acceptNewClients: boolean;
+  /** Other nodes that accept new clients. 0 = this is the last one, which is never closed. */
+  otherOpenNodes: number;
   /** What another server like this one costs per month, paise. */
   monthlyCostPaise: number;
 };
@@ -214,10 +216,15 @@ export class DecisionMaker {
     const subject = subjectForNode(nodeName);
     const reason = `${event.type}: ${resource} at ${pct}% on ${nodeName}`;
     const node = await this.deps.nodeState(nodeId);
+    // Closing the last open node would leave paid orders with nowhere to go: alert instead.
+    const lastOpenNode = !!node && node.acceptNewClients && node.otherOpenNodes === 0;
     const stop = (): Decision[] =>
-      node && !node.acceptNewClients
+      (node && !node.acceptNewClients) || lastOpenNode
         ? []
         : [{ kind: "STOP_SIGNUPS", subject, summary: `stop placing new clients on ${nodeName}`, reason, monthlyCostPaise: 0, payload: { kind: "STOP_SIGNUPS", nodeName } }];
+    const signups = lastOpenNode
+      ? `${nodeName} is the only node taking new clients, so signups stay open — new orders still land here. Add a node to take the load.`
+      : "New clients go elsewhere until it's back under the limit.";
 
     switch (event.type) {
       case "SERVER_RAM_WARNING":
@@ -229,7 +236,7 @@ export class DecisionMaker {
       case "SERVER_FULL":
         return [
           ...stop(),
-          this.alert(subject, `${nodeName}: ${SERVER_EVENT_TITLES[event.type]} (${resource} ${pct}%)`, `${reason}\nNew clients go elsewhere until it's back under the limit.`),
+          this.alert(subject, `${nodeName}: ${SERVER_EVENT_TITLES[event.type]} (${resource} ${pct}%)`, `${reason}\n${signups}`),
         ];
 
       case "SERVER_RAM_EMERGENCY": {
@@ -252,7 +259,7 @@ export class DecisionMaker {
             monthlyCostPaise: 0,
             payload: { kind: "MIGRATION", nodeName, urgency: "PLANNED", detail: `${resource} at ${pct}%` },
           },
-          this.alert(subject, `${nodeName}: RAM emergency (${pct}%)`, `${reason}\nProposed: new server, stop signups, migrate containers.`),
+          this.alert(subject, `${nodeName}: RAM emergency (${pct}%)`, `${reason}\nProposed: new server${lastOpenNode ? "" : ", stop signups"}, migrate containers.${lastOpenNode ? `\n${signups}` : ""}`),
         ];
       }
 

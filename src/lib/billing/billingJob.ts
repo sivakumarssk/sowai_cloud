@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { deprovisionVPS } from "@/lib/provisioning/provisionVPS";
 import { sendBillingNoticeEmail } from "@/lib/email";
-import { LIVE_STATUSES, syncSubscription } from "./subscriptions";
+import { LIVE_STATUSES, TERMINAL_STATUSES, syncSubscription } from "./subscriptions";
 import { suspendForNonPayment, BILLING_SUSPEND_REASON, DELETE_AFTER_SUSPENDED_DAYS } from "./suspension";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -30,7 +30,9 @@ export async function runBillingJob(now = new Date()): Promise<BillingJobSummary
     summary.checked++;
     try {
       let sub = service.subscriptions[0];
-      if (sub && LIVE_STATUSES.includes(sub.status)) {
+      // Re-check anything Razorpay might still charge — a stale CREATED/HALTED row
+      // may already be active there if its webhook was missed.
+      if (sub && !TERMINAL_STATUSES.includes(sub.status)) {
         sub = await syncSubscription(sub.razorpaySubscriptionId);
         if (sub.currentEnd && sub.currentEnd > service.nextBillingDate) {
           // Charged, but the subscription.charged webhook hasn't been processed

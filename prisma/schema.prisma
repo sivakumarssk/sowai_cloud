@@ -166,6 +166,8 @@ model Service {
   provisioningStep    String?
   provisioningPct     Int           @default(0)
   provisionError      String?
+  /// Paid but held (status PROVISIONING, 0%) because no node accepts new clients. Cleared when provisioning starts.
+  waitingForNodeSince DateTime?
   startDate           DateTime      @default(now())
   /// End of the paid period; autopay renewals move it forward.
   nextBillingDate     DateTime

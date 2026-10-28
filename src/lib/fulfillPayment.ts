@@ -4,6 +4,7 @@ import { generateInvoiceNumber } from "@/lib/razorpay";
 import { sendInvoiceEmail } from "@/lib/email";
 import { provisioningQueue } from "@/lib/queue/provisioningQueue";
 import { addMonths } from "@/lib/pricing";
+import { syncSubscription } from "@/lib/billing/subscriptions";
 
 type FulfillResult = { serviceId: string; orderId: string } | null;
 
@@ -110,6 +111,12 @@ export async function fulfillSubscriptionPayment(
 ): Promise<FulfillResult> {
   const subscription = await prisma.subscription.findUnique({ where: { razorpaySubscriptionId } });
   if (!subscription?.orderId) return null;
+
+  // Record that autopay is now authorised/active (and its schedule) without
+  // waiting for the webhook, which may be late or never reach us.
+  await syncSubscription(razorpaySubscriptionId).catch((err) =>
+    console.error(`[fulfill] syncing ${razorpaySubscriptionId} from Razorpay failed:`, err)
+  );
 
   const payment = await prisma.payment.findFirst({
     where: { subscriptionId: subscription.id, orderId: subscription.orderId },

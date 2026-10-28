@@ -158,7 +158,9 @@ export default function CheckoutClient({
     <div className="min-h-screen bg-canvas pb-24 lg:pb-0">
       <Script
         src="https://checkout.razorpay.com/v1/checkout.js"
-        onLoad={() => setScriptReady(true)}
+        // onReady (not onLoad) also fires when checkout.js is already loaded from an
+        // earlier checkout in this session — onLoad wouldn't, leaving Pay disabled.
+        onReady={() => setScriptReady(true)}
         onError={() => setScriptFailed(true)}
       />
       <Navbar />

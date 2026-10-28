@@ -36,15 +36,17 @@ export async function getSession(): Promise<JWTPayload | null> {
   return verifyToken(token);
 }
 
+export const AUTH_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax" as const,
+  maxAge: 7 * 24 * 60 * 60,
+  path: "/",
+};
+
 export async function setAuthCookie(token: string): Promise<void> {
   const cookieStore = await cookies();
-  cookieStore.set("auth_token", token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60,
-    path: "/",
-  });
+  cookieStore.set("auth_token", token, AUTH_COOKIE_OPTIONS);
 }
 
 export async function clearAuthCookie(): Promise<void> {

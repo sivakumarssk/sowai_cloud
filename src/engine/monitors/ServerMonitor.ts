@@ -33,6 +33,10 @@ export type NodeContainer = { vmid: number; status: string; maxmem: number };
 
 export type NodeUpdate = {
   nodeId: string;
+  /** Measured capacity: RAM and cores from the node, disk = the container storage (free pool). */
+  physicalRamMB: number;
+  physicalDiskGB: number;
+  physicalCpu: number;
   usedRamMB: number;
   usedDiskGB: number;
   usedCpuPct: number;
@@ -292,6 +296,9 @@ export class ServerMonitor {
     await this.deps
       .saveNode({
         nodeId: node.id,
+        physicalRamMB: Math.round(sample.physicalRam / MB),
+        physicalDiskGB: Math.floor(sample.physicalDisk / GB),
+        physicalCpu: sample.physicalCpu,
         usedRamMB: Math.round(sample.physicalRamUsed / MB),
         usedDiskGB: Math.round(sample.physicalDiskUsed / GB),
         usedCpuPct: sample.physicalCpuPct,

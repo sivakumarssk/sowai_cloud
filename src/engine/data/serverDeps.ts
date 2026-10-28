@@ -36,6 +36,10 @@ export function prismaServerDeps(): ServerMonitorDeps {
         prisma.proxmoxNode.update({
           where: { id: u.nodeId },
           data: {
+            // Measured, so a newly added node needs no hand-entered specs. Placement uses these.
+            ...(u.physicalRamMB > 0 && { physicalRamMB: u.physicalRamMB }),
+            ...(u.physicalDiskGB > 0 && { physicalDiskGB: u.physicalDiskGB }),
+            ...(u.physicalCpu > 0 && { physicalCpu: u.physicalCpu }),
             usedRamMB: u.usedRamMB,
             usedDiskGB: u.usedDiskGB,
             usedCpuPct: u.usedCpuPct,

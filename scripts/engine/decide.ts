@@ -201,7 +201,7 @@ async function simulated(
 
   const decisionMaker = new DecisionMaker(
     {
-      nodeState: async () => ({ name: node.name, ramPct: nodeRam(servers.tick), acceptNewClients: true, monthlyCostPaise: 330_000 }),
+      nodeState: async () => ({ name: node.name, ramPct: nodeRam(servers.tick), acceptNewClients: true, otherOpenNodes: 0, monthlyCostPaise: 330_000 }),
       target: async (id) => targets[id],
       ramScaler: {
         plan: async (t, req) => {

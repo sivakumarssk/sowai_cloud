@@ -90,11 +90,13 @@ export function prismaApprovalStore(): ApprovalStore {
 export async function nodeState(nodeId: string): Promise<NodeState | null> {
   const n = await prisma.proxmoxNode.findUnique({ where: { id: nodeId } });
   if (!n) return null;
+  const otherOpenNodes = await prisma.proxmoxNode.count({ where: { id: { not: n.id }, acceptNewClients: true, status: { in: [...OPEN_STATUSES] } } });
   const fresh = n.lastSeenAt && Date.now() - n.lastSeenAt.getTime() < NODE_STATE_MAX_AGE_MS && n.physicalRamMB > 0;
   return {
     name: n.name,
     ramPct: fresh ? Math.round((n.usedRamMB / n.physicalRamMB) * 1000) / 10 : null,
     acceptNewClients: n.acceptNewClients,
+    otherOpenNodes,
     monthlyCostPaise: n.monthlyCost,
   };
 }
@@ -131,9 +133,20 @@ export async function notifyClient(serviceId: string, template: ClientNoticeTemp
   await sendBillingNoticeEmail(s.user.email, s.user.name, NOTICES[template](host, detail.replace(/[<>&]/g, "")));
 }
 
-export async function stopSignups(nodeName: string): Promise<boolean> {
-  const { count } = await prisma.proxmoxNode.updateMany({ where: { name: nodeName, acceptNewClients: true }, data: { acceptNewClients: false } });
-  return count === 1;
+/** Nodes that can take new containers (READY/WARNING/CRITICAL are health, not closure). */
+const OPEN_STATUSES = ["READY", "WARNING", "CRITICAL"] as const;
+
+/** Closes a node to new clients — never the last open one (paid orders would have nowhere to go). */
+export async function stopSignups(nodeName: string): Promise<"CLOSED" | "ALREADY_CLOSED" | "LAST_OPEN_NODE"> {
+  return prisma.$transaction(
+    async (tx) => {
+      const others = await tx.proxmoxNode.count({ where: { name: { not: nodeName }, acceptNewClients: true, status: { in: [...OPEN_STATUSES] } } });
+      if (others === 0) return "LAST_OPEN_NODE";
+      const { count } = await tx.proxmoxNode.updateMany({ where: { name: nodeName, acceptNewClients: true }, data: { acceptNewClients: false } });
+      return count === 1 ? "CLOSED" : "ALREADY_CLOSED";
+    },
+    { isolationLevel: "Serializable" }
+  );
 }
 
 export const approveHint = (id: string) =>

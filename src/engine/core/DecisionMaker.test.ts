@@ -290,10 +290,10 @@ test("ASSISTED: an admin alert is sent as itself, not as an approval request; OB
 
 const target: ContainerTarget = { node: { id: "node_1", name: "sowsi-proxmox-01", ip: "10.0.0.1" }, vmid: 100, serviceId: "svc_1", planRamMB: 2048, planDiskGB: 20 };
 
-function maker(opts: { nodeRam?: number | null; acceptNewClients?: boolean; ram?: unknown; disk?: unknown } = {}) {
+function maker(opts: { nodeRam?: number | null; acceptNewClients?: boolean; otherOpenNodes?: number; ram?: unknown; disk?: unknown } = {}) {
   const submitted: Decision[] = [];
   const ramRequests: number[] = [];
-  const node: NodeState = { name: "sowsi-proxmox-01", ramPct: opts.nodeRam === undefined ? 50 : opts.nodeRam, acceptNewClients: opts.acceptNewClients ?? true, monthlyCostPaise: 330_000 };
+  const node: NodeState = { name: "sowsi-proxmox-01", ramPct: opts.nodeRam === undefined ? 50 : opts.nodeRam, acceptNewClients: opts.acceptNewClients ?? true, otherOpenNodes: opts.otherOpenNodes ?? 1, monthlyCostPaise: 330_000 };
   const deps: DecisionMakerDeps = {
     nodeState: async () => node,
     target: async () => target,
@@ -407,4 +407,26 @@ test("two events for one node in the same poll are both handled, in order, never
   await bus.drain();
   assert.deepEqual(order, ["STOP_SIGNUPS", "ALERT_ADMIN", "ALERT_ADMIN"]);
   assert.equal(dm.stats().skippedBusy, 0);
+});
+
+test("single node: a full server never stops signups — the admin is alerted instead", async () => {
+  const { dm } = maker({ otherOpenNodes: 0 });
+  for (const type of ["SERVER_RAM_CRITICAL", "SERVER_DISK_CRITICAL", "SERVER_FULL"]) {
+    const ds = await dm.decide(serverEvent(type));
+    assert.deepEqual(kinds(ds), ["ALERT_ADMIN"], type);
+    assert.match((ds[0].payload as { detail: string }).detail, /only node taking new clients, so signups stay open/);
+  }
+  const emergency = await dm.decide(serverEvent("SERVER_RAM_EMERGENCY", 93));
+  assert.deepEqual(kinds(emergency), ["SERVER_PURCHASE", "MIGRATION", "ALERT_ADMIN"]);
+});
+
+test("STOP_SIGNUPS action refuses to close the last open node and alerts instead", async () => {
+  const alerts: string[] = [];
+  const handlers = buildHandlers({
+    stopSignups: async () => "LAST_OPEN_NODE" as const,
+    alertAdmin: async (title: string) => void alerts.push(title),
+  } as unknown as HandlerDeps);
+  const result = await handlers.STOP_SIGNUPS!({ kind: "STOP_SIGNUPS", nodeName: "sowsi-proxmox-01" }, { trigger: "AUTO_ENGINE" });
+  assert.match(result, /kept sowsi-proxmox-01 open/);
+  assert.deepEqual(alerts, ["sowsi-proxmox-01 is full but kept open"]);
 });

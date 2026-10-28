@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { runBillingJob } from "@/lib/billing/billingJob";
+import { runProvisioningSweep } from "@/lib/queue/provisioningSweep";
 
 /**
- * Billing sweep — call every 15 minutes from cron on the app server:
+ * Billing sweep + held/unstarted paid orders — call every 15 minutes from cron on the app server:
  *   *\/15 * * * * curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET" https://<app>/api/cron/billing
  */
 export async function POST(req: Request) {
@@ -17,5 +18,9 @@ export async function POST(req: Request) {
 
   const summary = await runBillingJob();
   if (summary.errors.length > 0) console.error("[cron/billing]", summary.errors);
-  return Response.json(summary);
+  const provisioning = await runProvisioningSweep().catch((err) => {
+    console.error("[cron/billing] provisioning sweep failed:", err);
+    return { error: err instanceof Error ? err.message : String(err) };
+  });
+  return Response.json({ ...summary, provisioning });
 }

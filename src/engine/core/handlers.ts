@@ -17,8 +17,8 @@ export type HandlerDeps = {
   volumeNode(nodeName: string): Promise<VolumeNode>;
   notifyClient(serviceId: string, template: ClientNoticeTemplate, detail: string): Promise<void>;
   alertAdmin(title: string, detail: string): Promise<void>;
-  /** Sets ProxmoxNode.acceptNewClients = false. Returns false if it already was. */
-  stopSignups(nodeName: string): Promise<boolean>;
+  /** Sets ProxmoxNode.acceptNewClients = false — refused for the last node accepting clients. */
+  stopSignups(nodeName: string): Promise<"CLOSED" | "ALREADY_CLOSED" | "LAST_OPEN_NODE">;
 };
 
 type Of<K extends DecisionPayload["kind"]> = Extract<DecisionPayload, { kind: K }>;
@@ -73,7 +73,12 @@ export function buildHandlers(deps: HandlerDeps): Partial<Record<ActionKind, Act
 
     async STOP_SIGNUPS(payload) {
       const p = expect(payload, "STOP_SIGNUPS");
-      return (await deps.stopSignups(p.nodeName)) ? `${p.nodeName} no longer accepts new clients` : `${p.nodeName} already closed to new clients`;
+      const result = await deps.stopSignups(p.nodeName);
+      if (result === "LAST_OPEN_NODE") {
+        await deps.alertAdmin(`${p.nodeName} is full but kept open`, `${p.nodeName} is the only node taking new clients, so it was not closed — paid orders would have nowhere to go. Add a node.`);
+        return `kept ${p.nodeName} open: it's the only node taking new clients (admin alerted)`;
+      }
+      return result === "CLOSED" ? `${p.nodeName} no longer accepts new clients` : `${p.nodeName} already closed to new clients`;
     },
   };
 }
