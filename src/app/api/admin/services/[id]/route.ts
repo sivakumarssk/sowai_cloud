@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { encrypt, withDecryptedCredentials } from "@/lib/crypto";
+import { isActiveConstraintError } from "@/lib/provisioning/serverReady";
 
 const serviceInclude = {
   user: { select: { name: true, email: true } },
@@ -30,7 +31,8 @@ export async function PATCH(
   const { id } = await params;
   const { serverIp, sshUsername, sshPassword, panelUrl, panelPassword, status } = await req.json();
 
-  const service = await prisma.service.update({
+  const service = await prisma.service
+    .update({
     where: { id },
     data: {
       ...(serverIp !== undefined && { serverIp }),
@@ -41,7 +43,17 @@ export async function PATCH(
       ...(status !== undefined && { status }),
     },
     include: serviceInclude,
-  });
+  })
+    .catch((err: unknown) => {
+      if (isActiveConstraintError(err)) return null;
+      throw err;
+    });
+  if (!service) {
+    return apiError(
+      "A service can only be ACTIVE when it has a real container, node, Floating IP and a passed SSH check. Rebuild it with scripts/billing/reprovision.ts instead.",
+      409
+    );
+  }
 
   return apiSuccess(withDecryptedCredentials(service));
 }

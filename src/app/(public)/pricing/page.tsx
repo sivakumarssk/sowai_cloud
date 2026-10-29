@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/prisma";
-import { toPublicPlan } from "@/lib/plans";
+import { toPublicPlans } from "@/lib/plans";
 import PricingClient from "./PricingClient";
 import type { Metadata } from "next";
 
@@ -17,7 +17,7 @@ async function getPlans() {
       where: { isActive: true, category: { in: ["VPS", "STORAGE"] } },
       orderBy: [{ category: "asc" }, { sortOrder: "asc" }],
     });
-    return plans.map(toPublicPlan);
+    return await toPublicPlans(plans);
   } catch {
     return [];
   }

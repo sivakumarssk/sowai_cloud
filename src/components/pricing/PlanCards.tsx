@@ -13,6 +13,7 @@ import {
   formatStorage,
 } from "@/lib/pricing";
 import { SavePill } from "@/components/ui/selection";
+import { UnavailablePlan } from "@/components/pricing/Unavailable";
 
 export type { PublicPlan, CycleKey };
 
@@ -162,16 +163,20 @@ export function PlanCard({ plan, cycle: wanted }: { plan: PublicPlan; cycle: Cyc
         </p>
       </div>
 
-      <Link
-        href={`/order/${plan.slug}?cycle=${cycle}`}
-        className={`mt-5 flex items-center justify-center h-11 rounded-lg font-semibold text-sm transition-[background-color,border-color,transform] duration-150 ${
-          plan.isPopular
-            ? "bg-primary text-on-primary shadow-sm shadow-primary/30 hover:bg-primary-hover active:bg-primary-active active:translate-y-px"
-            : "bg-surface border border-line-strong text-fg hover:border-fg-subtle hover:bg-surface-2 active:bg-canvas active:translate-y-px"
-        }`}
-      >
-        {isStorage ? "Get" : "Deploy"} {plan.name}
-      </Link>
+      {plan.orderable ? (
+        <Link
+          href={`/order/${plan.slug}?cycle=${cycle}`}
+          className={`mt-5 flex items-center justify-center h-11 rounded-lg font-semibold text-sm transition-[background-color,border-color,transform] duration-150 ${
+            plan.isPopular
+              ? "bg-primary text-on-primary shadow-sm shadow-primary/30 hover:bg-primary-hover active:bg-primary-active active:translate-y-px"
+              : "bg-surface border border-line-strong text-fg hover:border-fg-subtle hover:bg-surface-2 active:bg-canvas active:translate-y-px"
+          }`}
+        >
+          {isStorage ? "Get" : "Deploy"} {plan.name}
+        </Link>
+      ) : (
+        <UnavailablePlan />
+      )}
 
       {features.length > 0 && (
         <ul className="mt-6 flex flex-col gap-2.5 border-t border-line pt-5">
@@ -298,16 +303,20 @@ export function DedicatedCard({ plan, cycle: wanted }: { plan: PublicPlan; cycle
         )}
       </div>
 
-      <Link
-        href={`/order/${plan.slug}?cycle=${cycle}`}
-        className={`mt-5 flex items-center justify-center h-11 rounded-lg font-semibold text-sm transition-[background-color,border-color,transform] duration-150 ${
-          plan.isPopular
-            ? "bg-primary text-on-primary shadow-sm shadow-primary/30 hover:bg-primary-hover active:bg-primary-active active:translate-y-px"
-            : "bg-surface border border-line-strong text-fg hover:border-fg-subtle hover:bg-surface-2 active:bg-canvas active:translate-y-px"
-        }`}
-      >
-        {isStorage ? "Get" : "Deploy"} {plan.name}
-      </Link>
+      {plan.orderable ? (
+        <Link
+          href={`/order/${plan.slug}?cycle=${cycle}`}
+          className={`mt-5 flex items-center justify-center h-11 rounded-lg font-semibold text-sm transition-[background-color,border-color,transform] duration-150 ${
+            plan.isPopular
+              ? "bg-primary text-on-primary shadow-sm shadow-primary/30 hover:bg-primary-hover active:bg-primary-active active:translate-y-px"
+              : "bg-surface border border-line-strong text-fg hover:border-fg-subtle hover:bg-surface-2 active:bg-canvas active:translate-y-px"
+          }`}
+        >
+          {isStorage ? "Get" : "Deploy"} {plan.name}
+        </Link>
+      ) : (
+        <UnavailablePlan />
+      )}
 
       {features.length > 0 && (
         <ul className="mt-6 flex flex-col gap-2.5 border-t border-line pt-5">

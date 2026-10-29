@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { toPublicPlan } from "@/lib/plans";
+import { toPublicPlans } from "@/lib/plans";
 import { HOSTING_STACKS, getStackBySlug } from "@/lib/hostingStacks";
 import StackClient from "./StackClient";
 
@@ -36,7 +36,7 @@ async function getPlans(category: string) {
       where: { isActive: true, isDedicated: false, category: category as never },
       orderBy: [{ sortOrder: "asc" }],
     });
-    return plans.map(toPublicPlan);
+    return await toPublicPlans(plans);
   } catch {
     return [];
   }

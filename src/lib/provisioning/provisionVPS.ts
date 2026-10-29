@@ -54,7 +54,16 @@ const SETUP_PROGRESS: Record<SetupStep, [string, number]> = {
  * see placement.ts. If none fits, none of the above happens: the paid order
  * stays PROVISIONING (0%) and waits for capacity.
  */
-export async function provisionVPS(serviceId: string): Promise<void> {
+export type ProvisionOptions = {
+  /**
+   * false = a failed build releases what it bought and marks the service FAILED,
+   * but never refunds, cancels autopay or emails the customer — for rebuilding a
+   * service whose payment stands (scripts/billing/reprovision.ts). [true]
+   */
+  refundOnFailure?: boolean;
+};
+
+export async function provisionVPS(serviceId: string, options: ProvisionOptions = {}): Promise<void> {
   // Picks a node and claims the order on it (0% → 10%) under a lock, so a
   // duplicate call can't provision twice and two orders can't take the last slot.
   const placement = await placeOrder(serviceId, prismaPlacementDeps());
@@ -144,6 +153,8 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       where: { id: serviceId },
       data: {
         status: "ACTIVE",
+        // setupVM has just logged in as the client and run sudo: the SSH check ACTIVE requires.
+        sshVerifiedAt: new Date(),
         provisioningPct: 100,
         provisioningStep: "Server is ready!",
         sshUsername: encrypt(credentials.sshUsername),
@@ -177,7 +188,7 @@ export async function provisionVPS(serviceId: string): Promise<void> {
       })
       .catch((err) => console.error("[provisioning] notification failed:", err));
   } catch (error) {
-    await handleFailure(serviceId, error, { vmid, floatingIpId });
+    await handleFailure(serviceId, error, { vmid, floatingIpId }, options.refundOnFailure ?? true);
   }
 }
 
@@ -246,7 +257,8 @@ async function clientForService(serviceId: string): Promise<{ client: ProxmoxSer
 async function handleFailure(
   serviceId: string,
   error: unknown,
-  { vmid, floatingIpId }: { vmid: number | null; floatingIpId: number | null }
+  { vmid, floatingIpId }: { vmid: number | null; floatingIpId: number | null },
+  refundOnFailure: boolean
 ) {
   console.error(`[provisioning] service ${serviceId} failed:`, error);
 
@@ -264,6 +276,22 @@ async function handleFailure(
     },
     include: { user: true, plan: true },
   });
+
+  if (!refundOnFailure) {
+    // A rebuild of a service that's paid for: the payment and autopay stand; a person decides what's next.
+    await sendAdminAlert(
+      serviceId,
+      [
+        `REBUILD FAILED for service ${serviceId} — payment and autopay NOT touched, no refund, customer not emailed.`,
+        `Client: ${service.user.name} <${service.user.email}>`,
+        `Plan: ${service.plan.name}`,
+        `Error: ${errorMessage(error)}`,
+        cleanedUp ? "Cleanup: container and IP released" : `Cleanup FAILED — remove manually:\n  ${cleanupErrors.join("\n  ")}`,
+        `Retry: npx tsx scripts/billing/reprovision.ts --service ${serviceId}`,
+      ].join("\n")
+    );
+    return;
+  }
 
   // Stop autopay before refunding, so the customer isn't charged again for a server that doesn't exist.
   const autopayError = await cancelAutopayForService(serviceId).then(

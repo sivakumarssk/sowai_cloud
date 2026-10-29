@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { realServerWhere } from "@/lib/provisioning/serverReady";
 import { proxmox } from "@/lib/proxmox";
 import { sendBillingNoticeEmail } from "@/lib/email";
 import { alertAdmins } from "@/lib/adminAlert";
@@ -73,7 +74,8 @@ export async function suspendForNonPayment(serviceId: string, why: string): Prom
 /** Restarts a service that was suspended for non-payment. Admin suspensions are left alone. */
 export async function resumeAfterPayment(serviceId: string): Promise<boolean> {
   const claimed = await prisma.service.updateMany({
-    where: { id: serviceId, status: "SUSPENDED", suspendReason: BILLING_SUSPEND_REASON },
+    // Only a real server can become ACTIVE again (the database refuses anything else).
+    where: { id: serviceId, status: "SUSPENDED", suspendReason: BILLING_SUSPEND_REASON, ...realServerWhere },
     data: { status: "ACTIVE", suspendedAt: null, suspendReason: null },
   });
   if (claimed.count === 0) return false;

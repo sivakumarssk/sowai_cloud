@@ -1,4 +1,9 @@
 import type { NextConfig } from "next";
+import { assertRealProvisioner } from "./src/lib/provisioning/guard";
+
+// Next loads .env before this file, so `next build` / `next start` refuse a
+// live environment (APP_ENV=production or rzp_live_ key) without PROVISIONER=proxmox.
+assertRealProvisioner();
 
 const nextConfig: NextConfig = {
   reactCompiler: true,

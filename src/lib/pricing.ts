@@ -198,6 +198,8 @@ export function formatINR(paise: number): string {
 
 /** Plan data the pricing and order pages need (serialisable for client components). */
 export type PublicPlan = PricedPlan & {
+  /** False when no registered node can hold it (or it has no automated provisioning): no Buy button. */
+  orderable: boolean;
   id: string;
   slug: string;
   isPopular: boolean;

@@ -168,6 +168,9 @@ model Service {
   provisionError      String?
   /// Paid but held (status PROVISIONING, 0%) because no node accepts new clients. Cleared when provisioning starts.
   waitingForNodeSince DateTime?
+  /// When the client's SSH login was verified on the real container. ACTIVE requires it, plus proxmoxVmId,
+  /// nodeId and hetznerFloatingIpId — enforced by the CHECK constraint "Service_active_requires_real_server".
+  sshVerifiedAt       DateTime?
   startDate           DateTime      @default(now())
   /// End of the paid period; autopay renewals move it forward.
   nextBillingDate     DateTime

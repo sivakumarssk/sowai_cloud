@@ -3,7 +3,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { availableCycles, cycleKeyFromMonths, isCycleKey, quotePrice, resolveAddons, CYCLES } from "@/lib/pricing";
-import { findActivePlan, addonsForPlan, isReturningCustomer, toPublicPlan } from "@/lib/plans";
+import { findActivePlan, addonsForPlan, isReturningCustomer, toPublicPlan, availabilityChecker } from "@/lib/plans";
 import {
   DEFAULT_REGION,
   getRegion,
@@ -45,7 +45,9 @@ export async function POST(req: NextRequest) {
 
   const plan = await findActivePlan(planId);
   if (!plan) return apiError("Plan not found", 404);
-  const publicPlan = toPublicPlan(plan);
+  const availability = (await availabilityChecker())(plan);
+  if (!availability.orderable) return apiError(`${plan.name} isn't available right now`, 409);
+  const publicPlan = toPublicPlan(plan, availability);
   if (!availableCycles(publicPlan).includes(cycle)) {
     return apiError(`${plan.name} isn't available on the ${CYCLES[cycle].label} cycle`);
   }

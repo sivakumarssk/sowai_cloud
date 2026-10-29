@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { runBillingJob } from "@/lib/billing/billingJob";
-import { runProvisioningSweep } from "@/lib/queue/provisioningSweep";
+import { runPaidWithoutContainerCheck, runProvisioningSweep } from "@/lib/queue/provisioningSweep";
 
 /**
  * Billing sweep + held/unstarted paid orders — call every 15 minutes from cron on the app server:
@@ -22,5 +22,9 @@ export async function POST(req: Request) {
     console.error("[cron/billing] provisioning sweep failed:", err);
     return { error: err instanceof Error ? err.message : String(err) };
   });
-  return Response.json({ ...summary, provisioning });
+  const paidWithoutServer = await runPaidWithoutContainerCheck().catch((err) => {
+    console.error("[cron/billing] paid-without-container check failed:", err);
+    return { error: err instanceof Error ? err.message : String(err) };
+  });
+  return Response.json({ ...summary, provisioning, paidWithoutServer });
 }

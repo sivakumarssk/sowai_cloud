@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { alertAdmins } from "@/lib/adminAlert";
 import { prismaEngineLog } from "@/engine/data/engineLog";
 import { resumeWaitingOrders } from "@/lib/provisioning/placement";
+import { alertPaidWithoutContainer } from "@/lib/provisioning/paidWithoutContainer";
 import { nodeLoads, placementConfig, planNeed } from "@/lib/provisioning/placementDeps";
 import { provisioningQueue } from "./provisioningQueue";
 
@@ -44,6 +45,45 @@ export async function runProvisioningSweep(now = new Date()) {
         return row?.createdAt ?? null;
       },
       recordReminder: (count) => prismaEngineLog({ action: "PROVISION_WAITING_REMINDER", after: { waitingOrders: count }, trigger: "SCHEDULED" }),
+    },
+    now
+  );
+}
+
+/**
+ * Paid orders with no container 10 minutes after payment — alerted once each.
+ * Runs whatever PROVISIONER says: a simulated or held order is exactly what it must catch.
+ */
+export async function runPaidWithoutContainerCheck(now = new Date()) {
+  return alertPaidWithoutContainer(
+    {
+      async candidates(paidBefore) {
+        const rows = await prisma.service.findMany({
+          where: {
+            proxmoxVmId: null,
+            status: { notIn: ["CANCELLED", "DELETED", "FAILED"] },
+            createdAt: { lt: paidBefore },
+            payments: { some: { status: "SUCCESS" } },
+          },
+          include: { plan: { select: { name: true } }, user: { select: { name: true, email: true } } },
+          orderBy: { createdAt: "asc" },
+        });
+        return rows.map((s) => ({
+          serviceId: s.id,
+          planName: s.plan.name,
+          customer: `${s.user.name} <${s.user.email}>`,
+          status: s.status,
+          provisioningStep: s.provisioningStep,
+          paidAt: s.createdAt,
+        }));
+      },
+      async alreadyAlerted(serviceIds) {
+        const rows = await prisma.engineLog.findMany({ where: { action: "PAID_NO_CONTAINER", serviceId: { in: serviceIds } }, select: { serviceId: true } });
+        return new Set(rows.map((r) => r.serviceId!));
+      },
+      alertAdmin: alertAdmins,
+      record: (o) =>
+        prismaEngineLog({ action: "PAID_NO_CONTAINER", serviceId: o.serviceId, after: { status: o.status, step: o.provisioningStep, paidAt: o.paidAt }, trigger: "SCHEDULED", success: false }),
     },
     now
   );

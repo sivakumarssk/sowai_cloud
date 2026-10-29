@@ -1,6 +1,8 @@
 import type { Addon, Plan } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { addonIncludedInPlan, type PricedAddon, type PublicPlan } from "@/lib/pricing";
+import { planAvailability, type Availability } from "@/lib/provisioning/availability";
+import { placementConfig } from "@/lib/provisioning/placementDeps";
 
 /** Feature bullets; older plans stored an object of label → text. */
 export function planFeatures(plan: Pick<Plan, "features">): string[] {
@@ -10,8 +12,22 @@ export function planFeatures(plan: Pick<Plan, "features">): string[] {
   return [];
 }
 
-export function toPublicPlan(plan: Plan): PublicPlan {
+/** Checks plans against the registered nodes (one query for any number of plans). */
+export async function availabilityChecker(): Promise<(plan: Plan) => Availability> {
+  const nodes = await prisma.proxmoxNode.findMany({ select: { name: true, status: true, physicalRamMB: true, physicalDiskGB: true } });
+  const config = placementConfig();
+  return (plan) => planAvailability(plan, nodes, config);
+}
+
+/** Public plans with Buy enabled only where the plan can really be built. */
+export async function toPublicPlans(plans: Plan[]): Promise<PublicPlan[]> {
+  const check = await availabilityChecker();
+  return plans.map((p) => toPublicPlan(p, check(p)));
+}
+
+export function toPublicPlan(plan: Plan, availability: Availability): PublicPlan {
   return {
+    orderable: availability.orderable,
     id: plan.id,
     slug: plan.slug ?? plan.id,
     name: plan.name,

@@ -2,6 +2,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { withDecryptedCredentials } from "@/lib/crypto";
+import { forCustomer } from "@/lib/provisioning/serverReady";
 
 export async function GET() {
   const session = await getSession();
@@ -41,5 +42,6 @@ export async function GET() {
     orderBy: { createdAt: "desc" },
   });
 
-  return apiSuccess(services.map(withDecryptedCredentials));
+  // IP and credentials only for real servers; anything else shows as "Setting up".
+  return apiSuccess(services.map((s) => forCustomer(withDecryptedCredentials(s))));
 }

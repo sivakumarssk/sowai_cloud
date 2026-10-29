@@ -3,6 +3,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { createSubscription, razorpayErrorMessage } from "@/lib/billing/subscriptions";
+import { availabilityChecker } from "@/lib/plans";
 import { type PriceQuote, addMonths, gstOn, processingFeeOn, CYCLES, cycleKeyFromMonths } from "@/lib/pricing";
 
 /**
@@ -28,6 +29,8 @@ export async function POST(req: NextRequest) {
     return apiError("Order not found", 404);
   }
   if (order.status === "PAID") return apiError("This order has already been paid for");
+  // An order made before the plan became unbuildable must not be paid for either.
+  if (!(await availabilityChecker())(order.plan).orderable) return apiError(`${order.plan.name} isn't available right now`, 409);
 
   const firstTermTotal = order.amount + order.gstAmount + order.processingFee;
   const prepaid = order.billingCycle > 1;

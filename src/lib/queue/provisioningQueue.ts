@@ -1,9 +1,8 @@
 import { prisma } from "@/lib/prisma";
-import { SimulatedProvider } from "@/lib/provisioning/SimulatedProvider";
-import type { ProvisioningProvider } from "@/lib/provisioning/ProvisioningProvider";
-import { sendCredentialsEmail } from "@/lib/email";
-import { encrypt } from "@/lib/crypto";
+import { alertAdmins } from "@/lib/adminAlert";
+import { prismaEngineLog } from "@/engine/data/engineLog";
 import { provisionVPS } from "@/lib/provisioning/provisionVPS";
+import { isLiveEnvironment, usesRealProvisioner } from "@/lib/provisioning/guard";
 
 export type ProvisionJobData = {
   serviceId: string;
@@ -17,7 +16,13 @@ export interface ProvisioningQueue {
   add(data: ProvisionJobData): Promise<void>;
 }
 
-const provider: ProvisioningProvider = new SimulatedProvider();
+/** Where a paid order goes. Nothing here ever invents an IP, credentials or an ACTIVE status. */
+export function provisioningRoute(category: string, env: Record<string, string | undefined> = process.env): "PROXMOX" | "HOLD" | "SIMULATE" {
+  if (category === "VPS" && usesRealProvisioner(env)) return "PROXMOX";
+  // Live payments are never "fulfilled" by the simulator: the order waits for a person.
+  if (isLiveEnvironment(env)) return "HOLD";
+  return "SIMULATE";
+}
 
 async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void> {
   const service = await prisma.service.findUnique({
@@ -26,65 +31,38 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
   });
   if (!service) return;
 
-  // Real Proxmox provisioning for VPS plans once PROVISIONER=proxmox is set;
-  // every other plan (and VPS until then) still goes through the simulator.
-  if (process.env.PROVISIONER === "proxmox" && service.plan.category === "VPS") {
-    await provisionVPS(serviceId);
+  const route = provisioningRoute(service.plan.category);
+  if (route === "PROXMOX") return provisionVPS(serviceId);
+
+  if (route === "HOLD") {
+    // Paid, no automated provisioner for it: stays PROVISIONING (not failed, not refunded).
+    const { count } = await prisma.service.updateMany({
+      where: { id: serviceId, status: "PROVISIONING", provisioningPct: 0 },
+      data: { provisioningStep: "Queued — our team is preparing your server" },
+    });
+    if (count === 0) return;
+    const reason =
+      service.plan.category === "VPS"
+        ? `PROVISIONER is "${process.env.PROVISIONER ?? ""}", not "proxmox"`
+        : `there is no automated provisioning for ${service.plan.category} plans`;
+    await prismaEngineLog({ action: "PROVISION_HELD_NO_PROVISIONER", serviceId, after: { reason, plan: service.plan.name }, trigger: "AUTO_ENGINE" });
+    await alertAdmins(
+      `Paid order can't be built automatically: ${service.plan.name}`,
+      [
+        `Service ${serviceId} (${service.plan.name}) for ${service.user.name} <${service.user.email}> is paid, but ${reason}.`,
+        "It stays PROVISIONING — not failed, not refunded, nothing fake shown to the customer.",
+        service.plan.category === "VPS" ? "Fix PROVISIONER, then: npx tsx scripts/billing/reprovision.ts --service " + serviceId : "Set it up by hand.",
+      ].join("\n")
+    );
     return;
   }
 
-  try {
-    await prisma.service.update({
-      where: { id: serviceId },
-      data: { status: "PROVISIONING" },
-    });
-
-    const result = await provider.provision({
-      serviceId: service.id,
-      hostname: service.hostname || `${service.plan.category.toLowerCase()}-${service.id.slice(0, 8)}`,
-      region: service.region,
-      osImage: service.osImage || "ubuntu-22.04",
-      stackPreset: service.stackPreset || "plain",
-      planName: service.plan.name,
-    });
-
-    await prisma.service.update({
-      where: { id: serviceId },
-      data: {
-        status: "ACTIVE",
-        serverIp: result.serverIp,
-        sshUsername: encrypt(result.sshUsername),
-        sshPassword: encrypt(result.sshPassword),
-        panelUrl: result.panelUrl,
-      },
-    });
-
-    await prisma.notification.create({
-      data: {
-        userId: service.userId,
-        title: "Server is ready",
-        message: `Your ${service.plan.name} server is now active. Login credentials have been emailed to you.`,
-      },
-    });
-
-    await sendCredentialsEmail(service.user.email, service.user.name, {
-      planName: service.plan.name,
-      hostname: service.hostname || result.serverIp,
-      serverIp: result.serverIp,
-      sshUsername: result.sshUsername,
-      sshPassword: result.sshPassword,
-      panelUrl: result.panelUrl,
-    }).catch(console.error);
-  } catch (err) {
-    console.error("[provisioning-job]", err);
-    await prisma.service.update({
-      where: { id: serviceId },
-      data: {
-        status: "FAILED",
-        provisionError: err instanceof Error ? err.message : "Unknown provisioning error",
-      },
-    });
-  }
+  // Development only: shows the flow without pretending a server exists.
+  await new Promise((r) => setTimeout(r, 4000));
+  await prisma.service.updateMany({
+    where: { id: serviceId, status: "PROVISIONING" },
+    data: { status: "INSTALLING", provisioningPct: 100, provisioningStep: "Simulated (development) — no real server was created" },
+  });
 }
 
 /**
@@ -95,7 +73,7 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
 class InProcessQueue implements ProvisioningQueue {
   async add(data: ProvisionJobData): Promise<void> {
     // Fire and forget — the HTTP request that enqueued this doesn't wait on it.
-    void runProvisioningJob(data);
+    void runProvisioningJob(data).catch((err) => console.error("[provisioning-job]", data.serviceId, err));
   }
 }
 

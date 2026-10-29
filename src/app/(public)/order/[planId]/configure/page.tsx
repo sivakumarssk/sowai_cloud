@@ -1,6 +1,6 @@
 import { notFound, redirect } from "next/navigation";
 import { getSession } from "@/lib/auth";
-import { findActivePlan, addonsForPlan, isReturningCustomer, toPublicPlan } from "@/lib/plans";
+import { findActivePlan, addonsForPlan, isReturningCustomer, toPublicPlan, availabilityChecker } from "@/lib/plans";
 import { availableCycles, isCycleKey, resolveAddons } from "@/lib/pricing";
 import { DEFAULT_OS, getOsImage, getPresetsForCategory } from "@/lib/provisioning/catalog";
 import ConfigureClient from "./ConfigureClient";
@@ -25,7 +25,10 @@ export default async function ConfigurePage({
   const plan = await findActivePlan(planId);
   if (!plan) notFound();
 
-  const publicPlan = toPublicPlan(plan);
+  // Not sold when it can't be built for real (no node can hold it).
+  const availability = (await availabilityChecker())(plan);
+  if (!availability.orderable) notFound();
+  const publicPlan = toPublicPlan(plan, availability);
   const cycles = availableCycles(publicPlan);
   if (cycles.length === 0) notFound();
 

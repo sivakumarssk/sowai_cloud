@@ -36,6 +36,8 @@ interface Service {
   sshUsername: string | null;
   sshPassword: string | null;
   panelUrl: string | null;
+  /** A real server (container, node, Floating IP, SSH check): only then are IP and credentials sent. */
+  ready: boolean;
   provisioningStep: string | null;
   provisioningPct: number;
   nextBillingDate: string;
@@ -315,6 +317,8 @@ function ServerRow({ service, onChanged }: { service: Service; onChanged: () => 
                 <div className="h-full bg-link rounded-full transition-[width] duration-500" style={{ width: `${service.provisioningPct}%` }} />
               </div>
             </div>
+          ) : !service.ready && service.status === "SUSPENDED" ? (
+            <span className="text-sm text-fg-muted">Setting up</span>
           ) : service.serverIp ? (
             <div className="flex items-center gap-1">
               <span className="text-xs text-fg-muted md:hidden mr-1">IPv4</span>
@@ -348,7 +352,7 @@ function ServerRow({ service, onChanged }: { service: Service; onChanged: () => 
               <Button variant="secondary" size="sm">Contact support</Button>
             </Link>
           )}
-          {service.panelUrl && service.status === "ACTIVE" && (
+          {service.panelUrl && service.ready && service.status === "ACTIVE" && (
             <a href={service.panelUrl} target="_blank" rel="noopener noreferrer">
               <Button variant="secondary" size="sm">
                 Open panel

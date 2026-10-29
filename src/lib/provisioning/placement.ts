@@ -88,7 +88,8 @@ export function chooseNode(nodes: NodeLoad[], need: Need, config: PlacementConfi
   return best ? { node: best.node, reasons } : { node: null, reasons };
 }
 
-function fitsWhenEmpty(node: NodeLoad, need: Need, config: PlacementConfig): boolean {
+/** Whether a node could hold this plan at all, even with nothing else on it. */
+export function fitsWhenEmpty(node: Pick<NodeLoad, "physicalRamMB" | "physicalDiskGB">, need: Need, config: PlacementConfig): boolean {
   return Math.floor(node.physicalRamMB * config.ramOvercommit) >= need.ramMB && node.physicalDiskGB - config.diskPoolReserveGB >= need.diskGB;
 }
 

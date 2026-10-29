@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import Navbar from "@/components/landing/Navbar";
 import { type CycleKey, type PublicPlan, CyclePicker, PlanGrid, DedicatedGrid } from "@/components/pricing/PlanCards";
+import { UnavailablePlan } from "@/components/pricing/Unavailable";
 import {
   CHARGES_PERCENT,
   PROCESSING_FEE_PERCENT,
@@ -193,13 +194,17 @@ function CompareTable({ plans, cycle }: { plans: PublicPlan[]; cycle: CycleKey }
             <td className="px-5 py-3" />
             {plans.map((p) => (
               <td key={p.id} className="px-5 py-3">
-                <Link
-                  href={`/order/${p.slug}?cycle=${availableCycles(p).includes(cycle) ? cycle : availableCycles(p).at(-1)}`}
-                  className="text-link font-medium hover:underline"
-                >
-                  Deploy {p.name}
-                  <span aria-hidden> →</span>
-                </Link>
+                {p.orderable ? (
+                  <Link
+                    href={`/order/${p.slug}?cycle=${availableCycles(p).includes(cycle) ? cycle : availableCycles(p).at(-1)}`}
+                    className="text-link font-medium hover:underline"
+                  >
+                    Deploy {p.name}
+                    <span aria-hidden> →</span>
+                  </Link>
+                ) : (
+                  <UnavailablePlan compact />
+                )}
               </td>
             ))}
           </tr>
