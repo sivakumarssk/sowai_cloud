@@ -7,9 +7,11 @@
  * so the nodes' measured RAM/disk and current allocations are fresh.
  */
 import { config as loadEnv } from "dotenv";
+import { exitUnlessEnvironment } from "../lib/env";
 
 loadEnv({ path: ".env", quiet: true });
 loadEnv({ path: ".env.local", quiet: true });
+exitUnlessEnvironment();
 
 (async () => {
   const { nodeLoads, placementConfig, planNeed } = await import("../../src/lib/provisioning/placementDeps");

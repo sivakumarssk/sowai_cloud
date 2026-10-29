@@ -54,6 +54,7 @@ export async function runBillingJob(now = new Date()): Promise<BillingJobSummary
     where: {
       status: "SUSPENDED",
       suspendReason: BILLING_SUSPEND_REASON,
+      billingHold: false,
       suspendedAt: { lt: new Date(now.getTime() - DELETE_AFTER_SUSPENDED_DAYS * DAY_MS) },
     },
     include: { user: true, plan: true },

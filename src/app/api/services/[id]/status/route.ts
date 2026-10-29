@@ -22,13 +22,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       nodeId: true,
       hetznerFloatingIpId: true,
       sshVerifiedAt: true,
+      serverSource: true,
     },
   });
   if (!service || (service.userId !== session.userId && session.role !== "ADMIN")) {
     return apiError("Service not found", 404);
   }
 
-  // Only a real server (container, node, Floating IP, SSH check) is shown as running with its IPs.
+  // Only a real server (SSH check passed, plus container/node/Floating IP or a manual IP) is shown as running with its IPs.
   const active = isRealServer(service) && service.status === "ACTIVE";
   return apiSuccess({
     status: service.status === "ACTIVE" && !active ? "INSTALLING" : service.status,

@@ -9,6 +9,7 @@ function simulated(over: Partial<ReprovisionSnapshot> = {}): ReprovisionSnapshot
   return {
     id: "svc_live",
     status: "INSTALLING", // moved off ACTIVE by the migration
+    serverSource: "PROXMOX",
     provisioningPct: 0,
     provisioningStep: "Setting up — your server is being prepared",
     updatedAt: new Date("2026-10-29T08:00:00Z"),
@@ -115,6 +116,7 @@ test("refuses refunded, unpaid, non-VPS, cancelled, mid-build or unplaceable ser
     [{ snap: simulated({ status: "INSTALLING", provisioningPct: 60, updatedAt: new Date(now.getTime() - 5 * 60_000) }) }, /build looks like it's running/],
     [{ node: null }, /no node can hold it now.*nothing would be built/],
     [{ snap: null }, /not found/],
+    [{ snap: simulated({ serverSource: "MANUAL" }) }, /manual server/],
   ];
   for (const [opts, why] of cases) {
     const f = fakes(opts);

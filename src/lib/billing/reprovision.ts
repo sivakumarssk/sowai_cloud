@@ -8,6 +8,8 @@
 export type ReprovisionSnapshot = {
   id: string;
   status: string;
+  /** PROXMOX or MANUAL — a manual server is never rebuilt here. */
+  serverSource: string;
   provisioningPct: number;
   provisioningStep: string | null;
   updatedAt: Date;
@@ -85,6 +87,7 @@ export async function planReprovision(serviceId: string, deps: ReprovisionDeps, 
   if (!s) return { ok: false, refusals: [`service ${serviceId} not found`] };
 
   const refusals: string[] = [];
+  if (s.serverSource === "MANUAL") refusals.push("it is a manual server (assigned by an admin) — change it in Admin → Servers → Assign server, not here");
   if (s.plan.category !== "VPS") refusals.push(`${s.plan.name} is a ${s.plan.category} plan — only VPS plans can be built automatically`);
   if (!REBUILDABLE.has(s.status)) refusals.push(`status is ${s.status} — only ACTIVE, INSTALLING, PROVISIONING or FAILED services are rebuilt`);
   if (!s.paymentStatuses.includes("SUCCESS")) {

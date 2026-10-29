@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyRazorpayWebhookSignature } from "@/lib/razorpay";
 import { fulfillPayment } from "@/lib/fulfillPayment";
 import { handleSubscriptionEvent, SUBSCRIPTION_EVENTS } from "@/lib/billing/webhookEvents";
+import { reportUnknown, unknownCheckout } from "@/lib/billing/unknownWebhookDeps";
 import type { Subscriptions } from "razorpay/dist/types/subscriptions";
 
 interface RazorpayWebhookPayload {
@@ -15,6 +16,7 @@ interface RazorpayWebhookPayload {
         status: string;
         /** Set when the payment belongs to a subscription invoice. */
         invoice_id?: string | null;
+        email?: string | null;
       };
     };
     subscription?: { entity: Subscriptions.RazorpaySubscription };
@@ -45,7 +47,21 @@ export async function POST(req: NextRequest) {
       // those are handled by subscription.charged instead.
       if (paymentEntity && !paymentEntity.invoice_id) {
         const result = await fulfillPayment(paymentEntity.order_id, paymentEntity.id);
-        if (!result) console.error("[razorpay-webhook] payment or order not found for", paymentEntity.order_id);
+        const unknown = result ? null : await unknownCheckout(paymentEntity.order_id);
+        if (unknown) {
+          // Not ours (or not ours yet): logged and emailed, and still answered 200 below.
+          console.error(`[razorpay-webhook] payment.captured for unknown ${unknown}`, paymentEntity.order_id, paymentEntity.id);
+          await reportUnknown({
+            event: body.event,
+            kind: unknown,
+            ids: { paymentId: paymentEntity.id, orderId: paymentEntity.order_id },
+            amountPaise: paymentEntity.amount,
+            status: paymentEntity.status,
+            email: paymentEntity.email,
+          });
+        } else if (!result) {
+          console.error("[razorpay-webhook] nothing to fulfil for", paymentEntity.order_id);
+        }
       }
     }
   } catch (err) {

@@ -56,6 +56,14 @@ enum SubscriptionStatus {
   EXPIRED
 }
 
+/// Who builds and runs the server behind a service.
+enum ServerSource {
+  /// A Proxmox container built by provisionVPS.
+  PROXMOX
+  /// A server an admin set up and assigned by hand (Admin → Servers → Assign server).
+  MANUAL
+}
+
 enum OrderStatus {
   DRAFT
   AWAITING_PAYMENT
@@ -168,9 +176,15 @@ model Service {
   provisionError      String?
   /// Paid but held (status PROVISIONING, 0%) because no node accepts new clients. Cleared when provisioning starts.
   waitingForNodeSince DateTime?
-  /// When the client's SSH login was verified on the real container. ACTIVE requires it, plus proxmoxVmId,
-  /// nodeId and hetznerFloatingIpId — enforced by the CHECK constraint "Service_active_requires_real_server".
+  /// When the client's SSH login was verified on the real server. ACTIVE requires it, plus (PROXMOX)
+  /// proxmoxVmId, nodeId and hetznerFloatingIpId, or (MANUAL) serverIp — enforced by the CHECK
+  /// constraint "Service_active_requires_real_server".
   sshVerifiedAt       DateTime?
+  serverSource        ServerSource  @default(PROXMOX)
+  /// Automatic billing actions are off: the billing job and the halted-autopay webhook never suspend
+  /// or delete it. Set on clients imported from another database until an admin has checked their
+  /// billing; payments and autopay renewals are still recorded as usual.
+  billingHold         Boolean       @default(false)
   startDate           DateTime      @default(now())
   /// End of the paid period; autopay renewals move it forward.
   nextBillingDate     DateTime
@@ -473,7 +487,7 @@ model EngineLog {
   after     Json?
   /// In paise.
   cost      Int?
-  /// AUTO_ENGINE | MANUAL | SCHEDULED
+  /// AUTO_ENGINE | MANUAL | SCHEDULED | WEBHOOK
   trigger   String
   /// True when the engine only logged what it would have done (dry-run mode).
   dryRun    Boolean  @default(false)

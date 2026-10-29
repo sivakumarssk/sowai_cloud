@@ -10,9 +10,11 @@
  * --execute nothing is changed or logged.
  */
 import { config as loadEnv } from "dotenv";
+import { exitUnlessEnvironment } from "../lib/env";
 
 loadEnv({ path: ".env", quiet: true });
 loadEnv({ path: ".env.local", quiet: true });
+exitUnlessEnvironment();
 
 const argv = process.argv.slice(2);
 const flag = (name: string) => argv.includes(name);

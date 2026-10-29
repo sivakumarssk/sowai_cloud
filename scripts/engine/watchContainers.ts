@@ -9,9 +9,11 @@
  * Read-only: the monitor never changes containers.
  */
 import { config as loadEnv } from "dotenv";
+import { exitUnlessEnvironment } from "../lib/env";
 
 loadEnv({ path: ".env", quiet: true });
 loadEnv({ path: ".env.local", quiet: true });
+exitUnlessEnvironment();
 
 const args = new Set(process.argv.slice(2));
 const live = args.has("--live");

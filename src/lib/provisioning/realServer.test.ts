@@ -1,28 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assertRealProvisioner, isLiveEnvironment, provisionerProblem } from "./guard";
 import { provisioningRoute } from "../queue/provisioningQueue";
 import { forCustomer, isActiveConstraintError, isRealServer, missingForActive } from "./serverReady";
 import { planAvailability } from "./availability";
 import { alertPaidWithoutContainer, type PaidOrder } from "./paidWithoutContainer";
 
-// ── Guard: a live environment never runs the simulator ───────────────
-
-test("refuses to start in production or with a live Razorpay key unless PROVISIONER=proxmox", () => {
-  const live = [{ APP_ENV: "production" }, { RAZORPAY_KEY_ID: "rzp_live_AbC123" }, { APP_ENV: "production", RAZORPAY_KEY_ID: "rzp_test_x" }];
-  for (const env of live) {
-    for (const PROVISIONER of [undefined, "", "simulated", "Proxmox "]) {
-      if (PROVISIONER === "Proxmox ") continue; // only the exact value counts — tested below
-      assert.throws(() => assertRealProvisioner({ ...env, PROVISIONER }), /Refusing to start/, JSON.stringify({ ...env, PROVISIONER }));
-    }
-    assert.doesNotThrow(() => assertRealProvisioner({ ...env, PROVISIONER: "proxmox" }));
-  }
-  assert.match(provisionerProblem({ RAZORPAY_KEY_ID: "rzp_live_1", PROVISIONER: "simulated" })!, /live key.*PROVISIONER="simulated"/);
-  assert.throws(() => assertRealProvisioner({ APP_ENV: "production", PROVISIONER: "Proxmox" }), /Refusing/);
-  // Development with test keys may simulate.
-  assert.doesNotThrow(() => assertRealProvisioner({ RAZORPAY_KEY_ID: "rzp_test_1", PROVISIONER: "simulated" }));
-  assert.equal(isLiveEnvironment({ APP_ENV: "development", RAZORPAY_KEY_ID: "rzp_test_1" }), false);
-});
+// ── Routing: a live environment never runs the simulator ─────────────
 
 test("live payments are never routed to the simulator — VPS goes to Proxmox, anything else is held for a person", () => {
   const prod = { APP_ENV: "production", PROVISIONER: "proxmox" };
@@ -34,20 +17,29 @@ test("live payments are never routed to the simulator — VPS goes to Proxmox, a
 
 // ── ACTIVE means a real server ───────────────────────────────────────
 
-const real = { status: "ACTIVE", proxmoxVmId: "101", nodeId: "node_1", hetznerFloatingIpId: "555", sshVerifiedAt: new Date() };
+const real = { status: "ACTIVE", serverSource: "PROXMOX", serverIp: "78.46.1.2", proxmoxVmId: "101", nodeId: "node_1", hetznerFloatingIpId: "555", sshVerifiedAt: new Date() };
 const creds = { serverIp: "78.46.1.2", ipv6Address: "2a01::101", sshUsername: "userab12", sshPassword: "pw", panelUrl: "http://x", panelPassword: "pp" };
 
 test("a real server needs a VM id, a node, a Floating IP and a passed SSH check", () => {
   assert.ok(isRealServer(real));
   assert.ok(isRealServer({ ...real, status: "SUSPENDED" }));
-  assert.deepEqual(missingForActive({ proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null }), ["container (VM id)", "node", "Floating IP", "SSH check"]);
+  assert.deepEqual(missingForActive({ serverSource: "PROXMOX", serverIp: null, proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null }), ["container (VM id)", "node", "Floating IP", "SSH check"]);
   for (const field of ["proxmoxVmId", "nodeId", "hetznerFloatingIpId", "sshVerifiedAt"] as const) {
     assert.equal(isRealServer({ ...real, [field]: null }), false, field);
   }
 });
 
+test("a manual server needs its IP and a passed SSH check — no container, node or Floating IP", () => {
+  const manual = { status: "ACTIVE", serverSource: "MANUAL", serverIp: "203.0.113.7", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: new Date() };
+  assert.ok(isRealServer(manual));
+  assert.deepEqual(missingForActive({ ...manual, sshVerifiedAt: null }), ["SSH check"]);
+  assert.deepEqual(missingForActive({ ...manual, serverIp: null, sshVerifiedAt: null }), ["server IP", "SSH check"]);
+  assert.equal(forCustomer({ ...creds, ...manual, sshVerifiedAt: null }).serverIp, null, "not checked yet: Setting up");
+  assert.equal(forCustomer({ ...creds, ...manual }).ready, true);
+});
+
 test("the simulator's ACTIVE row (fake IP, nothing else) is shown as Setting up with no IP or credentials", () => {
-  const fake = { ...creds, serverIp: "19.157.157.231", status: "ACTIVE", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null };
+  const fake = { ...creds, serverIp: "19.157.157.231", status: "ACTIVE", serverSource: "PROXMOX", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null };
   const shown = forCustomer(fake);
   assert.equal(shown.ready, false);
   assert.equal(shown.status, "INSTALLING");

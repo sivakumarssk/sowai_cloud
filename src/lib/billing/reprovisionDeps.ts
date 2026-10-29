@@ -29,6 +29,7 @@ export function prismaReprovisionDeps(): ReprovisionDeps {
       return {
         id: s.id,
         status: s.status,
+        serverSource: s.serverSource,
         provisioningPct: s.provisioningPct,
         provisioningStep: s.provisioningStep,
         updatedAt: s.updatedAt,

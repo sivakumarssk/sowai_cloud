@@ -21,7 +21,7 @@ export type EngineLogEntry = {
   after?: unknown;
   /** Monthly cost attributed to this action, in paise. */
   cost?: number;
-  trigger: "AUTO_ENGINE" | "MANUAL" | "SCHEDULED";
+  trigger: "AUTO_ENGINE" | "MANUAL" | "SCHEDULED" | "WEBHOOK";
   /** Planned/logged only — nothing was changed. */
   dryRun?: boolean;
   success?: boolean;

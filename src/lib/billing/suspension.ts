@@ -23,8 +23,9 @@ export function deletionDate(suspendedAt: Date): Date {
 export async function suspendForNonPayment(serviceId: string, why: string): Promise<boolean> {
   const suspendedAt = new Date();
   // Claim atomically so the webhook and the billing job can't both suspend.
+  // A service on billing hold is never suspended automatically.
   const claimed = await prisma.service.updateMany({
-    where: { id: serviceId, status: "ACTIVE" },
+    where: { id: serviceId, status: "ACTIVE", billingHold: false },
     data: { status: "SUSPENDED", suspendedAt, suspendReason: BILLING_SUSPEND_REASON },
   });
   if (claimed.count === 0) return false;

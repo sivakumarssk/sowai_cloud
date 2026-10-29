@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { runBillingJob } from "@/lib/billing/billingJob";
+import { productionOnlyProblem } from "@/lib/environment";
 import { runPaidWithoutContainerCheck, runProvisioningSweep } from "@/lib/queue/provisioningSweep";
 
 /**
@@ -14,6 +15,13 @@ export async function POST(req: Request) {
   const expected = Buffer.from(`Bearer ${secret}`);
   if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Suspensions, deletions and provisioning act on real customers: production only.
+  const notProduction = productionOnlyProblem("the billing cron");
+  if (notProduction) {
+    console.error("[cron/billing]", notProduction);
+    return Response.json({ error: notProduction }, { status: 503 });
   }
 
   const summary = await runBillingJob();

@@ -12,6 +12,7 @@ import {
   type RzpSubscription,
 } from "./subscriptions";
 import { suspendForNonPayment, resumeAfterPayment } from "./suspension";
+import { reportUnknown } from "./unknownWebhookDeps";
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://sowsicloud.com";
 const formatDate = (d: Date) => d.toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" });
@@ -45,7 +46,16 @@ export async function handleSubscriptionEvent(event: string, payload: Payload): 
 
   const before = await prisma.subscription.findUnique({ where: { razorpaySubscriptionId: entity.id } });
   if (!before) {
-    console.warn(`[webhook] ${event} for unknown subscription ${entity.id} — ignored`);
+    console.warn(`[webhook] ${event} for unknown subscription ${entity.id} — logged, admin alerted, nothing changed`);
+    const payment = payload.payment?.entity as (PaymentEntity & { order_id?: string; invoice_id?: string | null; email?: string }) | undefined;
+    await reportUnknown({
+      event,
+      kind: "subscription",
+      ids: { subscriptionId: entity.id, paymentId: payment?.id, orderId: payment?.order_id, invoiceId: payment?.invoice_id, customerId: entity.customer_id, planId: entity.plan_id },
+      amountPaise: payment?.amount,
+      status: entity.status,
+      email: payment?.email,
+    });
     return;
   }
 
@@ -86,7 +96,8 @@ export async function handleSubscriptionEvent(event: string, payload: Payload): 
 
     case "subscription.halted":
       if (isCurrent && sub.serviceId) {
-        await suspendForNonPayment(sub.serviceId, "your autopay payment failed after several retries");
+        const suspended = await suspendForNonPayment(sub.serviceId, "your autopay payment failed after several retries");
+        if (!suspended) await alertIfHeld(sub, "autopay halted after failed retries");
       }
       break;
 
@@ -182,6 +193,17 @@ async function recordRenewal(sub: Subscription, payment: PaymentEntity) {
       },
     })
     .catch(console.error);
+}
+
+/** A service on billing hold is never suspended automatically — tell an admin instead. */
+async function alertIfHeld(sub: Subscription, what: string) {
+  const service = await prisma.service.findUnique({ where: { id: sub.serviceId! }, include: { user: true, plan: true } });
+  if (!service?.billingHold) return;
+  await alertAdmins(
+    `Billing hold: ${what} for ${service.user.email}`,
+    `Razorpay subscription ${sub.razorpaySubscriptionId} (${what}) for service ${service.id} (${service.plan.name}, ${service.user.name} <${service.user.email}>).\n` +
+      "The service is on billing hold, so it was NOT suspended. Check it in the Razorpay dashboard and decide by hand."
+  );
 }
 
 async function notifyRetrying(sub: Subscription) {

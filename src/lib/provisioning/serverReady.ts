@@ -1,14 +1,17 @@
 // The one rule for "this service is a real, working server".
 //
-// ACTIVE requires a Proxmox container (vmid), the node it runs on, its
-// Floating IP, and a passed SSH login check. The database enforces it with
-// the CHECK constraint "Service_active_requires_real_server" (migration
-// 20261030090000_active_requires_real_server); this file mirrors it for reads.
+// ACTIVE requires a passed SSH login check plus, for a Proxmox server, the
+// container (vmid), the node it runs on and its Floating IP — or, for a manual
+// server an admin assigned, its IP. The database enforces it with the CHECK
+// constraint "Service_active_requires_real_server" (migration
+// 20261030120000_manual_servers_billing_hold); this file mirrors it for reads.
 
 export const ACTIVE_CONSTRAINT = "Service_active_requires_real_server";
 
 export type RealServerFields = {
   status: string;
+  serverSource: string;
+  serverIp: string | null;
   proxmoxVmId: string | null;
   nodeId: string | null;
   hetznerFloatingIpId: string | null;
@@ -17,6 +20,7 @@ export type RealServerFields = {
 
 /** What a service still lacks to be a real server (empty = it is one). */
 export function missingForActive(s: Omit<RealServerFields, "status">): string[] {
+  if (s.serverSource === "MANUAL") return [!s.serverIp && "server IP", !s.sshVerifiedAt && "SSH check"].filter((x): x is string => Boolean(x));
   return [
     !s.proxmoxVmId && "container (VM id)",
     !s.nodeId && "node",
@@ -32,11 +36,11 @@ export function isRealServer(s: RealServerFields): boolean {
 
 /** Prisma filter for services that may be (re)activated. */
 export const realServerWhere = {
-  proxmoxVmId: { not: null },
-  nodeId: { not: null },
-  hetznerFloatingIpId: { not: null },
-  sshVerifiedAt: { not: null },
-} as const;
+  OR: [
+    { serverSource: "PROXMOX" as const, proxmoxVmId: { not: null }, nodeId: { not: null }, hetznerFloatingIpId: { not: null }, sshVerifiedAt: { not: null } },
+    { serverSource: "MANUAL" as const, serverIp: { not: null }, sshVerifiedAt: { not: null } },
+  ],
+};
 
 type Credentials = {
   serverIp: string | null;

@@ -1,13 +1,17 @@
 "use client";
 
 import { useState, useEffect, useTransition } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { showToast } from "@/components/ui/Toast";
 
 interface ServiceRecord {
   id: string;
-  status: "ACTIVE" | "SUSPENDED" | "CANCELLED" | "DELETED";
+  status: "PENDING" | "PROVISIONING" | "INSTALLING" | "ACTIVE" | "SUSPENDED" | "CANCELLED" | "FAILED" | "DELETED";
+  serverSource: "PROXMOX" | "MANUAL";
+  billingHold: boolean;
+  proxmoxVmId: string | null;
   serverIp: string | null;
   sshUsername: string | null;
   sshPassword: string | null;
@@ -17,7 +21,11 @@ interface ServiceRecord {
   plan: { name: string; category: string };
 }
 
-const statusColors = {
+const statusColors: Record<ServiceRecord["status"], string> = {
+  PENDING: "bg-blue-900/40 text-blue-300 border-blue-800",
+  PROVISIONING: "bg-blue-900/40 text-blue-300 border-blue-800",
+  INSTALLING: "bg-blue-900/40 text-blue-300 border-blue-800",
+  FAILED: "bg-red-900/40 text-red-400 border-red-800",
   ACTIVE: "bg-green-900/40 text-green-400 border-green-800",
   SUSPENDED: "bg-amber-900/40 text-amber-400 border-amber-800",
   CANCELLED: "bg-red-900/40 text-red-400 border-red-800",
@@ -131,6 +139,7 @@ export default function AdminServersPage() {
                 onChange={(e) => setEditForm((f) => ({ ...f, status: e.target.value }))}
                 className="w-full px-4 py-2.5 rounded-lg bg-[#0A0F1E] border border-[#374151] text-white text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
               >
+                {!["ACTIVE", "SUSPENDED", "CANCELLED"].includes(editForm.status) && <option value={editForm.status}>{editForm.status} (unchanged)</option>}
                 <option value="ACTIVE">Active</option>
                 <option value="SUSPENDED">Suspended</option>
                 <option value="CANCELLED">Cancelled</option>
@@ -175,11 +184,24 @@ export default function AdminServersPage() {
                     <span className={`text-xs font-medium px-2 py-0.5 rounded-md border ${statusColors[svc.status]}`}>
                       {svc.status}
                     </span>
+                    {(svc.serverSource === "MANUAL" || svc.billingHold) && (
+                      <p className="text-gray-400 text-xs mt-1">
+                        {[svc.serverSource === "MANUAL" && "manual", svc.billingHold && "billing hold"].filter(Boolean).join(" · ")}
+                      </p>
+                    )}
                   </td>
                   <td className="px-6 py-4 text-gray-400 text-sm">
                     {new Date(svc.nextBillingDate).toLocaleDateString("en-IN")}
                   </td>
-                  <td className="px-6 py-4 text-right">
+                  <td className="px-6 py-4 text-right whitespace-nowrap">
+                    {!svc.proxmoxVmId && svc.status !== "CANCELLED" && svc.status !== "DELETED" && (
+                      <Link
+                        href={`/admin/servers/${svc.id}/assign`}
+                        className="inline-flex items-center h-8 px-3 mr-2 rounded-lg text-sm font-medium bg-primary text-on-primary hover:bg-primary-hover"
+                      >
+                        Assign server
+                      </Link>
+                    )}
                     <Button variant="secondary" size="sm" onClick={() => startEdit(svc)}>
                       Edit
                     </Button>

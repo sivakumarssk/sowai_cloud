@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { alertAdmins } from "@/lib/adminAlert";
 import { prismaEngineLog } from "@/engine/data/engineLog";
 import { provisionVPS } from "@/lib/provisioning/provisionVPS";
-import { isLiveEnvironment, usesRealProvisioner } from "@/lib/provisioning/guard";
+import { isLiveEnvironment, usesRealProvisioner } from "@/lib/environment";
 
 export type ProvisionJobData = {
   serviceId: string;
@@ -30,6 +30,8 @@ async function runProvisioningJob({ serviceId }: ProvisionJobData): Promise<void
     include: { plan: true, user: true },
   });
   if (!service) return;
+  // A manual server is assigned by an admin (Admin → Servers → Assign server), never built here.
+  if (service.serverSource === "MANUAL") return;
 
   const route = provisioningRoute(service.plan.category);
   if (route === "PROXMOX") return provisionVPS(serviceId);

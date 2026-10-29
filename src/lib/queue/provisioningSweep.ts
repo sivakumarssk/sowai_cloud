@@ -22,6 +22,7 @@ export async function runProvisioningSweep(now = new Date()) {
           where: {
             status: "PROVISIONING",
             provisioningPct: 0,
+            serverSource: "PROXMOX",
             plan: { category: "VPS" },
             OR: [{ waitingForNodeSince: { not: null } }, { createdAt: { lt: new Date(now.getTime() - NEVER_STARTED_AFTER_MS) } }],
           },
@@ -61,6 +62,8 @@ export async function runPaidWithoutContainerCheck(now = new Date()) {
         const rows = await prisma.service.findMany({
           where: {
             proxmoxVmId: null,
+            // A manual server has no container; its passed SSH check is what counts.
+            sshVerifiedAt: null,
             status: { notIn: ["CANCELLED", "DELETED", "FAILED"] },
             createdAt: { lt: paidBefore },
             payments: { some: { status: "SUCCESS" } },

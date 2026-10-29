@@ -12,6 +12,7 @@
  * OBSERVE every decision is only written to EngineLog (dryRun = true).
  */
 import { config as loadEnv } from "dotenv";
+import { exitUnlessEnvironment } from "../lib/env";
 
 loadEnv({ path: ".env", quiet: true });
 loadEnv({ path: ".env.local", quiet: true });
@@ -24,6 +25,8 @@ const value = (name: string) => {
 };
 const live = flag("--live");
 const once = flag("--once");
+// sowsi-engine (PM2) runs this with --live: only ever against production.
+exitUnlessEnvironment(live ? "the engine (decide.ts --live)" : undefined);
 
 (async () => {
   const { EventBus } = await import("../../src/engine/core/EventBus");
