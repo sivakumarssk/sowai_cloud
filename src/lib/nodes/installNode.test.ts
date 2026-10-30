@@ -83,6 +83,12 @@ type WorldCfg = {
     pinNotInInitrd?: boolean;
     /** The IPv6 step can't reach anything. */
     ipv6Fails?: boolean;
+    /** Names don't resolve even with resolvers set. */
+    dnsNeverResolves?: boolean;
+    /** /etc/resolv.conf is a link again after the reboot. */
+    resolvLostOnReboot?: boolean;
+    /** The Proxmox install put the link back, after DNS was written. */
+    resolvLostInInstall?: boolean;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -111,6 +117,8 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     pinName: null as string | null,
     guardInstalled: false,
     ipv6Fails: cfg.ipv6Fails ?? false,
+    /** A plain /etc/resolv.conf. Otherwise it's the image's link, which only works while DHCP feeds it. */
+    resolvStatic: false,
     /** What the rescue repair wrote. */
     repaired: "",
     servicesStarting: cfg.servicesStartingPolls ?? 0,
@@ -179,6 +187,11 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "stage bridge config": w.staged = o!.stdin!; return "";
         case "install bridge config": w.installed = w.staged; return "";
         case "kernel": return `kernel=${w.kernel}`;
+        case "dns write": w.resolvStatic = true; return "";
+        case "dns check": {
+          const resolves = !cfg.dnsNeverResolves && (w.resolvStatic || !w.kernel.endsWith("-pve"));
+          return `resolv_link=${w.resolvStatic ? "no" : "yes"}\nresolv_servers=${w.resolvStatic ? S.RESOLVERS.join(" ") : ""}\ndns=${resolves ? "ok" : "broken"}`;
+        }
         case "pin nic": w.pinName = /Name=(\S+)/.exec(command)![1]; return "";
         case "install guard": w.guardInstalled = true; return "";
         case "boot safety check":
@@ -194,9 +207,9 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "simulate bad nic": w.installed = w.installed.replace(/bridge-ports \S+/, `bridge-ports ${S.BAD_NIC}`); return "1";
         case "ipv6":
           if (!/inet6/.test(w.installed)) w.installed += "\niface vmbr0 inet6 static\n";
-          return `${w.ipv6Fails ? "ipv6_debug<<\n--- ip -6 addr\ninet6 fe80::1/64\n--- ip -6 neigh\nfe80::1 FAILED\n>>ipv6_debug\n" : ""}ipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\nroute6=fe80::1 vmbr0\nipv4=${SERVER_IPV4}\ngateway6=ok\ndns=broken\nout6=${w.ipv6Fails ? "fail" : "ok"}`;
+          return `${w.ipv6Fails ? "ipv6_debug<<\n--- ip -6 addr\ninet6 fe80::1/64\n--- ip -6 neigh\nfe80::1 FAILED\n>>ipv6_debug\n" : ""}ipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\nroute6=fe80::1 vmbr0\nipv4=${SERVER_IPV4}\ngateway6=ok\ndns=${w.resolvStatic ? "ok" : "broken"}\nout6=${w.ipv6Fails ? "fail" : "ok"}`;
         case "start Proxmox install": w.pveInstall = "running"; return "started=yes";
-        case "install status": if (w.pveInstall === "running") { w.pveInstall = "done"; return "state=activating\nresult=success"; } return "state=active\nresult=success";
+        case "install status": if (w.pveInstall === "running") { w.pveInstall = "done"; if (cfg.resolvLostInInstall) w.resolvStatic = false; return "state=activating\nresult=success"; } return "state=active\nresult=success";
         case "pre-reboot check": return facts();
         case "reboot": w.rebootAt = w.clock; return "rebooting";
         case "after reboot": {
@@ -238,6 +251,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         w.booted = "boot-2";
         w.kernel = "6.8.12-4-pve";
         if (cfg.hostKeyAfterReboot) w.hostKey = cfg.hostKeyAfterReboot;
+        if (cfg.resolvLostOnReboot) w.resolvStatic = false;
         runGuard();
       }
       if (netDown()) throw new Error("connect ETIMEDOUT");
@@ -554,7 +568,7 @@ test("a re-run resumes at the first unfinished step and repeats nothing before i
 /** The same simulated Hetzner, server and records, with no injected failure unless `cfg` says so. */
 function resumeWorld(w: World, cfg: WorldCfg = {}): World {
   const fresh = world(cfg, w.hz);
-  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt", "pinName", "guardInstalled", "repaired"] as const) {
+  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt", "pinName", "guardInstalled", "repaired", "resolvStatic"] as const) {
     (fresh as Record<string, unknown>)[key] = (w as Record<string, unknown>)[key];
   }
   return fresh;
@@ -1273,8 +1287,79 @@ test("a re-run on the server that stopped at 3e+ resumes there, buys nothing, an
   assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 1);
 });
 
-test("DNS not working yet doesn't fail 3e+: it's noted, and the host setup repairs it", async () => {
+// ── DNS ───────────────────────────────────────────────────────────────
+
+test("DNS is made permanent before Proxmox installs, checked before the reboot, and again right after it", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  const c = w.commands;
+  ok(c.indexOf("dns write") < c.indexOf("start Proxmox install"), "written first");
+  const checks = c.flatMap((x, i) => (x === "dns check" ? [i] : []));
+  assert.equal(checks.length, 3);
+  ok(checks[1] > c.indexOf("install status") && checks[1] < c.indexOf("reboot"), "before the reboot");
+  ok(checks[2] > c.indexOf("after reboot") && checks[2] < c.indexOf("ipv6"), "right after 3e, before anything needs it");
+  assert.equal(c.filter((x) => x === "dns write").length, 1, "it survived, so it isn't rewritten");
+  ok(!w.logs.some((l) => l.action === "NODE_DNS_REPAIRED"), "nothing to repair");
+  assert.match(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "dns")), /survived the reboot/);
+});
+
+test("names that don't resolve stop the install at the first step that needs them, before any reboot", async () => {
+  const w = world({ dnsNeverResolves: true });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /names don't resolve/);
+  ok(!w.commands.includes("start Proxmox install"), "not even the install");
+  ok(!w.commands.includes("reboot"), "no reboot");
+});
+
+test("if the Proxmox install undoes DNS, the check right before the reboot stops it", async () => {
+  const w = world({ resolvLostInInstall: true });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /pre-reboot check \(not rebooted\): .*is a link/);
+  ok(!w.commands.includes("reboot"), "no reboot");
+});
+
+test("the real server: stopped after 3e with the image's link in place, it's repaired on resume and carries on", async () => {
+  const w = world({ ipv6Fails: true });
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  const rec = w.installs.get(NAME)!;
+  // It was installed before this step existed: no static file, and 3e already done.
+  rec.completedSteps = STEPS.slice(0, STEPS.indexOf("dns"));
+  w.resolvStatic = false;
+
+  const before = w.commands.length;
+  const resumed = resumeWorld(w);
+  const plan = await planInstall(resumed.deps, opts(), settings);
+  assert.equal(plan.resumeFrom, "dns");
+  assert.match(resumeSummary(plan.install!).join("\n"), /no new server is bought[\s\S]*next: 3e\+ check DNS survived the reboot/);
+
+  const r = await executeInstall(resumed.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.deepEqual(resumed.commands.slice(before, before + 4), ["dns check", "dns write", "dns check", "ipv6"]);
+  assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 1);
+  assert.equal(requested(resumed, "/servers").length, 1);
+  ok(resumed.logs.some((l) => l.action === "NODE_DNS_REPAIRED"), "on the record");
+});
+
+test("DNS lost across the reboot is repaired once and logged; if that doesn't help, the step fails", async () => {
+  const w = world({ resolvLostOnReboot: true });
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  ok(w.logs.some((l) => l.action === "NODE_DNS_REPAIRED"), "logged");
+
+  const dead = world({ dnsNeverResolves: false, resolvLostOnReboot: true });
+  const write = dead.deps.ssh;
+  dead.deps.ssh = async (...a) => {
+    const c = await write(...a);
+    const exec = c.shell.exec;
+    c.shell.exec = async (label, cmd, o) => (label === "dns write" && dead.kernel.endsWith("-pve") ? "" : exec(label, cmd, o));
+    return c;
+  };
+  const r = await executeInstall(dead.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /dns: .*is a link/);
+});
+
+test("IPv6 still doesn't depend on DNS, which is recorded on its own", async () => {
   const w = world();
   await executeInstall(w.deps, opts(), settings);
-  assert.match(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "ipv6")), /DNS doesn't work yet/);
+  assert.doesNotMatch(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "ipv6")), /DNS doesn't work/);
 });

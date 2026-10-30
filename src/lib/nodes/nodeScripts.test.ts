@@ -33,6 +33,8 @@ test("every generated script is valid bash", () => {
     bootSafety: S.bootSafetyFactsScript("eth0"),
     badNic: S.simulateBadNicScript("eth0"),
     ipv6: S.ipv6Script(bridge.ipv6Subnet),
+    dns: S.dnsScript(),
+    dnsFacts: S.dnsFactsScript(),
     hostSetup: readFileSync("scripts/proxmox-host-setup.sh", "utf8"),
   };
   const bash = spawnSync("bash", ["--version"]);
@@ -469,4 +471,41 @@ whenBash("the IPv6 stanza is added once, however often it runs", () => {
 
 test("an IPv6-only container is checked by ping first: it can't reach IPv4 resolvers", () => {
   assert.match(S.containerOutboundScript(false), /ping -6 -c 2 -W 3 2001:4860:4860::8888/);
+});
+
+// ── DNS ──────────────────────────────────────────────────────────────
+
+test("the resolvers: Hetzner's two, then a public fallback, and no more than glibc reads", () => {
+  assert.deepEqual(S.RESOLVERS, ["185.12.64.1", "185.12.64.2", "1.1.1.1"]);
+  assert.match(S.dnsScript(), /nameserver 185\.12\.64\.1\nnameserver 185\.12\.64\.2\nnameserver 1\.1\.1\.1\noptions timeout:2/);
+  const host = readFileSync("scripts/proxmox-host-setup.sh", "utf8");
+  assert.match(host, /nameserver 185\.12\.64\.1\\nnameserver 185\.12\.64\.2\\nnameserver 1\.1\.1\.1/, "the host setup writes the same ones");
+  assert.match(host, /\[\[ -L \/etc\/resolv\.conf \]\]/, "and replaces a link even if it works today");
+});
+
+test("the check refuses the image's link, wrong resolvers and names that don't resolve", () => {
+  const ok = { resolv_link: "no", resolv_servers: S.RESOLVERS.join(" "), dns: "ok" };
+  assert.deepEqual(S.checkDns(ok), []);
+  assert.match(S.checkDns({ ...ok, resolv_link: "yes" }).join(), /is a link, so it won't survive a reboot/);
+  assert.match(S.checkDns({ ...ok, resolv_servers: "" }).join(), /lists ""/);
+  assert.match(S.checkDns({ ...ok, dns: "broken" }).join(), /names don't resolve/);
+});
+
+test("the link itself is replaced: writing through it would land under /run and be wiped", () => {
+  const script = S.dnsScript();
+  assert.match(script, /mv -fT "\$tmp" \/etc\/resolv\.conf/);
+  assert.doesNotMatch(script, /> *\/etc\/resolv\.conf/);
+});
+
+whenBash("the script replaces the link itself, not what it points at, and the facts read back right", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sowsi-dns-"));
+  const local = (s: string) => s.replaceAll("/etc/resolv.conf", "resolv.conf");
+  writeFileSync(path.join(dir, "target"), "# only comments, as after a reboot\n");
+  spawnSync("bash", ["-c", "ln -s target resolv.conf"], { cwd: dir });
+  const written = spawnSync("bash", ["-s"], { input: local(S.dnsScript()), encoding: "utf8", cwd: dir });
+  assert.equal(written.status, 0, written.stderr);
+  assert.match(readFileSync(path.join(dir, "target"), "utf8"), /only comments/, "the old target is untouched");
+  const f = S.parseFacts(spawnSync("bash", ["-s"], { input: `getent() { return 0; }\n${local(S.dnsFactsScript())}`, encoding: "utf8", cwd: dir }).stdout);
+  assert.deepEqual(S.checkDns(f), []);
+  rmSync(dir, { recursive: true, force: true });
 });

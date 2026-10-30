@@ -231,6 +231,44 @@ systemctl daemon-reload
 systemctl enable ${GUARD_UNIT}`;
 }
 
+/**
+ * Hetzner's two resolvers, then a public fallback. glibc reads only the first three, so that's all
+ * there are. Hetzner's only answer from inside Hetzner, which is where every node is.
+ */
+export const RESOLVERS = ["185.12.64.1", "185.12.64.2", "1.1.1.1"];
+
+/**
+ * The Debian image links /etc/resolv.conf to /run/resolvconf/resolv.conf, fed by dhclient. /run is
+ * wiped at boot and vmbr0 doesn't use DHCP, so after the first reboot that file has no nameserver.
+ * A plain file needs neither: resolvconf only warns and leaves it alone, and it's what Proxmox expects.
+ * mv replaces the link itself rather than writing through it.
+ */
+export function dnsScript(): string {
+  return `set -euo pipefail
+tmp=$(mktemp /etc/resolv.conf.sowsi.XXXXXX)
+cat > "$tmp" <<'EOF'
+# Written by Sowsi install-node. A plain file on purpose: a link into /run is empty after a reboot.
+${RESOLVERS.map((r) => `nameserver ${r}`).join("\n")}
+options timeout:2
+EOF
+chmod 644 "$tmp"
+mv -fT "$tmp" /etc/resolv.conf`;
+}
+
+export function dnsFactsScript(): string {
+  return `echo "resolv_link=$([ -L /etc/resolv.conf ] && echo yes || echo no)"
+echo "resolv_servers=$(awk '$1=="nameserver"{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
+echo "dns=$(getent hosts deb.debian.org >/dev/null 2>&1 && echo ok || echo broken)"`;
+}
+
+export function checkDns(facts: Record<string, string>): string[] {
+  const problems: string[] = [];
+  if (facts.resolv_link !== "no") problems.push("/etc/resolv.conf is a link, so it won't survive a reboot");
+  if (facts.resolv_servers !== RESOLVERS.join(" ")) problems.push(`/etc/resolv.conf lists "${facts.resolv_servers ?? ""}", expected ${RESOLVERS.join(" ")}`);
+  if (facts.dns !== "ok") problems.push("names don't resolve");
+  return problems;
+}
+
 /** A failed boot has to be readable afterwards. */
 export function journaldScript(): string {
   return `set -euo pipefail
@@ -373,11 +411,7 @@ cat > ${STAGED_INTERFACES}
 mkdir -p /etc/cloud/cloud.cfg.d
 grep -qs 'network: {config: disabled}' /etc/cloud/cloud.cfg.d/99-sowsi.cfg || echo 'network: {config: disabled}' >> /etc/cloud/cloud.cfg.d/99-sowsi.cfg
 rm -f /etc/network/interfaces.d/50-cloud-init /etc/network/interfaces.d/50-cloud-init.cfg
-# DNS must keep working once dhclient no longer writes resolv.conf (Hetzner's resolvers).
-if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
-  rm -f /etc/resolv.conf
-  printf 'nameserver 185.12.64.1\\nnameserver 185.12.64.2\\nnameserver 2a01:4ff:ff00::add:1\\n' > /etc/resolv.conf
-fi`;
+`;
 }
 
 /** Puts the staged file in place (keeping the original once). Takes effect at the next boot. */

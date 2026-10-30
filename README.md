@@ -157,6 +157,9 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
      is downtime, so a node holding customers is refused unless you pass
      `--allow-downtime`.
 - **First boot is IPv4 only,** as on node 1. IPv6 is added once SSH is back.
+- **DNS is a plain `/etc/resolv.conf`,** written before the reboot and checked
+  again after it. The image's link into `/run` is empty after a reboot once
+  DHCP is gone.
 - **Re-using a name:** a name whose install was destroyed or failed gets a new
   row and a new server, and the plan says so. The old record is kept as
   `<name>#<serverId>`.

@@ -24,10 +24,10 @@ IPV6_SUBNET="${IPV6_SUBNET%%::*}"
 PROVISIONING_PUBKEY="${PROVISIONING_PUBKEY:-}"
 
 echo "== 1. DNS"
-if ! getent hosts download.proxmox.com >/dev/null; then
-  # resolv.conf is empty (or a dangling systemd-resolved link); use Hetzner's resolvers.
+if [[ -L /etc/resolv.conf ]] || ! getent hosts download.proxmox.com >/dev/null; then
+  # A plain file: a link into /run is empty after a reboot once DHCP no longer feeds it.
   rm -f /etc/resolv.conf
-  printf 'nameserver 185.12.64.1\nnameserver 185.12.64.2\n' > /etc/resolv.conf
+  printf 'nameserver 185.12.64.1\nnameserver 185.12.64.2\nnameserver 1.1.1.1\noptions timeout:2\n' > /etc/resolv.conf
 fi
 getent hosts download.proxmox.com >/dev/null && echo "DNS OK" || { echo "DNS still broken — fix /etc/resolv.conf"; exit 1; }
 

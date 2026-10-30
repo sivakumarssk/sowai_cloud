@@ -162,7 +162,7 @@ export type InstallSettings = {
 export const INSTALL_LABEL = "sowsi-node-install";
 // The firewall comes before the Proxmox install, so port 8006 is never open to the
 // internet: ufw is already denying it when pveproxy first starts listening.
-export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "ipv6", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
+export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "dns", "ipv6", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
 export type StepId = (typeof STEPS)[number];
 
 export const STEP_TITLES: Record<StepId, string> = {
@@ -171,9 +171,10 @@ export const STEP_TITLES: Record<StepId, string> = {
   hostname: "3b hostname and /etc/hosts",
   firewall: "3f ufw, fail2ban, key-only SSH (before Proxmox, so 8006 is never open)",
   bridge: "3c write vmbr0 (IPv4 /32, point-to-point to 172.31.1.1) and verify it",
-  "boot-safety": "3c+ pin the card name by MAC, boot-time network guard, persistent journal",
+  "boot-safety": "3c+ permanent DNS, pin the card name by MAC, boot-time network guard, persistent journal",
   proxmox: "3d install Proxmox VE, remove the Debian kernel, verify, reboot",
   reboot: "3e wait for SSH after the reboot, check the Proxmox kernel and network (rescue repair if it never answers)",
+  dns: "3e+ check DNS survived the reboot (repair it if it didn't)",
   ipv6: "3e+ add IPv6 now the bridge is proven up, reload, verify",
   "host-setup": "3g proxmox-host-setup.sh (vmbr1, routes, sowsi-host, storage, template)",
   "api-token": "3h Proxmox API token, stored encrypted; check :8006 from sowsi-mgmt-01",
@@ -549,12 +550,15 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
   async "boot-safety"(ctx) {
     const { o, s } = ctx;
     const live = S.parseFacts(await onNode(ctx, "bridge facts", S.bridgeFactsScript()));
+    await onNode(ctx, "dns write", S.dnsScript());
+    const dns = S.checkDns(S.parseFacts(await onNode(ctx, "dns check", S.dnsFactsScript())));
+    if (dns.length) fail("dns", dns);
     if (!o.noPin) await onNode(ctx, "pin nic", S.pinNicScript({ nic: live.nic, mac: live.mac }), { timeoutMs: 5 * 60_000 });
     if (!o.noGuard) await onNode(ctx, "install guard", S.installGuardScript({ mac: live.mac, ipv4: ctx.rec.ipv4!, mgmtIp: s.mgmtIp }), { stdin: S.guardScript() });
     await onNode(ctx, "journald", S.journaldScript());
     const problems = S.checkBootSafety(S.parseFacts(await onNode(ctx, "boot safety check", S.bootSafetyFactsScript(live.nic))), { nic: live.nic, mac: live.mac, pin: !o.noPin, guard: !o.noGuard });
     if (problems.length) fail("boot safety", problems);
-    return `${o.noPin ? "NO name pin" : `${live.nic} pinned to ${live.mac}, in every initramfs`}; ${o.noGuard ? "NO guard" : "boot guard enabled"}; journal persistent`;
+    return `resolvers in a plain /etc/resolv.conf; ${o.noPin ? "NO name pin" : `${live.nic} pinned to ${live.mac}, in every initramfs`}; ${o.noGuard ? "NO guard" : "boot guard enabled"}; journal persistent`;
   },
 
   async proxmox(ctx) {
@@ -587,6 +591,8 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     // The Proxmox kernel has its own initramfs: the pin has to be in that one, not only Debian's.
     const safety = S.checkBootSafety(S.parseFacts(await onNode(ctx, "boot safety check", S.bootSafetyFactsScript(live.nic))), { nic: live.nic, mac: live.mac, pin: !ctx.o.noPin, guard: !ctx.o.noGuard });
     if (safety.length) fail("pre-reboot check (not rebooted)", safety);
+    const dns = S.checkDns(S.parseFacts(await onNode(ctx, "dns check", S.dnsFactsScript())));
+    if (dns.length) fail("pre-reboot check (not rebooted)", dns);
 
     if (ctx.o.simulateBadNic) {
       ctx.deps.report(`      --simulate-bad-nic: pointing vmbr0 at ${S.BAD_NIC}`);
@@ -630,6 +636,21 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const firewall = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
     if (firewall.length) fail("firewall check after the reboot", firewall);
     return `${facts.pveversion} on ${facts.kernel}${ctx.rec.repairedAt ? " (recovered by the rescue repair)" : ""}`;
+  },
+
+  async dns(ctx) {
+    const { deps } = ctx;
+    const read = async () => S.checkDns(S.parseFacts(await onNode(ctx, "dns check", S.dnsFactsScript())));
+    const missing = await read();
+    if (missing.length === 0) return `/etc/resolv.conf survived the reboot and names resolve (${S.RESOLVERS.join(", ")})`;
+
+    // Written before the reboot, so this shouldn't happen: fixed, and left on the record.
+    deps.report(`      DNS isn't right after the reboot: ${missing.join("; ")}. Writing it again`);
+    await deps.log({ action: "NODE_DNS_REPAIRED", toNode: ctx.rec.name, success: false, error: missing.join("; ") });
+    await onNode(ctx, "dns write", S.dnsScript());
+    const still = await read();
+    if (still.length) fail("dns", still);
+    return `DNS wasn't right after the reboot (${missing.join("; ")}); repaired: ${S.RESOLVERS.join(", ")}`;
   },
 
   async ipv6(ctx) {

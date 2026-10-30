@@ -83,6 +83,25 @@ guarded("sowsi-mgmt-01 being down doesn't look like a broken node", () => {
   }
 });
 
+guarded("a DNS failure isn't a network failure: names don't resolve, the address answers, nothing happens", () => {
+  const h = host({ reachable: [MGMT], port: "eth0", extra: "getent() { return 2; }\nnslookup() { return 1; }\ndig() { return 1; }" });
+  h.put("resolv.conf", "# only comments\n");
+  const before = h.read("interfaces");
+  assert.equal(h.run().status, 0);
+  assert.equal(h.read("interfaces"), before);
+  assert.equal(h.read("calls"), "");
+  assert.equal(h.read("guard.log"), "");
+  h.done();
+});
+
+test("the guard only ever tests addresses: there's no name in it to look up", () => {
+  const script = guardScript();
+  assert.doesNotMatch(script, /getent|nslookup|\bdig\b|\bhost \w|resolv\.conf|\.(com|org|net)\b/);
+  const targets = [...script.matchAll(/can_reach ("?[^"\s]+"?) \d+/g)].map((m) => m[1]);
+  assert.deepEqual(targets, ['"$MGMT_IP"', "185.12.64.1", "1.1.1.1"]);
+  assert.match(installGuardScript({ mac: MAC, ipv4: "2.28.75.244", mgmtIp: MGMT }), /MGMT_IP=2\.31\.11\.105/, "an address, not a name");
+});
+
 guarded("a bridge on the wrong card: found by MAC, corrected, reloaded, and the bridge kept", () => {
   const h = host({ port: "eth0" });
   h.put("reload-fixes");
