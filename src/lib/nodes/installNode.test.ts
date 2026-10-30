@@ -7,6 +7,7 @@ import {
   INSTALL_LABEL,
   planDestroy,
   planInstall,
+  resumeSummary,
   SshAuthError,
   STEPS,
   type InstallDeps,
@@ -20,6 +21,7 @@ import * as S from "./nodeScripts";
 import { installHetznerApi } from "./hetznerApi";
 import { HetznerService } from "@/lib/hetzner";
 import { CPX22, deprecatedUse, fakeHetzner, type FakeHetznerConfig } from "@/lib/testing/fakeHetzner";
+import { freshFirewall, runFirewallScript } from "@/lib/testing/fakeUfw";
 
 // ── A simulated Hetzner project, server and Proxmox node ─────────────
 
@@ -60,6 +62,8 @@ function world(
     spent?: number;
     /** ufw comes back disabled after the reboot. */
     firewallLostOnReboot?: boolean;
+    /** Polls after the reboot that find Proxmox's services still starting. */
+    servicesStartingPolls?: number;
     hetzner?: FakeHetznerConfig;
   } = {},
   hz = fakeHetzner(cfg.hetzner)
@@ -83,6 +87,8 @@ function world(
     authorized: [INSTALL_KEY, ADMIN_KEY],
     containers: [...(cfg.otherContainers ?? [])] as { vmid: number; name: string }[],
     tokenMade: false,
+    firewall: freshFirewall(),
+    servicesStarting: cfg.servicesStartingPolls ?? 0,
   };
 
   const live = () => ({ nic: "eth0", mac: "96:00:03:aa:bb:cc", ipv4: SERVER_IPV4, gateway: "172.31.1.1" });
@@ -96,7 +102,7 @@ function world(
     }).map(([k, v]) => `${k}=${v}`).join("\n");
 
   const shellFor = (): Shell => ({
-    async exec(label, _command, o) {
+    async exec(label, command, o) {
       w.commands.push(label);
       if (cfg.failLabel === label) throw new Error(`${label} failed (exit 1):\nsimulated failure`);
       switch (label) {
@@ -110,11 +116,17 @@ function world(
         case "install status": if (w.pveInstall === "running") { w.pveInstall = "done"; return "state=activating\nresult=success"; } return "state=active\nresult=success";
         case "pre-reboot check": return facts();
         case "reboot": w.rebootAt = w.clock; return "rebooting";
-        case "after reboot": return `kernel=${w.kernel}\npveversion=pve-manager/8.3.0/abc\nvmbr0_ipv4=${SERVER_IPV4}/32\ngateway=172.31.1.1 vmbr0\nipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\npve_services=active active active\nboot_id=${w.booted}`;
-        case "firewall": return FIREWALL_OK;
-        case "firewall check": return cfg.firewallLostOnReboot && w.kernel.endsWith("-pve") ? FIREWALL_OK.replace("Status: active", "Status: inactive") : FIREWALL_OK;
+        case "after reboot": {
+          const services = w.servicesStarting-- > 0 ? "activating activating activating" : "active active active";
+          return `kernel=${w.kernel}\npveversion=pve-manager/8.3.0/abc (running kernel: ${w.kernel})\nvmbr0_ipv4=${SERVER_IPV4}\ngateway=172.31.1.1 vmbr0\nipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\npve_services=${services}\nboot_id=${w.booted}`;
+        }
+        case "firewall":
+          return runFirewallScript(w.firewall, command);
+        case "firewall check":
+          if (cfg.firewallLostOnReboot && w.kernel.endsWith("-pve")) w.firewall.active = false;
+          return runFirewallScript(w.firewall, command);
         case "proxmox-host-setup.sh": assert.match(o!.stdin!, /sowsi-routes/); return "== 1. DNS\n…\n== Done";
-        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=UP\nstorage=iso,vztmpl,backup,rootdir,images";
+        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images";
         case "API token": w.tokenMade = true; return JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: "0" }, value: SECRET });
         case "add provisioning key": w.authorized.push(`restrict,command="/usr/local/sbin/sowsi-host" ${PROV_KEY}`); return "1";
         case "remove install key": w.authorized = w.authorized.filter((k) => k !== INSTALL_KEY); return `install_lines=0\nadmin_lines=${w.authorized.includes(ADMIN_KEY) ? 1 : 0}`;
@@ -196,20 +208,6 @@ function world(
 
 const servers = (w: World) => w.hz.state.servers;
 const hetznerRequests = (w: World) => w.hz.requests;
-
-const FIREWALL_OK = `ufw<<
-Status: active
-Default: deny (incoming), allow (outgoing), allow (routed)
-22/tcp                     ALLOW IN    Anywhere
-80/tcp                     ALLOW IN    Anywhere
-443/tcp                    ALLOW IN    Anywhere
-8006/tcp                   ALLOW IN    2.31.11.105
-Anywhere                   ALLOW FWD   Anywhere on vmbr1
->>ufw
-sshd_password=no
-sshd_root=without-password
-sshd_kbd=no
-fail2ban=active`;
 
 const steps = (w: World) => w.logs.filter((l) => l.action === "NODE_INSTALL_STEP").map((l) => (l.after as { step: string }).step);
 
@@ -455,7 +453,7 @@ test("a re-run resumes at the first unfinished step and repeats nothing before i
 /** The same simulated Hetzner, server and records, with no injected failure. */
 function resumeWorld(w: World): World {
   const fresh = world({}, w.hz);
-  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock"] as const) {
+  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall"] as const) {
     (fresh as Record<string, unknown>)[key] = (w as Record<string, unknown>)[key];
   }
   return fresh;
@@ -467,7 +465,7 @@ test("a run that stopped right after removing the install key counts the lockdow
   const rec = w.installs.get("sowsi-proxmox-02")!;
   // Pretend the lockdown never got recorded, though it happened on the server.
   rec.completedSteps = rec.completedSteps.filter((s) => s !== "lockdown");
-  assert.ok(!w.authorized.includes(INSTALL_KEY));
+  assert.ok(!w.authorized.includes(INSTALL_KEY), "the install key was removed from the server");
   const resumed = resumeWorld(w);
   const r = await executeInstall(resumed.deps, opts(), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
@@ -543,7 +541,7 @@ test("Proxmox is never installed while the firewall is down", async () => {
 test("a firewall that didn't survive the reboot stops the install", async () => {
   const w = world({ firewallLostOnReboot: true });
   const r = await executeInstall(w.deps, opts(), settings);
-  assert.match((r as { error: string }).error, /firewall check after the reboot: ufw is not active/);
+  assert.match((r as { error: string }).error, /ufw is not active/);
   assert.equal(servers(w).size, 0);
   assert.equal(w.nodes.length, 0);
 });
@@ -578,4 +576,74 @@ test("a whole install and destroy touches nothing deprecated", async () => {
   assert.deepEqual(hetznerRequests(w).flatMap(deprecatedUse), []);
   assert.ok(!hetznerRequests(w).some((r) => r.path.startsWith("/datacenters")));
   assert.equal(w.hz.state.primaryIps.size, 0);
+});
+
+// ── The real stop at step 3f ──────────────────────────────────────────
+
+/** Server 173512291 as found: bought, 3a and 3b done, ufw half applied by the run that stopped at 3f. */
+async function stoppedAt3f() {
+  const w = world({ failLabel: "firewall" });
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  Object.assign(w.firewall, { active: true, ipForward: 0, policy: { incoming: "deny", outgoing: "allow", routed: "allow" } });
+  w.firewall.rules = ["22/tcp                     ALLOW IN    Anywhere", "8006/tcp                   ALLOW IN    2.31.11.105"];
+  return w;
+}
+
+test("the plan shows the install resumes at 3f, buys nothing, and which step is next", async () => {
+  const w = await stoppedAt3f();
+  const p = await planInstall(w.deps, opts(), settings);
+  assert.equal(p.ok, true, p.problems.join());
+  assert.equal(p.resumeFrom, "firewall");
+  const lines = resumeSummary(p.install!).join("\n");
+  assert.match(lines, /no new server is bought/);
+  assert.match(lines, /done: server, ssh, hostname/);
+  assert.match(lines, /next: 3f ufw, fail2ban, key-only SSH/);
+  assert.match(lines, /last error: firewall: /);
+});
+
+test("a re-run on the half-configured server resumes at 3f, buys no second server, and finishes", async () => {
+  const w = await stoppedAt3f();
+  const before = w.commands.length;
+  const shown: string[] = [];
+  const resumed = resumeWorld(w);
+  resumed.deps.report = (l) => void shown.push(l);
+  const r = await executeInstall(resumed.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+
+  assert.equal(resumed.commands[before], "firewall", "3f is the first thing it runs");
+  assert.ok(!resumed.commands.slice(before).includes("hostname"));
+  assert.equal(hetznerRequests(resumed).filter((q) => q.method === "POST" && q.path === "/servers").length, 1, "one server, ever");
+  assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 1);
+  assert.equal(servers(resumed).size, 1);
+  assert.match(shown[0], /Resuming sowsi-proxmox-02 on Hetzner server \d+ \(203\.0\.113\.20\): no new server is bought/);
+  assert.match(shown[2], /next: 3f/, "says what's next before running it");
+  assert.equal(w.installs.get("sowsi-proxmox-02")!.error, null, "the old error doesn't linger");
+});
+
+test("SSH coming up before Proxmox's services isn't a failure: it waits for them", async () => {
+  const w = world({ servicesStartingPolls: 3 });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.equal(servers(w).size, 1);
+});
+
+test("Proxmox services that never start fail after the timeout; a wrong kernel fails at once", async () => {
+  const stuck = world({ servicesStartingPolls: 1000 });
+  const r = await executeInstall(stuck.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /after reboot: Proxmox services: activating/);
+  assert.equal(servers(stuck).size, 0);
+
+  const wrong = world({ facts: {} });
+  wrong.deps.report = () => {};
+  const shell = wrong.deps.ssh;
+  wrong.deps.ssh = async (...a) => {
+    const c = await shell(...a);
+    const exec = c.shell.exec;
+    c.shell.exec = async (label, cmd, o) => (label === "after reboot" ? (await exec(label, cmd, o)).replace(/kernel=\S+/, "kernel=6.1.0-26-cloud-amd64") : exec(label, cmd, o));
+    return c;
+  };
+  const started = wrong.clock;
+  const r2 = await executeInstall(wrong.deps, opts(), settings);
+  assert.match((r2 as { error: string }).error, /after reboot: running kernel/);
+  assert.ok(wrong.clock - started < 60_000 + 30_000, "doesn't wait out the timeout");
 });

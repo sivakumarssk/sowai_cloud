@@ -97,15 +97,16 @@ function lock(): () => void {
     const plan = await N.planInstall(deps, options, settings);
 
     console.log(`Install node ${options.name || "?"} (${options.serverType || "?"}, ${settings.location}, ${settings.image})`);
+    const resuming = plan.install?.status === "IN_PROGRESS";
+    if (resuming) for (const l of N.resumeSummary(plan.install!)) console.log(l);
     if (plan.cost) for (const l of plan.cost.lines) console.log(`  € ${l}`);
-    if (plan.cost) {
+    if (plan.cost && plan.resumeFrom === "server") {
       const spent = await deps.db.spentThisMonthPaise();
       const r = (p: number) => `₹${(p / 100).toLocaleString("en-IN")}`;
       console.log(`  spend this month ${r(spent)} + ${r(plan.cost.monthlyPaise)} = ${r(spent + plan.cost.monthlyPaise)} of the ${r(settings.spendCapPaise)} cap`);
     }
     console.log(`  install key: ${existsSync(`${installKeyPath()}.pub`) ? installKeyPath() : `${installKeyPath()} (created on --execute)`}`);
     console.log(`  test container: IPv6 only${options.ipv4Test ? " + a Floating IPv4 (--ipv4)" : ""}; sowsi-mgmt-01 IPv6: ${settings.mgmtHasIpv6 ? "yes" : "NO"}`);
-    if (plan.install?.status === "IN_PROGRESS") console.log(`  resuming the install started earlier (done: ${plan.install.completedSteps.join(", ") || "nothing"})`);
     console.log("\nSteps:");
     for (const st of N.STEPS) {
       const done = plan.install?.status === "IN_PROGRESS" && plan.install.completedSteps.includes(st);

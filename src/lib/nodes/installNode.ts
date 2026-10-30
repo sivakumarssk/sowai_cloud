@@ -446,20 +446,29 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const { deps, s } = ctx;
     const before = ctx.rec.bootIdBeforeReboot;
     const deadline = deps.now() + s.rebootTimeoutMs;
+    const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! };
     let facts: Record<string, string> = {};
+    let problems: string[] = [];
     for (;;) {
-      if (deps.now() > deadline) throw new Error(`the server didn't come back within ${s.rebootTimeoutMs / 60_000} min of the reboot — check the Hetzner console (VNC)`);
+      if (deps.now() > deadline) {
+        if (problems.length) fail("after reboot", problems);
+        throw new Error(`the server didn't come back within ${s.rebootTimeoutMs / 60_000} min of the reboot — check the Hetzner console (VNC)`);
+      }
       try {
         dropShell(ctx);
         facts = S.parseFacts(await (await installShell(ctx, 30_000)).exec("after reboot", S.afterRebootFactsScript()));
-        if (!before || facts.boot_id !== before) break; // a new boot
+        if (!before || facts.boot_id !== before) {
+          problems = S.checkAfterReboot(facts, expected);
+          if (problems.length === 0) break;
+          // SSH comes up before Proxmox's services, so those get time; anything else won't fix itself.
+          const lasting = S.checkAfterReboot({ ...facts, pve_services: "active active active" }, expected);
+          if (lasting.length) fail("after reboot", lasting);
+        }
       } catch (err) {
-        if (err instanceof HostKeyMismatchError) throw err;
+        if (err instanceof HostKeyMismatchError || /^after reboot:/.test(errMsg(err))) throw err;
       }
       await deps.sleep(10_000);
     }
-    const problems = S.checkAfterReboot(facts, { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! });
-    if (problems.length) fail("after reboot", problems);
     const firewall = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
     if (firewall.length) fail("firewall check after the reboot", firewall);
     return `${facts.pveversion} on ${facts.kernel}`;
@@ -602,6 +611,17 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
   },
 };
 
+/** Where an unfinished install stands: shown before anything runs. */
+export function resumeSummary(rec: InstallRecord): string[] {
+  const next = STEPS.find((st) => !rec.completedSteps.includes(st));
+  return [
+    `Resuming ${rec.name}${rec.hetznerServerId ? ` on Hetzner server ${rec.hetznerServerId} (${rec.ipv4})` : ""}${rec.completedSteps.includes("server") ? ": no new server is bought" : ""}`,
+    `  done: ${rec.completedSteps.join(", ") || "nothing"}`,
+    `  next: ${next ? STEP_TITLES[next] : "nothing left"}`,
+    ...(rec.error ? [`  last error: ${rec.error}`] : []),
+  ];
+}
+
 export type InstallResult = { ok: true; summary: string } | { ok: false; error: string; serverDeleted: boolean };
 
 export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: InstallSettings): Promise<InstallResult> {
@@ -622,6 +642,10 @@ export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: In
     rec = rec
       ? await deps.db.updateInstall(rec.id, { ...fresh, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, apiTokenSecret: null, testFloatingIpId: null })
       : await deps.db.createInstall(fresh);
+  }
+  if (rec.completedSteps.length > 0) {
+    for (const line of resumeSummary(rec)) deps.report(line);
+    rec = await deps.db.updateInstall(rec.id, { error: null });
   }
   const ctx: Ctx = { deps, s, o, rec, shell: null, tokenSecret: null };
   await deps.log({ action: "NODE_INSTALL_STARTED", toNode: o.name, after: { resumeFrom: plan.resumeFrom, serverType: o.serverType, approvedBy: o.approvedBy, ipv4Test: o.ipv4Test } });

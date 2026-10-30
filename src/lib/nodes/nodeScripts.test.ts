@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import * as S from "./nodeScripts";
+import { freshFirewall, runFirewallScript, type FakeFirewall } from "@/lib/testing/fakeUfw";
 
 const bridge = { nic: "eth0", mac: "96:00:03:aa:bb:cc", ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" };
 
@@ -72,7 +73,7 @@ test("the bridge check catches everything that would leave the server unreachabl
 });
 
 test("after the reboot: Proxmox kernel, pve-manager, vmbr0 with both addresses, default route on vmbr0", () => {
-  const ok = { kernel: "6.8.12-4-pve", pveversion: "pve-manager/8.3.0/1234", vmbr0_ipv4: "203.0.113.20/32", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active" };
+  const ok = { kernel: "6.8.12-4-pve", pveversion: "pve-manager/8.3.0/1234", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active" };
   assert.deepEqual(S.checkAfterReboot(ok, { ipv4: bridge.ipv4, ipv6Subnet: bridge.ipv6Subnet }), []);
   assert.match(S.checkAfterReboot({ ...ok, kernel: "6.1.0-26-cloud-amd64" }, bridge).join(), /isn't a Proxmox kernel/);
   assert.match(S.checkAfterReboot({ ...ok, gateway: "172.31.1.1 eth0" }, bridge).join(), /on vmbr0/);
@@ -93,6 +94,7 @@ test("the token secret comes from pveum's JSON and must be root@pam!sowsi withou
   assert.throws(() => S.parseTokenSecret("Permission denied"), /JSON/);
 });
 
+// The real formats, from the tools' own sources and the live server.
 const UFW = `ufw<<
 Status: active
 Logging: on (low)
@@ -108,17 +110,25 @@ To                         Action      From
 Anywhere                   ALLOW FWD   Anywhere on vmbr1
 Anywhere on vmbr1          ALLOW FWD   Anywhere
 22/tcp (v6)                ALLOW IN    Anywhere (v6)
+Anywhere (v6)              ALLOW FWD   Anywhere (v6) on vmbr1
 >>ufw
 sshd_password=no
 sshd_root=without-password
 sshd_kbd=no
-fail2ban=active`;
+fail2ban=active
+ip_forward=1`;
 
 test("firewall: deny in, 22/80/443, 8006 only from sowsi-mgmt-01, routed vmbr1, key-only SSH, fail2ban", () => {
   assert.deepEqual(S.checkFirewall(UFW, "2.31.11.105"), []);
   assert.match(S.checkFirewall(UFW.replace("8006/tcp                   ALLOW IN    2.31.11.105", "8006/tcp                   ALLOW IN    Anywhere"), "2.31.11.105").join(), /open to everyone/);
-  assert.match(S.checkFirewall(UFW.replace("deny (incoming)", "allow (incoming)"), "2.31.11.105").join(), /defaults/);
-  assert.match(S.checkFirewall(UFW.replace("sshd_password=no", "sshd_password=yes"), "2.31.11.105").join(), /PasswordAuthentication/);
+  assert.match(S.checkFirewall(UFW.replace("deny (incoming)", "allow (incoming)"), "2.31.11.105").join(), /default incoming is "allow"/);
+  assert.match(S.checkFirewall(UFW.replace("allow (routed)", "disabled (routed)"), "2.31.11.105").join(), /"disabled \(routed\)": the kernel isn't forwarding/);
+  assert.match(S.checkFirewall(UFW.replace("allow (routed)", "deny (routed)"), "2.31.11.105").join(), /default routed is "deny"/);
+  assert.match(S.checkFirewall(UFW.replace("ip_forward=1", "ip_forward=0"), "2.31.11.105").join(), /ip_forward is 0/);
+  assert.match(S.checkFirewall(UFW.replace("sshd_password=no", "sshd_password=yes"), "2.31.11.105").join(), /passwordauthentication is yes, expected no/);
+  assert.match(S.checkFirewall(UFW.replace("sshd_password=no\n", ""), "2.31.11.105").join(), /passwordauthentication is unknown/);
+  assert.match(S.checkFirewall(UFW.replace("sshd_root=without-password", "sshd_root=yes"), "2.31.11.105").join(), /permitrootlogin is yes, expected prohibit-password/);
+  assert.deepEqual(S.checkFirewall(UFW.replace("sshd_root=without-password", "sshd_root=prohibit-password"), "2.31.11.105"), [], "either spelling");
   assert.match(S.checkFirewall(UFW.replace("Status: active", "Status: inactive"), "2.31.11.105").join(), /not active/);
   assert.match(S.checkFirewall(UFW, "2.31.11.106").join(), /8006 isn't limited to 2\.31\.11\.106/);
 });
@@ -138,4 +148,147 @@ test("the Proxmox install is pinned to the published key hash and removes every 
   assert.ok(s.indexOf("vmlinuz-*-pve") < s.indexOf("$APT remove $debian"), "a Proxmox kernel is checked before Debian's is removed");
   assert.match(s, /update-grub/);
   assert.doesNotMatch(s, /reboot/, "the reboot happens only after the pre-reboot check");
+});
+
+// ── Step 3f, against a host that behaves like the real tools ─────────
+
+const MGMT = "2.31.11.105";
+const script = S.firewallScript(MGMT);
+const withoutLine = (needle: string) => script.split("\n").filter((l) => !l.includes(needle)).join("\n");
+
+test("3f from a fresh server: deny in, allow out, allow routed, and it passes its own check", () => {
+  const fw = freshFirewall();
+  const out = runFirewallScript(fw, script);
+  assert.match(out, /Default: deny \(incoming\), allow \(outgoing\), allow \(routed\)/);
+  assert.deepEqual(S.checkFirewall(out, MGMT), []);
+});
+
+test("3f sets the defaults and turns forwarding on before it enables ufw", () => {
+  const fw = freshFirewall();
+  runFirewallScript(fw, script);
+  assert.deepEqual(fw.atEnable, { policy: { incoming: "deny", outgoing: "allow", routed: "allow" }, ipForward: 1, rules: 6 });
+  const at = (needle: string) => script.indexOf(needle);
+  for (const line of ["ufw default deny incoming", "ufw default allow outgoing", "ufw default allow routed", "sysctl -q -w net.ipv4.ip_forward=1"]) {
+    assert.ok(at(line) >= 0 && at(line) < at("ufw --force enable"), line);
+  }
+});
+
+test("the script that stopped on the real server: policy set, no forwarding, disabled (routed) — and the check catches it", () => {
+  const out = runFirewallScript(freshFirewall(), withoutLine("sysctl -q -w net.ipv4.ip_forward=1"));
+  assert.match(out, /allow \(outgoing\), disabled \(routed\)/);
+  assert.match(S.checkFirewall(out, MGMT).join(), /"disabled \(routed\)"/);
+});
+
+test("without ufw default allow routed: disabled (routed) with forwarding off, deny (routed) with it on — caught both ways", () => {
+  const off = runFirewallScript(freshFirewall(), withoutLine("ufw default allow routed").replace(/.*ip_forward=1.*\n/g, ""));
+  assert.match(off, /disabled \(routed\)/);
+  assert.ok(S.checkFirewall(off, MGMT).length > 0);
+  const on = runFirewallScript(freshFirewall(), withoutLine("ufw default allow routed"));
+  assert.match(on, /deny \(routed\)/);
+  assert.match(S.checkFirewall(on, MGMT).join(), /default routed is "deny"/);
+});
+
+test("3f on the half-configured real server, and twice in a row: same clean result, no duplicate rules", () => {
+  const halfDone: FakeFirewall = {
+    ...freshFirewall(),
+    active: true,
+    policy: { incoming: "deny", outgoing: "allow", routed: "allow" },
+    rules: ["22/tcp                     ALLOW IN    Anywhere", "8006/tcp                   ALLOW IN    2.31.11.105", "1234/tcp                   ALLOW IN    Anywhere"],
+  };
+  const first = runFirewallScript(halfDone, script);
+  assert.deepEqual(S.checkFirewall(first, MGMT), []);
+  assert.doesNotMatch(first, /1234/, "a stray rule from before doesn't survive");
+  const second = runFirewallScript(halfDone, script);
+  assert.equal(second, first);
+  assert.equal(new Set(halfDone.rules).size, halfDone.rules.length);
+});
+
+test("SSH: PasswordAuthentication no is set explicitly, and the effective value is what's checked", () => {
+  const out = runFirewallScript(freshFirewall(), script);
+  assert.match(out, /sshd_password=no/);
+  assert.match(out, /sshd_root=without-password/, "how sshd -T prints prohibit-password");
+  const noDropIn = runFirewallScript(freshFirewall(), script.replace(/cat > \/etc\/ssh\/sshd_config\.d\/00-sowsi\.conf <<'EOF'[\s\S]*?\nEOF\n/, ""));
+  assert.match(S.checkFirewall(noDropIn, MGMT).join(), /passwordauthentication is yes/, "Debian's default fails the check");
+  assert.match(script, /sshd -T \| awk|sshd -T/);
+  assert.doesNotMatch(S.firewallStatusScript(), /grep[^\n]*sshd_config/, "never read from the config file");
+});
+
+// ── The scripts' own parsing, on real tool output ────────────────────
+
+/** Runs a script under bash with the tools stubbed to print their real output. Null if there's no bash. */
+function factsFrom(script: string, stubs: string): Record<string, string> | null {
+  if (spawnSync("bash", ["--version"]).error) return null;
+  const r = spawnSync("bash", ["-s"], { input: `${stubs}\n${script}`, encoding: "utf8" });
+  return S.parseFacts(r.stdout);
+}
+
+test("3e parses the real output of ip, pveversion, uname and systemctl", () => {
+  const facts = factsFrom(
+    S.afterRebootFactsScript(),
+    `uname() { echo 6.8.12-9-pve; }
+pveversion() { echo "pve-manager/8.4.1/2a5fa54a8503f96d (running kernel: 6.8.12-9-pve)"; }
+cat() { echo 3f2c-boot; }
+systemctl() { printf 'active\\nactive\\nactive\\n'; }
+ip() {
+  case "$*" in
+    "-o -4 addr show dev vmbr0") echo '2: vmbr0    inet 203.0.113.20 peer 172.31.1.1/32 scope global vmbr0\\       valid_lft forever preferred_lft forever' ;;
+    "-o -4 route show to default") echo 'default via 172.31.1.1 dev vmbr0 proto kernel onlink' ;;
+    "-o -6 addr show dev vmbr0 scope global") echo '2: vmbr0    inet6 2a01:4f8:1c1c:abcd::1/64 scope global \\       valid_lft forever preferred_lft forever' ;;
+  esac
+}`
+  );
+  if (!facts) return;
+  assert.equal(facts.vmbr0_ipv4, "203.0.113.20", "the address, with ip's peer form");
+  assert.equal(facts.gateway, "172.31.1.1 vmbr0");
+  assert.equal(facts.pve_services, "active active active");
+  assert.deepEqual(S.checkAfterReboot(facts, { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" }), []);
+});
+
+test("3e accepts the address whichever way ip prints it: with a peer, or as a plain /32", () => {
+  for (const line of ["2: vmbr0    inet 203.0.113.20 peer 172.31.1.1/32 scope global vmbr0", "2: vmbr0    inet 203.0.113.20/32 scope global vmbr0"]) {
+    const facts = factsFrom(S.afterRebootFactsScript(), `ip() { [ "$1 $2" = "-o -4" ] && [ "$3" = addr ] && echo '${line}'; }\nuname() { :; }\npveversion() { :; }\ncat() { :; }\nsystemctl() { :; }`);
+    if (!facts) return;
+    assert.equal(facts.vmbr0_ipv4, "203.0.113.20", line);
+  }
+  const ok = { kernel: "6.8.12-9-pve", pveversion: "pve-manager/8.4.1/abc", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active" };
+  assert.deepEqual(S.checkAfterReboot(ok, { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" }), []);
+  assert.match(S.checkAfterReboot({ ...ok, vmbr0_ipv4: "203.0.113.99" }, { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" }).join(), /vmbr0 has IPv4/);
+});
+
+test("3g: a bridge with no ports reports DOWN until its first container, and that's healthy", () => {
+  const facts = factsFrom(
+    S.outboundScript(),
+    `curl() { return 0; }
+pveam() { echo 'local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst   141.00MB'; }
+systemctl() { echo enabled; }
+pvesh() { echo '{"content":"iso,vztmpl,backup,rootdir,images","digest":"x","type":"dir"}'; }
+ip() { echo 'vmbr1            DOWN           bc:24:11:aa:bb:cc <NO-CARRIER,BROADCAST,MULTICAST,UP>'; }
+test() { return 0; }`
+  );
+  if (!facts) return;
+  assert.equal(facts.vmbr1, "<NO-CARRIER,BROADCAST,MULTICAST,UP>");
+  assert.deepEqual(S.checkHostSetup("== Done", facts), []);
+  assert.match(S.checkHostSetup("== Done", { ...facts, vmbr1: "<BROADCAST,MULTICAST>" }).join(), /vmbr1 isn't up/);
+  assert.match(S.checkHostSetup("== Done", { ...facts, vmbr1: "" }).join(), /missing/);
+});
+
+test("3f parses real sshd -T output", () => {
+  const facts = factsFrom(
+    S.firewallStatusScript(),
+    `ufw() { echo 'Status: active'; }
+sshd() { printf 'port 22\\npermitrootlogin without-password\\npasswordauthentication no\\nkbdinteractiveauthentication no\\npubkeyauthentication yes\\n'; }
+fail2ban-client() { return 0; }
+sysctl() { echo 1; }`
+  );
+  if (!facts) return;
+  assert.deepEqual([facts.sshd_password, facts.sshd_root, facts.sshd_kbd, facts.fail2ban, facts.ip_forward], ["no", "without-password", "no", "active", "1"]);
+});
+
+test("3d doesn't hold the SSH call open for the whole install", () => {
+  assert.match(S.startPveInstallScript(), /systemd-run --no-block --unit=sowsi-pve-install/);
+});
+
+test("3h finds the token JSON even with other output around it", () => {
+  const json = JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: 0 }, value: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" }, null, 2);
+  assert.equal(S.parseTokenSecret(`perl: warning: Setting locale failed.\n${json}\n`), "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0");
 });

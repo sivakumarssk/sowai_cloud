@@ -226,7 +226,8 @@ if [[ $state == active && $result == success ]]; then echo "already=done"; exit 
 if [[ $state == activating ]]; then echo "already=running"; exit 0; fi
 systemctl reset-failed ${PVE_INSTALL_UNIT} 2>/dev/null || true
 systemctl stop ${PVE_INSTALL_UNIT} 2>/dev/null || true
-systemd-run --unit=${PVE_INSTALL_UNIT} --property=Type=oneshot --property=RemainAfterExit=yes /root/${PVE_INSTALL_UNIT}.sh
+# --no-block: without it systemd-run waits for a oneshot unit to finish, keeping this SSH call open for the whole install.
+systemd-run --no-block --unit=${PVE_INSTALL_UNIT} --property=Type=oneshot --property=RemainAfterExit=yes /root/${PVE_INSTALL_UNIT}.sh
 echo "started=yes"`;
 }
 
@@ -248,7 +249,7 @@ export const REBOOT_SCRIPT = "systemd-run --on-active=3 /bin/systemctl reboot &&
 export function afterRebootFactsScript(): string {
   return `echo "kernel=$(uname -r)"
 echo "pveversion=$(pveversion 2>/dev/null | head -1)"
-echo "vmbr0_ipv4=$(ip -o -4 addr show dev vmbr0 2>/dev/null | awk '{print $4; exit}')"
+echo "vmbr0_ipv4=$(ip -o -4 addr show dev vmbr0 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1)"
 echo "gateway=$(ip -o -4 route show to default | awk '{print $3" "$5; exit}')"
 echo "ipv6=$(ip -o -6 addr show dev vmbr0 scope global 2>/dev/null | awk '{print $4; exit}')"
 echo "pve_services=$(systemctl is-active pve-cluster pvedaemon pveproxy | tr '\\n' ' ')"
@@ -259,7 +260,8 @@ export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4
   const problems: string[] = [];
   if (!facts.kernel?.endsWith("-pve")) problems.push(`running kernel "${facts.kernel}" isn't a Proxmox kernel`);
   if (!facts.pveversion?.startsWith("pve-manager/")) problems.push(`pveversion says "${facts.pveversion}"`);
-  if (facts.vmbr0_ipv4 !== `${expected.ipv4}/32`) problems.push(`vmbr0 has IPv4 "${facts.vmbr0_ipv4}", expected ${expected.ipv4}/32`);
+  // With pointopoint, ip prints "inet A peer 172.31.1.1/32": the address alone is compared.
+  if (facts.vmbr0_ipv4 !== expected.ipv4) problems.push(`vmbr0 has IPv4 "${facts.vmbr0_ipv4}", expected ${expected.ipv4}`);
   if (facts.gateway !== `${HETZNER_GATEWAY4} vmbr0`) problems.push(`default route is "${facts.gateway}", expected via ${HETZNER_GATEWAY4} on vmbr0`);
   if (facts.ipv6 !== `${expected.ipv6Subnet}::1/64`) problems.push(`vmbr0 has IPv6 "${facts.ipv6}", expected ${expected.ipv6Subnet}::1/64`);
   if (facts.pve_services !== "active active active") problems.push(`Proxmox services: ${facts.pve_services} (pve-cluster pvedaemon pveproxy)`);
@@ -274,7 +276,8 @@ export function firewallStatusScript(): string {
 echo "sshd_password=$(sshd -T | awk '$1=="passwordauthentication"{print $2}')"
 echo "sshd_root=$(sshd -T | awk '$1=="permitrootlogin"{print $2}')"
 echo "sshd_kbd=$(sshd -T | awk '$1=="kbdinteractiveauthentication"{print $2}')"
-echo "fail2ban=$(fail2ban-client status sshd >/dev/null 2>&1 && echo active || echo inactive)"`;
+echo "fail2ban=$(fail2ban-client status sshd >/dev/null 2>&1 && echo active || echo inactive)"
+echo "ip_forward=$(sysctl -n net.ipv4.ip_forward)"`;
 }
 
 /** Runs before Proxmox is installed, on plain Debian: rules can name vmbr1 before it exists. */
@@ -282,7 +285,12 @@ export function firewallScript(mgmtIp: string): string {
   return `set -euo pipefail
 ${APT} update
 ${APT} install ufw fail2ban python3-systemd
+# A clean start, so a half-applied firewall from an earlier run can't matter.
 ufw --force reset >/dev/null
+# ufw reports "disabled (routed)" while the kernel doesn't forward, whatever its policy says.
+# proxmox-host-setup.sh adds IPv6 forwarding once the bridges exist.
+grep -qs '^net.ipv4.ip_forward *= *1' /etc/sysctl.d/99-sowsi-routing.conf || echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.d/99-sowsi-routing.conf
+sysctl -q -w net.ipv4.ip_forward=1
 ufw default deny incoming
 ufw default allow outgoing
 ufw default allow routed
@@ -304,7 +312,9 @@ ignoreip = 127.0.0.1/8 ::1 ${mgmtIp}
 EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
-# Key-only SSH. 00- sorts first, and sshd keeps the first value it reads (cloud-init writes 50-cloud-init.conf).
+# Key-only SSH, set explicitly. 00- sorts first, and sshd keeps the first value it reads
+# (cloud-init writes 50-cloud-init.conf). checkFirewall reads the result from sshd -T.
+grep -qE '^Include /etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
 cat > /etc/ssh/sshd_config.d/00-sowsi.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -322,16 +332,25 @@ export function checkFirewall(output: string, mgmtIp: string): string[] {
   const ufw = /ufw<<([\s\S]*)>>ufw/.exec(output)?.[1] ?? "";
   const facts = parseFacts(output);
   if (!/Status: active/.test(ufw)) problems.push("ufw is not active");
-  if (!/Default: deny \(incoming\), allow \(outgoing\), allow \(routed\)/.test(ufw)) problems.push("ufw defaults aren't deny incoming / allow outgoing / allow routed");
+  const defaults = /Default: (\S+) \(incoming\), (\S+) \(outgoing\), (\S+) \(routed\)/.exec(ufw);
+  if (!defaults) problems.push("ufw status has no Default: line");
+  else {
+    if (defaults[1] !== "deny") problems.push(`ufw default incoming is "${defaults[1]}", expected deny`);
+    if (defaults[2] !== "allow") problems.push(`ufw default outgoing is "${defaults[2]}", expected allow`);
+    if (defaults[3] === "disabled") problems.push('ufw shows "disabled (routed)": the kernel isn\'t forwarding, so containers behind vmbr1 would have no internet');
+    else if (defaults[3] !== "allow") problems.push(`ufw default routed is "${defaults[3]}", expected allow`);
+  }
+  if (facts.ip_forward !== "1") problems.push(`net.ipv4.ip_forward is ${facts.ip_forward || "unknown"}, expected 1`);
   for (const port of ["22", "80", "443"]) {
     if (!new RegExp(`^${port}/tcp\\s+ALLOW IN\\s+Anywhere`, "m").test(ufw)) problems.push(`port ${port} isn't open`);
   }
-  if (!new RegExp(`^8006/tcp\\s+ALLOW IN\\s+${mgmtIp.replace(/\./g, "\\.")}`, "m").test(ufw)) problems.push(`8006 isn't limited to ${mgmtIp}`);
-  if (/^8006(\/tcp)?\s+ALLOW IN\s+Anywhere/m.test(ufw)) problems.push("8006 is open to everyone");
-  if (!/ALLOW FWD\s+Anywhere on vmbr1/.test(ufw)) problems.push("routed traffic from vmbr1 isn't allowed");
-  if (facts.sshd_password !== "no") problems.push(`sshd PasswordAuthentication is ${facts.sshd_password}`);
-  if (facts.sshd_kbd !== "no") problems.push(`sshd KbdInteractiveAuthentication is ${facts.sshd_kbd}`);
-  if (facts.sshd_root !== "without-password" && facts.sshd_root !== "prohibit-password") problems.push(`sshd PermitRootLogin is ${facts.sshd_root}`);
+  if (!new RegExp(`^8006/tcp\\s+ALLOW IN\\s+${mgmtIp.replace(/\./g, "\\.")}(\\s|$)`, "m").test(ufw)) problems.push(`8006 isn't limited to ${mgmtIp}`);
+  if (/^8006(\/tcp)?(\s+\(v6\))?\s+ALLOW IN\s+Anywhere/m.test(ufw)) problems.push("8006 is open to everyone");
+  if (!/ALLOW FWD\s+Anywhere on vmbr1/.test(ufw) || !/Anywhere on vmbr1\s+ALLOW FWD/.test(ufw)) problems.push("routed traffic on vmbr1 isn't allowed both ways");
+  // What sshd actually enforces, from sshd -T. It prints prohibit-password as "without-password".
+  if (facts.sshd_password !== "no") problems.push(`sshd passwordauthentication is ${facts.sshd_password || "unknown"}, expected no`);
+  if (facts.sshd_kbd !== "no") problems.push(`sshd kbdinteractiveauthentication is ${facts.sshd_kbd || "unknown"}, expected no`);
+  if (facts.sshd_root !== "without-password" && facts.sshd_root !== "prohibit-password") problems.push(`sshd permitrootlogin is ${facts.sshd_root || "unknown"}, expected prohibit-password`);
   if (facts.fail2ban !== "active") problems.push("fail2ban's sshd jail isn't running");
   return problems;
 }
@@ -351,7 +370,7 @@ echo "out6=$(curl -6 -fsS -o /dev/null -m 15 ${OUTBOUND_URL} && echo ok || echo 
 echo "template=$(pveam list local 2>/dev/null | grep -c ubuntu-22.04-standard)"
 echo "routes_service=$(systemctl is-enabled sowsi-routes.service 2>/dev/null)"
 echo "dispatcher=$(test -x /usr/local/sbin/sowsi-host && echo yes || echo no)"
-echo "vmbr1=$(ip -br link show vmbr1 2>/dev/null | awk '{print $2}')"
+echo "vmbr1=$(ip -br link show vmbr1 2>/dev/null | awk '{print $NF}')"
 echo "storage=$(pvesh get /storage/local --output-format json | sed -n 's/.*"content":"\\([^"]*\\)".*/\\1/p')"`;
 }
 
@@ -363,7 +382,8 @@ export function checkHostSetup(setupOutput: string, facts: Record<string, string
   if (!(Number(facts.template) >= 1)) problems.push("the Ubuntu 22.04 LXC template isn't downloaded");
   if (facts.routes_service !== "enabled") problems.push("sowsi-routes.service isn't enabled");
   if (facts.dispatcher !== "yes") problems.push("/usr/local/sbin/sowsi-host is missing");
-  if (!facts.vmbr1 || facts.vmbr1 === "DOWN") problems.push(`vmbr1 is ${facts.vmbr1 || "missing"}`);
+  // Its state column says DOWN (no carrier) until the first container: read the UP flag instead.
+  if (!/[<,]UP[,>]/.test(facts.vmbr1 ?? "")) problems.push(`vmbr1 isn't up (${facts.vmbr1 || "missing"})`);
   const content = `,${facts.storage ?? ""},`;
   for (const type of ["rootdir", "images", "vztmpl"]) if (!content.includes(`,${type},`)) problems.push(`storage "local" lacks ${type}`);
   return problems;
@@ -382,7 +402,7 @@ pveum user token add root@pam ${API_TOKEN_NAME} --privsep 0 --comment 'Sowsi eng
 export function parseTokenSecret(output: string): string {
   let parsed: { "full-tokenid"?: string; value?: string; info?: { privsep?: string | number } };
   try {
-    parsed = JSON.parse(output.trim().split("\n").filter((l) => l.trim().startsWith("{")).join("") || output);
+    parsed = JSON.parse(output.slice(output.indexOf("{"), output.lastIndexOf("}") + 1));
   } catch {
     throw new Error("pveum didn't print the token as JSON");
   }
