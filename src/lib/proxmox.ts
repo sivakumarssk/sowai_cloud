@@ -115,19 +115,16 @@ export function envToken(): ProxmoxToken {
   return { tokenId: `${requireEnv("PROXMOX_USER")}!${requireEnv("PROXMOX_TOKEN_ID")}`, secret: requireEnv("PROXMOX_TOKEN_SECRET") };
 }
 
-/**
- * The token of a registered node: its own (ProxmoxNode.apiTokenId / apiTokenSecret,
- * set by scripts/node/install-node.ts), else the .env token. Loaded lazily so this
- * module doesn't pull Prisma into everything that imports it.
- */
+/** A node's own token (each node generates its own secret), else the .env token (node 1). */
+export function nodeToken(row: { apiTokenId: string | null; apiTokenSecret: string | null } | null, decrypt: (value: string) => string): ProxmoxToken {
+  return row?.apiTokenId && row.apiTokenSecret ? { tokenId: row.apiTokenId, secret: decrypt(row.apiTokenSecret) } : envToken();
+}
+
+/** Loaded lazily so this module doesn't pull Prisma into everything that imports it. */
 async function registeredToken(nodeName: string): Promise<ProxmoxToken> {
   const { prisma } = await import("@/lib/prisma");
-  const row = await prisma.proxmoxNode.findUnique({ where: { name: nodeName }, select: { apiTokenId: true, apiTokenSecret: true } });
-  if (row?.apiTokenId && row.apiTokenSecret) {
-    const { decrypt } = await import("@/lib/crypto");
-    return { tokenId: row.apiTokenId, secret: decrypt(row.apiTokenSecret) };
-  }
-  return envToken();
+  const { decrypt } = await import("@/lib/crypto");
+  return nodeToken(await prisma.proxmoxNode.findUnique({ where: { name: nodeName }, select: { apiTokenId: true, apiTokenSecret: true } }), decrypt);
 }
 
 export class ProxmoxService {

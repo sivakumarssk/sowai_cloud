@@ -14,12 +14,11 @@ import { spentThisMonthPaise } from "@/engine/data/spend";
 import { loadEngineSettings } from "@/engine/core/policy";
 import { alertAdmins } from "@/lib/adminAlert";
 import { decrypt, encrypt } from "@/lib/crypto";
+import { installHetznerApi, keyId } from "./hetznerApi";
 import { HostKeyMismatchError, SshAuthError, type InstallDeps, type InstallRecord, type InstallSettings, type Shell } from "./installNode";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** Type + base64 body of an OpenSSH public key (the comment doesn't count). */
-const keyId = (publicKey: string) => publicKey.trim().split(/\s+/).slice(0, 2).join(" ");
 
 /** The dedicated install key on sowsi-mgmt-01 — never a personal key, never the provisioning key. */
 export function installKeyPath(env = process.env): string {
@@ -72,32 +71,7 @@ const toRecord = (r: NonNullable<Awaited<ReturnType<typeof prisma.nodeInstall.fi
 
 export function prismaInstallDeps(): InstallDeps {
   return {
-    hetzner: {
-      prices: (t, l) => hetzner.prices(t, l),
-      serverTypeAvailable: (t, l) => hetzner.serverTypeAvailable(t, l),
-      findServerByName: (n) => hetzner.findServerByName(n),
-      getServer: (id) => hetzner.getServer(id),
-      createServer: (i) => hetzner.createServer(i),
-      deleteServer: (id) => hetzner.deleteServer(id),
-      async ensureSshKey(name, publicKey) {
-        const existing = (await hetzner.listSshKeys()).find((k) => keyId(k.publicKey) === keyId(publicKey));
-        if (existing) return { id: existing.id, created: false };
-        // Names are unique in a project: an old entry under the same name with another key gets a suffix.
-        const taken = (await hetzner.listSshKeys()).some((k) => k.name === name);
-        const created = await hetzner.createSshKey(taken ? `${name}-${Date.now()}` : name, publicKey, { "sowsi-key": name });
-        return { id: created.id, created: true };
-      },
-      async removeSshKey(publicKey) {
-        const existing = (await hetzner.listSshKeys()).find((k) => keyId(k.publicKey) === keyId(publicKey));
-        if (!existing) return false;
-        await hetzner.deleteSshKey(existing.id);
-        return true;
-      },
-      buyFloatingIP: (label, location) => hetzner.buyFloatingIP(label, location),
-      assignFloatingIP: (id, serverId) => hetzner.assignFloatingIP(id, serverId),
-      releaseFloatingIP: (id) => hetzner.releaseFloatingIP(id),
-      floatingIpExists: async (id) => (await hetzner.getFloatingIP(id)) !== null,
-    },
+    hetzner: installHetznerApi(hetzner),
 
     keys: {
       async installPublicKey(create) {
@@ -182,7 +156,7 @@ export function prismaInstallDeps(): InstallDeps {
 export function installSettings(env = process.env): InstallSettings {
   const problems: string[] = [];
   const expectedHost = env.NODE_INSTALL_FROM_HOST?.trim() || "sowsi-mgmt-01";
-  if (hostname() !== expectedHost) problems.push(`this runs only on ${expectedHost} (this is ${hostname()}; NODE_INSTALL_FROM_HOST)`);
+  const wrongHost = hostname() === expectedHost ? null : `this runs only on ${expectedHost} (this is ${hostname()}; NODE_INSTALL_FROM_HOST)`;
 
   const addrs = Object.values(networkInterfaces()).flat().filter((a): a is NonNullable<typeof a> => Boolean(a));
   const mgmtIp = env.MGMT_PUBLIC_IP?.trim() ?? "";
@@ -217,6 +191,7 @@ export function installSettings(env = process.env): InstallSettings {
     mgmtIp,
     mgmtHasIpv6,
     protectedServerId: env.HETZNER_SERVER_ID?.trim() || null,
+    wrongHost,
     eurToInr: rate,
     spendCapPaise: loadEngineSettings(env).spendCapPaise,
     sshTimeoutMs: Number(env.NODE_SSH_TIMEOUT_SECONDS || 300) * 1000,

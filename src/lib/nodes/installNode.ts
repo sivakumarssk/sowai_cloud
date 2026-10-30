@@ -7,7 +7,7 @@
 // container. The new node is registered closed (PROVISIONING, no new clients).
 //
 // Not wired to the engine or approvals: only scripts/node/install-node.ts calls this.
-import type { HetznerPrice, HetznerServer } from "@/lib/hetzner";
+import { serverTypeOffer, type ApiServerType, type HetznerPrice, type HetznerServer, type ServerDeleted } from "@/lib/hetzner";
 import { ipv6ForVmid } from "@/lib/provisioning/nodeTarget";
 import * as S from "./nodeScripts";
 
@@ -73,12 +73,12 @@ export type NodeRegistration = {
 
 export type InstallDeps = {
   hetzner: {
-    prices(serverType: string, location: string): Promise<{ server: HetznerPrice | null; primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }>;
-    serverTypeAvailable(serverType: string, location: string): Promise<{ known: boolean; available: boolean }>;
+    getServerType(name: string): Promise<ApiServerType | null>;
+    ipPrices(location: string): Promise<{ primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }>;
     findServerByName(name: string): Promise<HetznerServer | null>;
     getServer(id: number): Promise<HetznerServer | null>;
     createServer(input: { name: string; serverType: string; location: string; image: string; sshKeyIds: number[]; labels: Record<string, string> }): Promise<HetznerServer>;
-    deleteServer(id: number): Promise<void>;
+    deleteServer(id: number): Promise<ServerDeleted>;
     /** The project's SSH key entry for this public key, registering it under `name` if missing. */
     ensureSshKey(name: string, publicKey: string): Promise<{ id: number; created: boolean }>;
     /** Removes the project's entry for this public key, if any. */
@@ -138,22 +138,26 @@ export type InstallSettings = {
   sshTimeoutMs: number;
   rebootTimeoutMs: number;
   installTimeoutMs: number;
-  /** Problems with the machine this runs on (wrong host, missing keys…), found by the script. */
+  /** Set when this isn't sowsi-mgmt-01. Refuses installs and --destroy alike. */
+  wrongHost: string | null;
+  /** Problems with the machine this runs on (missing keys…), found by the script. */
   environmentProblems: string[];
 };
 
 export const INSTALL_LABEL = "sowsi-node-install";
-export const STEPS = ["server", "ssh", "hostname", "bridge", "proxmox", "reboot", "firewall", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
+// The firewall comes before the Proxmox install, so port 8006 is never open to the
+// internet: ufw is already denying it when pveproxy first starts listening.
+export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "proxmox", "reboot", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
 export type StepId = (typeof STEPS)[number];
 
 export const STEP_TITLES: Record<StepId, string> = {
   server: "1  buy the Hetzner server",
   ssh: "3a wait for SSH (install key), pin the host key",
   hostname: "3b hostname and /etc/hosts",
+  firewall: "3f ufw, fail2ban, key-only SSH (before Proxmox, so 8006 is never open)",
   bridge: "3c write vmbr0 (/32, point-to-point to 172.31.1.1) and verify it",
   proxmox: "3d install Proxmox VE, remove the Debian kernel, verify, reboot",
   reboot: "3e wait for SSH after the reboot, check the Proxmox kernel and network",
-  firewall: "3f ufw, fail2ban, key-only SSH",
   "host-setup": "3g proxmox-host-setup.sh (vmbr1, routes, sowsi-host, storage, template)",
   "api-token": "3h Proxmox API token, stored encrypted; check :8006 from sowsi-mgmt-01",
   lockdown: "3i provisioning key in (restricted), install key out",
@@ -205,20 +209,20 @@ export type Cost = { monthlyPaise: number; hourlyPaise: number; lines: string[] 
 
 const inr = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
-export async function serverCost(deps: InstallDeps, serverType: string, s: InstallSettings, withIpv4Test: boolean): Promise<Cost | { error: string }> {
-  const p = await deps.hetzner.prices(serverType, s.location);
-  if (!p.server) return { error: `Hetzner has no price for ${serverType} in ${s.location} — unknown type or not sold there` };
-  const ip = p.primaryIpv4 ?? { hourlyEur: 0, monthlyEur: 0 };
-  const monthlyEur = p.server.monthlyEur + ip.monthlyEur;
-  const hourlyEur = p.server.hourlyEur + ip.hourlyEur;
+/** The server's price plus its Primary IPv4. A missing price is an error, never a zero. */
+export function serverCost(serverType: string, price: HetznerPrice, ips: { primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }, s: InstallSettings, withIpv4Test: boolean): Cost | { error: string } {
+  const ip = ips.primaryIpv4;
+  if (!ip) return { error: `Hetzner's pricing has no Primary IPv4 price for ${s.location}` };
+  const monthlyEur = price.monthlyEur + ip.monthlyEur;
+  const hourlyEur = price.hourlyEur + ip.hourlyEur;
   const monthlyPaise = Math.ceil(monthlyEur * s.eurToInr * 100);
   const hourlyPaise = Math.ceil(hourlyEur * s.eurToInr * 100);
   const lines = [
-    `${serverType} in ${s.location}: €${p.server.monthlyEur.toFixed(2)}/month, €${p.server.hourlyEur.toFixed(4)}/hour (gross)`,
-    `primary IPv4: €${ip.monthlyEur.toFixed(2)}/month`,
-    `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.eurToInr}/€, HETZNER_EUR_TO_INR). Billed hourly until deleted; a started hour is billed in full.`,
+    `${serverType} in ${s.location}: €${price.monthlyEur.toFixed(2)}/month, €${price.hourlyEur.toFixed(4)}/hour (gross)`,
+    `primary IPv4: €${ip.monthlyEur.toFixed(2)}/month, €${ip.hourlyEur.toFixed(4)}/hour`,
+    `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.eurToInr}/€, HETZNER_EUR_TO_INR). Billed hourly until deleted.`,
   ];
-  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 (€${(p.floatingIpv4MonthlyEur ?? 0).toFixed(2)}/month list price), released right after the test`);
+  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 (€${(ips.floatingIpv4MonthlyEur ?? 0).toFixed(2)}/month list price), released right after the test`);
   return { monthlyPaise, hourlyPaise, lines };
 }
 
@@ -229,7 +233,7 @@ export type InstallOptions = { name: string; serverType: string; ipv4Test: boole
 export type InstallPlan = { ok: boolean; problems: string[]; resumeFrom: StepId | null; install: InstallRecord | null; cost: Cost | null };
 
 export async function planInstall(deps: InstallDeps, o: InstallOptions, s: InstallSettings): Promise<InstallPlan> {
-  const problems = [...validateArgs(o.name, o.serverType), ...s.environmentProblems];
+  const problems = [...(s.wrongHost ? [s.wrongHost] : []), ...validateArgs(o.name, o.serverType), ...s.environmentProblems];
   if (problems.length) return { ok: false, problems, resumeFrom: null, install: null, cost: null };
 
   if (await deps.db.nodeNameTaken(o.name)) problems.push(`a ProxmoxNode named ${o.name} is already registered`);
@@ -248,14 +252,29 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
   } else {
     const existing = await deps.hetzner.findServerByName(o.name);
     if (existing) problems.push(`a Hetzner server named ${o.name} already exists (id ${existing.id}) and isn't one this installer is running — pick another --name`);
-    const availability = await deps.hetzner.serverTypeAvailable(o.serverType, s.location);
-    if (!availability.known) problems.push(`${o.serverType} isn't a Hetzner server type`);
-    else if (!availability.available) problems.push(`${o.serverType} isn't available in ${s.location} right now`);
   }
 
-  const costOrError = await serverCost(deps, o.serverType, s, o.ipv4Test);
-  const cost = "error" in costOrError ? null : costOrError;
-  if ("error" in costOrError) problems.push(costOrError.error);
+  // Availability and price come from the server type's own entry. If they can't be read, the plan fails.
+  let cost: Cost | null = null;
+  const buying = resumeFrom === "server";
+  try {
+    const [type, ips] = await Promise.all([deps.hetzner.getServerType(o.serverType), deps.hetzner.ipPrices(s.location)]);
+    if (!type) {
+      if (buying) problems.push(`${o.serverType} isn't a Hetzner server type`);
+    } else {
+      const offer = serverTypeOffer(type, s.location);
+      if (buying && !offer.buyable) problems.push(offer.reason!);
+      if (buying && type.architecture !== "x86") problems.push(`${o.serverType} is ${type.architecture} — Proxmox VE's packages are x86 (amd64) only`);
+      if (offer.price) {
+        const c = serverCost(o.serverType, offer.price, ips, s, o.ipv4Test);
+        if ("error" in c) problems.push(c.error);
+        else cost = c;
+      }
+    }
+  } catch (err) {
+    if (buying) problems.push(`can't read availability and prices from Hetzner, so nothing can be bought: ${errMsg(err)}`);
+  }
+
   if (cost && resumeFrom === "server") {
     const spent = await deps.db.spentThisMonthPaise();
     if (spent + cost.monthlyPaise > s.spendCapPaise) {
@@ -394,6 +413,10 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const already = S.parseFacts(await onNode(ctx, "kernel", "echo \"kernel=$(uname -r)\""));
     if (already.kernel?.endsWith("-pve")) return "already running a Proxmox kernel";
 
+    // Proxmox opens 8006 as soon as it is installed: never start without the firewall up.
+    const before = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
+    if (before.length) fail("firewall check (Proxmox not installed)", before);
+
     const started = await onNode(ctx, "start Proxmox install", S.startPveInstallScript(), { stdin: S.pveInstallScript() });
     ctx.deps.report(`      ${started.includes("already=done") ? "install already finished" : "installing proxmox-ve (10–20 min)…"}`);
     const deadline = ctx.deps.now() + s.installTimeoutMs;
@@ -437,6 +460,8 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     }
     const problems = S.checkAfterReboot(facts, { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! });
     if (problems.length) fail("after reboot", problems);
+    const firewall = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
+    if (firewall.length) fail("firewall check after the reboot", firewall);
     return `${facts.pveversion} on ${facts.kernel}`;
   },
 
@@ -444,7 +469,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const out = await onNode(ctx, "firewall", S.firewallScript(ctx.s.mgmtIp), { timeoutMs: 10 * 60_000 });
     const problems = S.checkFirewall(out, ctx.s.mgmtIp);
     if (problems.length) fail("firewall", problems);
-    return `deny incoming; 22/80/443 open; 8006 from ${ctx.s.mgmtIp} only; routed allow on vmbr1; fail2ban; key-only SSH`;
+    return `deny incoming; 22/80/443 open; 8006 from ${ctx.s.mgmtIp} only (before Proxmox exists); routed allow on vmbr1; fail2ban; key-only SSH`;
   },
 
   async "host-setup"(ctx) {
@@ -667,9 +692,10 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
       cleanup.push(`server ${serverId} NOT deleted: ${blocked}`);
     } else {
       try {
-        await deps.hetzner.deleteServer(Number(serverId));
+        const { primaryIpsLeft } = await deps.hetzner.deleteServer(Number(serverId));
         serverDeleted = (await deps.hetzner.getServer(Number(serverId))) === null;
         if (!serverDeleted) cleanup.push(`server ${serverId} still exists after delete`);
+        if (primaryIpsLeft.length) cleanup.push(`Primary IP(s) ${primaryIpsLeft.join(", ")} still exist and bill hourly — delete them in the Hetzner Console`);
       } catch (e) {
         cleanup.push(`server ${serverId} NOT deleted: ${errMsg(e)}`);
       }
@@ -705,7 +731,7 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
 export type DestroyPlan = { ok: boolean; problems: string[]; lines: string[]; server: HetznerServer | null; install: InstallRecord | null; nodeId: string | null };
 
 export async function planDestroy(deps: InstallDeps, serverId: string, s: InstallSettings): Promise<DestroyPlan> {
-  const problems: string[] = [];
+  const problems: string[] = s.wrongHost ? [s.wrongHost] : [];
   const lines: string[] = [];
   if (!/^\d+$/.test(serverId)) return { ok: false, problems: [`--destroy needs a numeric Hetzner server id, got "${serverId}"`], lines, server: null, install: null, nodeId: null };
   if (s.protectedServerId && serverId === s.protectedServerId) problems.push(`server ${serverId} is HETZNER_SERVER_ID (node 1) — never destroyed by this script`);
@@ -716,7 +742,7 @@ export async function planDestroy(deps: InstallDeps, serverId: string, s: Instal
   const blocked = await customerProblem(deps, serverId, install?.apiTokenSecret ? deps.decrypt(install.apiTokenSecret) : null, install?.ipv4 ? { name: install.name, ip: install.ipv4 } : null);
   if (blocked) problems.push(`refusing: ${blocked}`);
 
-  if (server) lines.push(`delete Hetzner server ${server.id} ${server.name} (${server.serverType}, ${server.ipv4}) — saves ${install ? `${inr(install.monthlyCostPaise)}/month` : "its monthly cost"}`);
+  if (server) lines.push(`delete Hetzner server ${server.id} ${server.name} (${server.serverType}, ${server.ipv4}) and its Primary IPs ${server.primaryIpIds.join(", ") || "(none)"} — saves ${install ? `${inr(install.monthlyCostPaise)}/month` : "its monthly cost"}`);
   else lines.push(`server ${serverId} is already gone at Hetzner`);
   if (install?.testFloatingIpId) lines.push(`release test Floating IP ${install.testFloatingIpId}`);
   if (node) lines.push(`remove ProxmoxNode ${node.name} (no services, no volumes)`);
@@ -734,9 +760,11 @@ export async function executeDestroy(deps: InstallDeps, serverId: string, approv
     done.push(`released Floating IP ${plan.install.testFloatingIpId}`);
   }
   if (plan.server) {
-    await deps.hetzner.deleteServer(plan.server.id);
+    const { primaryIpsRemoved, primaryIpsLeft } = await deps.hetzner.deleteServer(plan.server.id);
     if (await deps.hetzner.getServer(plan.server.id)) return { ok: false, lines: [...done, `server ${plan.server.id} still exists after delete`] };
     done.push(`deleted server ${plan.server.id}`);
+    if (primaryIpsRemoved.length) done.push(`deleted leftover Primary IP(s) ${primaryIpsRemoved.join(", ")}`);
+    if (primaryIpsLeft.length) return { ok: false, lines: [...done, `Primary IP(s) ${primaryIpsLeft.join(", ")} still exist and bill hourly — delete them in the Hetzner Console`] };
   }
   if (plan.nodeId) {
     await deps.db.deleteNode(plan.nodeId);

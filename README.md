@@ -20,7 +20,7 @@ Every process (the web app, `next build`, the engine and every script) reads
 | `PROVISIONER` | `simulated` (never builds a server, never shows an IP) | `proxmox` |
 | Hetzner / Proxmox tokens | refused unless `ALLOW_REAL_INFRA=1` | required |
 | Billing cron (`/api/cron/billing`) | refuses (503) | runs |
-| Engine (`decide.ts --live`) | refuses | runs (PM2 `sowsi-engine`) |
+| Engine (`decide.ts --live`) | refuses | off for now: `sowsi-engine` isn't running, and no deploy step starts it |
 | Seed | `npm run db:seed` (demo admin with a known password) | `npx tsx scripts/prod/seed.ts` (plans and node only, no users) |
 | Database | the **old** database | a **new**, empty database |
 
@@ -31,7 +31,7 @@ your machine (development)            sowsi-mgmt-01 2.31.11.105 (production)
   webnext/ · APP_ENV=development        /var/www/sowsicloud · APP_ENV=production
   rzp_test_ keys                        rzp_live_ keys, Razorpay webhook → /api/payment/webhook
   DATABASE_URL → old database           DATABASE_URL → new database
-                                        PM2: web app, sowsi-engine (decide.ts --live)
+                                        PM2: web app (sowsi-engine stays off)
                                         cron: POST /api/cron/billing every 5–15 min
                                         reaches Proxmox :8006 (closed to everything else)
 
@@ -77,7 +77,7 @@ Run all of this on sowsi-mgmt-01 in `/var/www/sowsicloud`.
    - Check that every line under his `sub_…` id is ✓.
    - His service arrives as a **manual server on billing hold**, shown to him as
      "Setting up".
-6. **Build and switch:** `npm run build && pm2 restart <web app> sowsi-engine`
+6. **Build and switch:** `npm run build && pm2 restart <web app>`
    (`pm2 ls` shows the names). The build refuses if the environment is wrong.
 7. **Admin:** sign up on the site, then run
    `npx tsx scripts/prod/make-admin.ts <your email>`. Sign out and back in.
@@ -100,7 +100,7 @@ Run all of this on sowsi-mgmt-01 in `/var/www/sowsicloud`.
 
 ```bash
 git pull && npm ci && npx prisma migrate deploy && npx prisma generate
-npm run test:engine && npm run build && pm2 restart <web app> sowsi-engine
+npm run test:engine && npm run build && pm2 restart <web app>
 ```
 
 ## What protects paying clients
@@ -125,28 +125,48 @@ npm run test:engine && npm run build && pm2 restart <web app> sowsi-engine
 
 `scripts/node/install-node.ts` turns a fresh Debian 12 Hetzner Cloud server
 into a Proxmox node. It runs only on sowsi-mgmt-01 with `APP_ENV=production`,
-and isn't wired to the engine or approvals yet.
+one at a time, and isn't wired to the engine or approvals yet.
 
 ```bash
-npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32                                    # plan: cost, checks
-npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32 --execute --approved-by <you>      # buy + install (~25 min)
+npx tsx scripts/node/hetzner-check.ts --type cpx22                                                           # read-only: every Hetzner endpoint we use
+npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx22                                    # plan: cost, checks
+npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx22 --execute --approved-by <you>      # buy + install (~25 min)
 npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --approved-by <you>]             # remove a throwaway node
 ```
 
 - **What it does:**
-  1. Buys the server, checked against the monthly spend cap.
-  2. Installs Proxmox on it.
+  1. Buys the server, checked against the monthly spend cap. Availability and
+     price are read from the type's entry for nbg1; if they can't be read,
+     nothing is bought.
+  2. Turns on the firewall, then installs Proxmox, so port 8006 is never open
+     to the internet.
   3. Proves the node works with a test container, then deletes the container.
   4. Registers the node **closed**: status PROVISIONING, `acceptNewClients=false`.
 - **Re-runs and failures:** re-running with the same `--name` resumes at the
-  first unfinished step. Any failure deletes the server, unless you pass
-  `--keep-on-failure`.
+  first unfinished step. Any failure deletes the server and its Primary IPs,
+  unless you pass `--keep-on-failure`.
 - **Settings it needs in `.env`:** `MGMT_PUBLIC_IP` and
   `NODE_ADMIN_SSH_PUBLIC_KEY` (see `.env.example`).
-- **Opening the node:** only once you're happy with it.
+- **Before opening a second node:** `src/lib/billing/suspension.ts` still talks
+  to node 1 only. Fix that first, or suspending a node-2 service acts on the
+  same VM id on node 1.
+- **Opening the node:** only once you're happy with it, and after the fix above.
   ```sql
   update "ProxmoxNode" set status = 'READY', "acceptNewClients" = true where name = 'sowsi-proxmox-02';
   ```
+
+Reading the database on sowsi-mgmt-01 (`psql` doesn't accept `?schema=`):
+
+```bash
+DB=$(grep '^DATABASE_URL=' .env | cut -d= -f2- | tr -d '"' | sed 's/?.*//')
+psql "$DB" -c 'select name, status, "acceptNewClients", "physicalRamMB", "physicalDiskGB" from "ProxmoxNode";'
+```
+
+Checking port 8006 from a Windows laptop (must print `TcpTestSucceeded : False`):
+
+```powershell
+Test-NetConnection <node ip> -Port 8006
+```
 
 ## Rollback
 
@@ -154,14 +174,14 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   new schema.
   ```bash
   git log --oneline -5                     # pick the last good commit
-  git checkout <sha> && npm ci && npm run build && pm2 restart <web app> sowsi-engine
+  git checkout <sha> && npm ci && npm run build && pm2 restart <web app>
   ```
   Go back to `master` afterwards with `git checkout master`.
 - **Back to the old database:**
   1. `cp .env.old-db .env`.
   2. Make sure it says `APP_ENV=production` and `PROVISIONER=proxmox`, or the
      app refuses to start.
-  3. Run `npm run build && pm2 restart <web app> sowsi-engine`.
+  3. Run `npm run build && pm2 restart <web app>`.
   4. Then reconcile by hand. Anything recorded in the new database after the
      switch isn't in the old one:
      ```sql

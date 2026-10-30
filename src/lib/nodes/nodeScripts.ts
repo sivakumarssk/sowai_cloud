@@ -266,10 +266,21 @@ export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4
   return problems;
 }
 
-// ── f) firewall, fail2ban, key-only SSH ─────────────────────────────
+// ── f) firewall, fail2ban, key-only SSH (before the Proxmox install) ─
 
+/** Prints the firewall and SSH state. Changes nothing. */
+export function firewallStatusScript(): string {
+  return `echo "ufw<<"; ufw status verbose; echo ">>ufw"
+echo "sshd_password=$(sshd -T | awk '$1=="passwordauthentication"{print $2}')"
+echo "sshd_root=$(sshd -T | awk '$1=="permitrootlogin"{print $2}')"
+echo "sshd_kbd=$(sshd -T | awk '$1=="kbdinteractiveauthentication"{print $2}')"
+echo "fail2ban=$(fail2ban-client status sshd >/dev/null 2>&1 && echo active || echo inactive)"`;
+}
+
+/** Runs before Proxmox is installed, on plain Debian: rules can name vmbr1 before it exists. */
 export function firewallScript(mgmtIp: string): string {
   return `set -euo pipefail
+${APT} update
 ${APT} install ufw fail2ban python3-systemd
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -302,11 +313,8 @@ PubkeyAuthentication yes
 EOF
 sshd -t
 systemctl reload ssh
-echo "ufw<<"; ufw status verbose; echo ">>ufw"
-echo "sshd_password=$(sshd -T | awk '$1=="passwordauthentication"{print $2}')"
-echo "sshd_root=$(sshd -T | awk '$1=="permitrootlogin"{print $2}')"
-echo "sshd_kbd=$(sshd -T | awk '$1=="kbdinteractiveauthentication"{print $2}')"
-echo "fail2ban=$(fail2ban-client status sshd >/dev/null 2>&1 && echo active || echo inactive)"`;
+for _ in $(seq 1 15); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
+${firewallStatusScript()}`;
 }
 
 export function checkFirewall(output: string, mgmtIp: string): string[] {

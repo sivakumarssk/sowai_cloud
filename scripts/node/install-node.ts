@@ -2,8 +2,8 @@
  * Stage 2: turn a fresh Debian 12 Hetzner Cloud server into a Proxmox node.
  * Runs only in production, on sowsi-mgmt-01. Not wired to the engine or approvals.
  *
- *   npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32 [--ipv4]          # plan: cost + checks, buys nothing
- *   npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32 --execute --approved-by <name> [--ipv4] [--keep-on-failure]
+ *   npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx22 [--ipv4]          # plan: cost + checks, buys nothing
+ *   npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx22 --execute --approved-by <name> [--ipv4] [--keep-on-failure]
  *   npx tsx scripts/node/install-node.ts --destroy <hetznerServerId>                              # plan
  *   npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> --execute --approved-by <name>
  *
