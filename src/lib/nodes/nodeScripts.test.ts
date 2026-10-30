@@ -54,6 +54,14 @@ test("the first boot is minimal: IPv4 /32, point-to-point to 172.31.1.1, bridged
   assert.doesNotMatch(config, /source|dhcp|vmbr1|inet6|hwaddress/, "nothing else is pulled in; vmbr1 comes from the host setup");
 });
 
+test("vmbr0 names the same resolvers as /etc/resolv.conf, so the two sources can't disagree", () => {
+  const stanza = S.interfacesFile(bridge).split("iface vmbr0 inet static\n")[1];
+  const line = stanza.split("\n").find((l) => l.includes("dns-nameservers"));
+  assert.equal(line, `    dns-nameservers ${S.RESOLVERS.join(" ")}`);
+  const written = [...S.dnsScript().matchAll(/^nameserver (\S+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(written, S.RESOLVERS);
+});
+
 const good = (sha: string) => ({
   nic: "eth0", mac: bridge.mac, ipv4: bridge.ipv4, gateway: "172.31.1.1", staged_sha: sha, installed_sha: sha, cloudinit_net_disabled: "yes",
   interfaces_d: "", sources_interfaces_d: "no", ifupdown2: "yes", nameservers: "2", syntax: "ok", pve_kernel: "yes", grub_pve: "yes", debian_kernels: "none",

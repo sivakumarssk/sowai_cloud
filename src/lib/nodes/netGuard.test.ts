@@ -109,6 +109,7 @@ guarded("a bridge on the wrong card: found by MAC, corrected, reloaded, and the 
   assert.equal(r.status, 0, r.stderr);
   const f = h.read("interfaces");
   assert.match(f, /iface vmbr0 inet static[\s\S]*bridge-ports enp1s0/);
+  assert.match(f, /dns-nameservers 185\.12\.64\.1/, "the correction leaves the rest of the stanza alone");
   assert.match(f, /^iface enp1s0 inet manual$/m);
   assert.doesNotMatch(f, /eth0/);
   assert.match(f, /iface vmbr1 inet manual\n {4}bridge-ports none/, "vmbr1 is untouched");

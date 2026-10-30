@@ -80,6 +80,8 @@ export type BridgeInput = { nic: string; ipv4: string };
  * The complete /etc/network/interfaces for the first boot: vmbr0 bridged to the card with
  * the server's /32, point-to-point to Hetzner's gateway. IPv4 only, as on node 1: IPv6 is
  * added by a later step, once SSH is back. proxmox-host-setup.sh appends vmbr1.
+ * dns-nameservers is the second source for DNS: resolvconf's if-up hook reads it, and it only
+ * counts if /etc/resolv.conf ever turns back into resolvconf's link.
  */
 export function interfacesFile({ nic, ipv4 }: BridgeInput): string {
   return `# Written by Sowsi install-node. proxmox-host-setup.sh appends vmbr1.
@@ -96,6 +98,7 @@ iface vmbr0 inet static
     bridge-ports ${nic}
     bridge-stp off
     bridge-fd 0
+    dns-nameservers ${RESOLVERS.join(" ")}
 `;
 }
 
