@@ -256,14 +256,15 @@ echo "pve_services=$(systemctl is-active pve-cluster pvedaemon pveproxy | tr '\\
 echo "boot_id=$(cat /proc/sys/kernel/random/boot_id)"`;
 }
 
-export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4: string; ipv6Subnet: string }): string[] {
+/** `ipv6Subnet` null = no IPv6 expected yet (a repaired node, IPv4 only until the host setup). */
+export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4: string; ipv6Subnet: string | null }): string[] {
   const problems: string[] = [];
   if (!facts.kernel?.endsWith("-pve")) problems.push(`running kernel "${facts.kernel}" isn't a Proxmox kernel`);
   if (!facts.pveversion?.startsWith("pve-manager/")) problems.push(`pveversion says "${facts.pveversion}"`);
   // With pointopoint, ip prints "inet A peer 172.31.1.1/32": the address alone is compared.
   if (facts.vmbr0_ipv4 !== expected.ipv4) problems.push(`vmbr0 has IPv4 "${facts.vmbr0_ipv4}", expected ${expected.ipv4}`);
   if (facts.gateway !== `${HETZNER_GATEWAY4} vmbr0`) problems.push(`default route is "${facts.gateway}", expected via ${HETZNER_GATEWAY4} on vmbr0`);
-  if (facts.ipv6 !== `${expected.ipv6Subnet}::1/64`) problems.push(`vmbr0 has IPv6 "${facts.ipv6}", expected ${expected.ipv6Subnet}::1/64`);
+  if (expected.ipv6Subnet && facts.ipv6 !== `${expected.ipv6Subnet}::1/64`) problems.push(`vmbr0 has IPv6 "${facts.ipv6}", expected ${expected.ipv6Subnet}::1/64`);
   if (facts.pve_services !== "active active active") problems.push(`Proxmox services: ${facts.pve_services} (pve-cluster pvedaemon pveproxy)`);
   return problems;
 }

@@ -13,6 +13,9 @@ export function installHetznerApi(hetzner: HetznerService): InstallDeps["hetzner
     getServer: (id) => hetzner.getServer(id),
     createServer: (i) => hetzner.createServer(i),
     deleteServer: (id) => hetzner.deleteServer(id),
+    enableRescue: (id, keys) => hetzner.enableRescue(id, keys),
+    disableRescue: (id) => hetzner.disableRescue(id),
+    resetServer: (id) => hetzner.resetServer(id),
     async ensureSshKey(name, publicKey) {
       const keys = await hetzner.listSshKeys();
       const existing = keys.find((k) => keyId(k.publicKey) === keyId(publicKey));

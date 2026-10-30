@@ -50,6 +50,9 @@ export const CPX22 = {
   ],
 };
 
+/** Returned by enable_rescue. Must never reach a log. */
+export const RESCUE_ROOT_PASSWORD = "rescue-root-password";
+
 export type FakeHetznerConfig = {
   /** Replaces GET /server_types entries (e.g. an unavailable or deprecated cpx22). */
   serverTypes?: Record<string, unknown>[];
@@ -65,6 +68,8 @@ export type FakeHetznerConfig = {
   primaryIpDeleteFails?: boolean;
   /** Action polling: answer "running" this many times first. */
   actionPollsRunning?: number;
+  /** enable_rescue answers with this error. */
+  rescueError?: { status: number; code: string; message: string };
 };
 
 type Row = Record<string, unknown> & { id: number };
@@ -169,6 +174,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
         labels: body.labels ?? {},
         backup_window: null,
         volumes: [],
+        rescue_enabled: false,
       };
       state.servers.set(serverId, server);
       return ok({ server, action: action("create_server"), next_actions: [action("start_server")], root_password: null }, 201);
@@ -190,6 +196,23 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
         }
         return ok({ action: action("delete_server") });
       }
+    }
+    if ((m = /^\/servers\/(\d+)\/actions\/(enable_rescue|disable_rescue|reset)$/.exec(path)) && method === "POST") {
+      const server = state.servers.get(Number(m[1]));
+      if (!server) throw notFound();
+      if (m[2] === "enable_rescue") {
+        if (cfg.rescueError) throw new Reply(cfg.rescueError.status, cfg.rescueError.code, cfg.rescueError.message);
+        if (body.type !== "linux64") throw new Reply(422, "invalid_input", "type");
+        Object.assign(server, { rescue_enabled: true, rescueKeys: body.ssh_keys });
+        return ok({ root_password: RESCUE_ROOT_PASSWORD, action: action("enable_rescue") }, 201);
+      }
+      if (m[2] === "disable_rescue") {
+        server.rescue_enabled = false;
+        return ok({ action: action("disable_rescue") }, 201);
+      }
+      // Rescue switches itself off at the boot it's used for.
+      Object.assign(server, { bootedRescue: server.rescue_enabled === true, rescue_enabled: false });
+      return ok({ action: action("reset_server") }, 201);
     }
     if ((m = /^\/servers\/(\d+)\/actions$/.exec(path)) && method === "GET") {
       const rows = [...state.actions.values()].map((a) => a.row);
@@ -305,5 +328,5 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
     return response;
   };
 
-  return { adapter, state, requests };
+  return { adapter, state, requests, cfg };
 }

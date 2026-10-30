@@ -145,6 +145,11 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
 - **Re-runs and failures:** re-running with the same `--name` resumes at the
   first unfinished step. Any failure deletes the server and its Primary IPs,
   unless you pass `--keep-on-failure`.
+- **A node that doesn't come back from its first reboot** is recovered once,
+  automatically, by re-running the same command: power cycle into the Hetzner
+  rescue system, diagnostics saved to `/root/node-diagnostics/`, network repaired
+  only if the evidence supports it, install resumed. Rescue is downtime, so a
+  node holding customers is refused unless you pass `--allow-downtime`.
 - **Settings it needs in `.env`:** `MGMT_PUBLIC_IP` and
   `NODE_ADMIN_SSH_PUBLIC_KEY` (see `.env.example`).
 - **VM ids repeat across nodes**, so a VM id means nothing without its node.

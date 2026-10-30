@@ -10,6 +10,7 @@
 import { serverTypeOffer, type ApiServerType, type HetznerPrice, type HetznerServer, type ServerDeleted } from "@/lib/hetzner";
 import { ipv6ForVmid } from "@/lib/provisioning/nodeTarget";
 import * as S from "./nodeScripts";
+import { rescueDiagnoseAgain, rescueRefusal, rescueRepair, type RescueArgs } from "./rescueRepair";
 
 // ── Dependencies (real ones in installNodeDeps.ts, fakes in the tests) ──
 
@@ -46,6 +47,7 @@ export type InstallRecord = {
   hostKeySha256: string | null;
   /** boot_id just before the reboot into Proxmox (the reboot step waits for a different one). */
   bootIdBeforeReboot: string | null;
+  repairedAt: Date | null;
   completedSteps: string[];
   /** Encrypted. */
   apiTokenSecret: string | null;
@@ -79,6 +81,9 @@ export type InstallDeps = {
     getServer(id: number): Promise<HetznerServer | null>;
     createServer(input: { name: string; serverType: string; location: string; image: string; sshKeyIds: number[]; labels: Record<string, string> }): Promise<HetznerServer>;
     deleteServer(id: number): Promise<ServerDeleted>;
+    enableRescue(id: number, sshKeyIds: number[]): Promise<void>;
+    disableRescue(id: number): Promise<void>;
+    resetServer(id: number): Promise<void>;
     /** The project's SSH key entry for this public key, registering it under `name` if missing. */
     ensureSshKey(name: string, publicKey: string): Promise<{ id: number; created: boolean }>;
     /** Removes the project's entry for this public key, if any. */
@@ -106,7 +111,7 @@ export type InstallDeps = {
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
     findInstallByServer(serverId: string): Promise<InstallRecord | null>;
-    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "apiTokenSecret" | "testFloatingIpId">): Promise<InstallRecord>;
+    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "repairedAt" | "apiTokenSecret" | "testFloatingIpId">): Promise<InstallRecord>;
     updateInstall(id: string, data: Partial<InstallRecord>): Promise<InstallRecord>;
     /** The registered node on this Hetzner server, with how many services and volumes it has. */
     nodeByServerId(serverId: string): Promise<{ id: string; name: string; services: number; volumes: number; apiTokenId: string | null; apiTokenSecret: string | null; ip: string } | null>;
@@ -115,6 +120,8 @@ export type InstallDeps = {
     deleteNode(id: string): Promise<void>;
     spentThisMonthPaise(): Promise<number>;
   };
+  /** Saves a diagnostics report on this machine and returns where. */
+  saveDiagnostics(serverId: string, suffix: string, text: string): Promise<string>;
   log(entry: { action: string; after?: unknown; cost?: number; success?: boolean; error?: string; dryRun?: boolean; toNode?: string }): Promise<void>;
   alert(subject: string, detail: string): Promise<void>;
   encrypt(text: string): string;
@@ -137,6 +144,8 @@ export type InstallSettings = {
   spendCapPaise: number;
   sshTimeoutMs: number;
   rebootTimeoutMs: number;
+  /** How long a re-run waits for a node it didn't just reboot before calling it unreachable. */
+  resumeProbeMs: number;
   installTimeoutMs: number;
   /** Set when this isn't sowsi-mgmt-01. Refuses installs and --destroy alike. */
   wrongHost: string | null;
@@ -228,9 +237,9 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { prima
 
 // ── Plan ──────────────────────────────────────────────────────────────
 
-export type InstallOptions = { name: string; serverType: string; ipv4Test: boolean; approvedBy: string | null; keepOnFailure: boolean };
+export type InstallOptions = { name: string; serverType: string; ipv4Test: boolean; approvedBy: string | null; keepOnFailure: boolean; allowDowntime?: boolean };
 
-export type InstallPlan = { ok: boolean; problems: string[]; resumeFrom: StepId | null; install: InstallRecord | null; cost: Cost | null };
+export type InstallPlan = { ok: boolean; problems: string[]; notes?: string[]; resumeFrom: StepId | null; install: InstallRecord | null; cost: Cost | null };
 
 export async function planInstall(deps: InstallDeps, o: InstallOptions, s: InstallSettings): Promise<InstallPlan> {
   const problems = [...(s.wrongHost ? [s.wrongHost] : []), ...validateArgs(o.name, o.serverType), ...s.environmentProblems];
@@ -281,7 +290,19 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
       problems.push(`buying it takes this month's infrastructure spend to ${inr(spent + cost.monthlyPaise)}, over the ${inr(s.spendCapPaise)} cap (ENGINE_SPEND_CAP_PAISE) — already ${inr(spent)}`);
     }
   }
-  return { ok: problems.length === 0, problems, resumeFrom, install, cost };
+  const notes: string[] = [];
+  if (resumeFrom === "reboot" && install?.ipv4) {
+    const reachable = await deps
+      .ssh(install.ipv4, "install", { hostKeySha256: install.hostKeySha256, timeoutMs: 20_000 })
+      .then((c) => (c.shell.close(), true))
+      .catch(() => false);
+    notes.push(
+      reachable
+        ? `${install.ipv4} answers SSH`
+        : `${install.ipv4} doesn't answer SSH. --execute will wait ${s.resumeProbeMs / 1000}s, then POWER-CYCLE it into the rescue system, save diagnostics and repair the network once`
+    );
+  }
+  return { ok: problems.length === 0, problems, notes, resumeFrom, install, cost };
 }
 
 // ── Execute ───────────────────────────────────────────────────────────
@@ -294,6 +315,8 @@ type Ctx = {
   shell: Shell | null;
   /** Plain token secret while this run has it. */
   tokenSecret: string | null;
+  /** This run issued the reboot, so the node gets the full timeout to come back. */
+  rebootedNow: boolean;
 };
 
 const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -337,6 +360,50 @@ function api(ctx: Ctx): ContainerApi {
   const secret = ctx.tokenSecret ?? (ctx.rec.apiTokenSecret ? ctx.deps.decrypt(ctx.rec.apiTokenSecret) : null);
   if (!secret) throw new Error("no Proxmox API token for this node yet");
   return ctx.deps.proxmox(nodeRef(ctx), { tokenId: S.API_TOKEN_ID, secret });
+}
+
+/**
+ * Waits for a new boot on the pinned host key, then checks it. Null = the node
+ * never answered in time. A repaired node has no IPv6 yet: the host setup brings it up.
+ */
+async function waitForBoot(ctx: Ctx, timeoutMs: number): Promise<Record<string, string> | null> {
+  const { deps } = ctx;
+  const before = ctx.rec.bootIdBeforeReboot;
+  const deadline = deps.now() + timeoutMs;
+  const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.repairedAt ? null : ctx.rec.ipv6Subnet! };
+  let problems: string[] = [];
+  for (;;) {
+    if (deps.now() > deadline) {
+      if (problems.length) fail("after reboot", problems);
+      return null;
+    }
+    try {
+      dropShell(ctx);
+      const facts = S.parseFacts(await (await installShell(ctx, 30_000)).exec("after reboot", S.afterRebootFactsScript()));
+      if (!before || facts.boot_id !== before) {
+        problems = S.checkAfterReboot(facts, expected);
+        if (problems.length === 0) return facts;
+        // SSH comes up before Proxmox's services, so those get time; anything else won't fix itself.
+        const lasting = S.checkAfterReboot({ ...facts, pve_services: "active active active" }, expected);
+        if (lasting.length) fail("after reboot", lasting);
+      }
+    } catch (err) {
+      if (err instanceof HostKeyMismatchError || /^after reboot:/.test(errMsg(err))) throw err;
+    }
+    await deps.sleep(10_000);
+  }
+}
+
+async function rescueArgs(ctx: Ctx): Promise<RescueArgs> {
+  const secret = ctx.tokenSecret ?? (ctx.rec.apiTokenSecret ? ctx.deps.decrypt(ctx.rec.apiTokenSecret) : null);
+  return {
+    deps: ctx.deps,
+    rec: ctx.rec,
+    s: ctx.s,
+    allowDowntime: ctx.o.allowDowntime ?? false,
+    customerProblem: await customerProblem(ctx.deps, ctx.rec.hetznerServerId!, secret, nodeRef(ctx)),
+    markRepairAttempt: (at) => save(ctx, { repairedAt: at }),
+  };
 }
 
 const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
@@ -439,39 +506,40 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     await save(ctx, { bootIdBeforeReboot: live.boot_id });
     await onNode(ctx, "reboot", S.REBOOT_SCRIPT);
     dropShell(ctx);
+    ctx.rebootedNow = true;
     return `Proxmox VE installed, Debian kernel removed, bridge verified; rebooting (boot ${live.boot_id.slice(0, 8)}…)`;
   },
 
   async reboot(ctx) {
     const { deps, s } = ctx;
-    const before = ctx.rec.bootIdBeforeReboot;
-    const deadline = deps.now() + s.rebootTimeoutMs;
-    const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! };
-    let facts: Record<string, string> = {};
-    let problems: string[] = [];
-    for (;;) {
-      if (deps.now() > deadline) {
-        if (problems.length) fail("after reboot", problems);
-        throw new Error(`the server didn't come back within ${s.rebootTimeoutMs / 60_000} min of the reboot — check the Hetzner console (VNC)`);
+    let facts = await waitForBoot(ctx, ctx.rebootedNow ? s.rebootTimeoutMs : s.resumeProbeMs);
+    if (!facts) {
+      const unreachable = `the server didn't come back within ${(ctx.rebootedNow ? s.rebootTimeoutMs : s.resumeProbeMs) / 60_000} min of the reboot`;
+      deps.report(`      ${unreachable}: starting the rescue repair`);
+      await deps.log({ action: "NODE_UNREACHABLE", toNode: ctx.rec.name, success: false, after: { hetznerServerId: ctx.rec.hetznerServerId, ipv4: ctx.rec.ipv4 } });
+      const args = await rescueArgs(ctx);
+      const refused = await rescueRefusal(args, INSTALL_LABEL);
+      if (refused) {
+        await deps.log({ action: "NODE_RESCUE_REFUSED", toNode: ctx.rec.name, success: false, error: refused });
+        throw new Error(`${unreachable}. No automatic repair: ${refused}`);
       }
-      try {
-        dropShell(ctx);
-        facts = S.parseFacts(await (await installShell(ctx, 30_000)).exec("after reboot", S.afterRebootFactsScript()));
-        if (!before || facts.boot_id !== before) {
-          problems = S.checkAfterReboot(facts, expected);
-          if (problems.length === 0) break;
-          // SSH comes up before Proxmox's services, so those get time; anything else won't fix itself.
-          const lasting = S.checkAfterReboot({ ...facts, pve_services: "active active active" }, expected);
-          if (lasting.length) fail("after reboot", lasting);
-        }
-      } catch (err) {
-        if (err instanceof HostKeyMismatchError || /^after reboot:/.test(errMsg(err))) throw err;
+      const repair = await rescueRepair(args).catch((err) => {
+        throw new Error(`${unreachable}. Rescue repair failed: ${errMsg(err)}`);
+      });
+      if (!repair.repaired) throw new Error(`${unreachable}. ${repair.summary} Diagnostics: ${repair.diagnosticsPath}`);
+      dropShell(ctx);
+      deps.report(`      ${repair.summary}; booting from its own disk`);
+
+      facts = await waitForBoot(ctx, s.rebootTimeoutMs);
+      if (!facts) {
+        const again = await rescueDiagnoseAgain(args, repair.changes).catch((err) => `not collected: ${errMsg(err)}`);
+        throw new Error(`the rescue repair didn't bring the server back. Diagnostics: ${repair.diagnosticsPath}, then ${again}. What changed: ${repair.changes.join("; ")}`);
       }
-      await deps.sleep(10_000);
+      await deps.log({ action: "NODE_RESCUE_RECOVERED", toNode: ctx.rec.name, after: { kernel: facts.kernel } });
     }
     const firewall = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
     if (firewall.length) fail("firewall check after the reboot", firewall);
-    return `${facts.pveversion} on ${facts.kernel}`;
+    return `${facts.pveversion} on ${facts.kernel}${ctx.rec.repairedAt ? " (recovered by the rescue repair)" : ""}`;
   },
 
   async firewall(ctx) {
@@ -640,14 +708,14 @@ export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: In
   if (!rec || rec.status !== "IN_PROGRESS") {
     const fresh = { name: o.name, serverType: o.serverType, location: s.location, monthlyCostPaise: plan.cost!.monthlyPaise, hourlyCostPaise: plan.cost!.hourlyPaise, approvedBy: o.approvedBy };
     rec = rec
-      ? await deps.db.updateInstall(rec.id, { ...fresh, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, apiTokenSecret: null, testFloatingIpId: null })
+      ? await deps.db.updateInstall(rec.id, { ...fresh, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, apiTokenSecret: null, testFloatingIpId: null })
       : await deps.db.createInstall(fresh);
   }
   if (rec.completedSteps.length > 0) {
     for (const line of resumeSummary(rec)) deps.report(line);
     rec = await deps.db.updateInstall(rec.id, { error: null });
   }
-  const ctx: Ctx = { deps, s, o, rec, shell: null, tokenSecret: null };
+  const ctx: Ctx = { deps, s, o, rec, shell: null, tokenSecret: null, rebootedNow: false };
   await deps.log({ action: "NODE_INSTALL_STARTED", toNode: o.name, after: { resumeFrom: plan.resumeFrom, serverType: o.serverType, approvedBy: o.approvedBy, ipv4Test: o.ipv4Test } });
 
   let current: StepId = "server";

@@ -30,6 +30,6 @@ if (files.length === 0) {
 
 // tsx's own CLI, run with this node binary — no shell, works the same on Linux and Windows.
 const tsxCli = createRequire(import.meta.url).resolve("tsx/cli");
-const result = spawnSync(process.execPath, [tsxCli, "--test", ...files], { cwd: root, stdio: "inherit" });
+const result = spawnSync(process.execPath, [tsxCli, "--test", "--test-timeout=120000", ...files], { cwd: root, stdio: "inherit" });
 if (result.error) throw result.error;
 process.exit(result.status ?? 1);

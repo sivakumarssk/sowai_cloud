@@ -86,7 +86,7 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
 
   await add("GET /ssh_keys", "/ssh_keys", { per_page: 50 }, "ssh_keys", ["id", "name", "fingerprint", "public_key"]);
 
-  const servers = await add("GET /servers", "/servers", { per_page: 50 }, "servers", ["id", "name", "status", "server_type.name", "location.name", "public_net.ipv4", "public_net.ipv6", "labels"], (rows) => {
+  const servers = await add("GET /servers", "/servers", { per_page: 50 }, "servers", ["id", "name", "status", "server_type.name", "location.name", "public_net.ipv4", "public_net.ipv6", "rescue_enabled", "labels"], (rows) => {
     if (rows.length === 0) return [];
     try {
       const s = toServer(rows[0] as never);

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { NodeSSH } from "node-ssh";
@@ -142,6 +142,14 @@ export function prismaInstallDeps(): InstallDeps {
       spentThisMonthPaise: () => spentThisMonthPaise(),
     },
 
+    async saveDiagnostics(serverId, suffix, text) {
+      const dir = process.env.NODE_DIAGNOSTICS_DIR?.trim() || "/root/node-diagnostics";
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const file = path.join(dir, `${serverId}-${new Date().toISOString().replace(/[:.]/g, "-")}${suffix}.txt`);
+      writeFileSync(file, text, { mode: 0o600 });
+      return file;
+    },
+
     log: (e) => prismaEngineLog({ ...e, trigger: "MANUAL" }),
     alert: alertAdmins,
     encrypt,
@@ -196,6 +204,7 @@ export function installSettings(env = process.env): InstallSettings {
     spendCapPaise: loadEngineSettings(env).spendCapPaise,
     sshTimeoutMs: Number(env.NODE_SSH_TIMEOUT_SECONDS || 300) * 1000,
     rebootTimeoutMs: Number(env.NODE_REBOOT_TIMEOUT_SECONDS || 600) * 1000,
+    resumeProbeMs: Number(env.NODE_RESUME_PROBE_SECONDS || 120) * 1000,
     installTimeoutMs: Number(env.NODE_PVE_INSTALL_TIMEOUT_SECONDS || 2400) * 1000,
     environmentProblems: problems,
   };

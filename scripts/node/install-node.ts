@@ -12,6 +12,10 @@
  * server (unless --keep-on-failure). The node is registered closed: status PROVISIONING,
  * acceptNewClients false. Every step is logged to EngineLog (NODE_INSTALL_*, SERVER_PURCHASED).
  *
+ * A node that doesn't come back from the reboot is recovered once through the Hetzner rescue
+ * system: power cycle, diagnostics saved to /root/node-diagnostics, network repaired, install
+ * resumed. A node holding customers is refused unless --allow-downtime is given.
+ *
  * .env: MGMT_PUBLIC_IP, NODE_ADMIN_SSH_PUBLIC_KEY, HETZNER_API_TOKEN, PROVISIONING_SSH_* ;
  * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_EUR_TO_INR [100].
  */
@@ -93,12 +97,13 @@ function lock(): () => void {
     }
 
     // ── install ──
-    const options = { name: value("--name") ?? "", serverType: value("--type") ?? "", ipv4Test: flag("--ipv4"), approvedBy, keepOnFailure: flag("--keep-on-failure") };
+    const options = { name: value("--name") ?? "", serverType: value("--type") ?? "", ipv4Test: flag("--ipv4"), approvedBy, keepOnFailure: flag("--keep-on-failure"), allowDowntime: flag("--allow-downtime") };
     const plan = await N.planInstall(deps, options, settings);
 
     console.log(`Install node ${options.name || "?"} (${options.serverType || "?"}, ${settings.location}, ${settings.image})`);
     const resuming = plan.install?.status === "IN_PROGRESS";
     if (resuming) for (const l of N.resumeSummary(plan.install!)) console.log(l);
+    for (const n of plan.notes ?? []) console.log(`  ! ${n}`);
     if (plan.cost) for (const l of plan.cost.lines) console.log(`  € ${l}`);
     if (plan.cost && plan.resumeFrom === "server") {
       const spent = await deps.db.spentThisMonthPaise();

@@ -49,6 +49,8 @@ export type HetznerServer = {
   ipv6Network: string | null;
   /** Its Primary IPs. Billed hourly on their own, so a delete must not leave them behind. */
   primaryIpIds: number[];
+  /** The next boot goes into the rescue system. */
+  rescueEnabled: boolean;
   labels: Record<string, string>;
 };
 
@@ -59,6 +61,7 @@ type ApiServer = {
   server_type: { name: string };
   location: { name: string };
   public_net: { ipv4: { id?: number; ip: string } | null; ipv6: { id?: number; ip: string } | null };
+  rescue_enabled?: boolean;
   labels: Record<string, string>;
 };
 
@@ -72,6 +75,7 @@ export function toServer(s: ApiServer): HetznerServer {
     ipv4: s.public_net.ipv4?.ip ?? null,
     ipv6Network: s.public_net.ipv6?.ip ?? null,
     primaryIpIds: [s.public_net.ipv4?.id, s.public_net.ipv6?.id].filter((id): id is number => typeof id === "number"),
+    rescueEnabled: Boolean(s.rescue_enabled),
     labels: s.labels ?? {},
   };
 }
@@ -388,6 +392,26 @@ export class HetznerService {
       }
     }
     return { primaryIpsRemoved, primaryIpsLeft };
+  }
+
+  // ── Rescue and power ──
+
+  /** The next boot goes into the rescue system. Hetzner turns it off again at that boot, or after 60 minutes. */
+  async enableRescue(serverId: number, sshKeyIds: number[]): Promise<void> {
+    // The response also has a root_password: unused, since the key logs in, and never kept.
+    const { action } = await this.request<{ action: HetznerAction }>("post", `/servers/${serverId}/actions/enable_rescue`, { data: { type: "linux64", ssh_keys: sshKeyIds } });
+    await this.waitForAction(action);
+  }
+
+  async disableRescue(serverId: number): Promise<void> {
+    const { action } = await this.request<{ action: HetznerAction }>("post", `/servers/${serverId}/actions/disable_rescue`);
+    await this.waitForAction(action);
+  }
+
+  /** Cuts power and starts the server again: a hard power cycle. */
+  async resetServer(serverId: number): Promise<void> {
+    const { action } = await this.request<{ action: HetznerAction }>("post", `/servers/${serverId}/actions/reset`);
+    await this.waitForAction(action);
   }
 
   // ── Primary IPs ──
