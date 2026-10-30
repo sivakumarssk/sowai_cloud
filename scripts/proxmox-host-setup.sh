@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# One-time Proxmox host setup for Sowsi Cloud container networking.
+# One-time Proxmox host setup for Sowsi Cloud container networking. Works on
+# any node: the node's IPv6 /64 and the provisioning key come from the
+# environment. scripts/node/install-node.ts runs it on new nodes (without
+# PROVISIONING_PUBKEY: it installs that key itself, last). By hand, e.g. node 1:
 #
-#   scp scripts/proxmox-host-setup.sh root@128.140.70.53:/root/
-#   ssh root@128.140.70.53 bash /root/proxmox-host-setup.sh
+#   ssh root@128.140.70.53 \
+#     'IPV6_SUBNET=2a01:4f8:1c16:5f1d PROVISIONING_PUBKEY="ssh-ed25519 AAAA… sowsi-provisioning" bash -s' \
+#     < scripts/proxmox-host-setup.sh
 #
 # Safe to re-run. Does not modify vmbr0's IPv4 config, so it can't cut off
 # your SSH session.
@@ -13,8 +17,11 @@
 # port, and the host routes each container's Floating IP / IPv6 to it.
 set -euo pipefail
 
-IPV6_SUBNET="2a01:4f8:1c16:5f1d"
-PROVISIONING_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL+L152cRvIkX3R0xtdG4toSwTbblpUz6PioDz89wglD sowsi-provisioning"
+# This node's routed /64 without the trailing "::" (Hetzner Console → server → Networking).
+IPV6_SUBNET="${IPV6_SUBNET:?set IPV6_SUBNET to the /64 of this node without ::, e.g. 2a01:4f8:1c16:5f1d}"
+IPV6_SUBNET="${IPV6_SUBNET%%::*}"
+# Public half of the platform provisioning key (PROVISIONING_SSH_PUBLIC_KEY). Empty = step 8 is skipped.
+PROVISIONING_PUBKEY="${PROVISIONING_PUBKEY:-}"
 
 echo "== 1. DNS"
 if ! getent hosts download.proxmox.com >/dev/null; then
@@ -182,6 +189,9 @@ SCRIPT
 chmod 755 /usr/local/sbin/sowsi-host
 
 echo "== 8. Provisioning key → restricted to sowsi-host"
+if [[ -z $PROVISIONING_PUBKEY ]]; then
+  echo "skipped (PROVISIONING_PUBKEY not set)"
+else
 KEY_BODY=$(awk '{print $2}' <<<"$PROVISIONING_PUBKEY")
 AUTH=/root/.ssh/authorized_keys
 touch "$AUTH"
@@ -192,19 +202,26 @@ echo "restrict,command=\"/usr/local/sbin/sowsi-host\" $PROVISIONING_PUBKEY" >> "
 # On Proxmox this file is a symlink into /etc/pve: write through it, don't replace it.
 cat "$TMP" > "$AUTH"
 rm -f "$TMP"
+fi
 
-echo "== 9. Container storage can list orphaned disks"
-# Proxmox labels a disk "rootdir" only while its container exists; a disk left
-# behind by a deleted container is labelled "images". A storage without the
-# "images" content type hides those orphans from every listing (pvesm list and
-# the API), so the engine's leftover-disk check couldn't see them.
+echo "== 9. Container storage holds containers and lists orphaned disks"
+# "rootdir": containers can be created on it (a Proxmox installed on Debian
+# starts with only iso,vztmpl,backup on "local").
+# "images": Proxmox labels a disk "rootdir" only while its container exists; a
+# disk left behind by a deleted container is labelled "images". A storage
+# without the "images" content type hides those orphans from every listing
+# (pvesm list and the API), so the engine's leftover-disk check couldn't see them.
 CONTAINER_STORAGE=${CONTAINER_STORAGE:-local}
 content=$(pvesh get "/storage/$CONTAINER_STORAGE" --output-format json | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
-if [[ ",$content," != *",images,"* ]]; then
-  pvesm set "$CONTAINER_STORAGE" --content "${content:+$content,}images"
-  echo "added 'images' content to $CONTAINER_STORAGE (was: ${content:-none})"
+was=$content
+for type in rootdir images; do
+  if [[ ",$content," != *",$type,"* ]]; then content="${content:+$content,}$type"; fi
+done
+if [[ $content != "$was" ]]; then
+  pvesm set "$CONTAINER_STORAGE" --content "$content"
+  echo "$CONTAINER_STORAGE content: ${was:-none} → $content"
 else
-  echo "$CONTAINER_STORAGE already lists images ($content)"
+  echo "$CONTAINER_STORAGE already holds rootdir and images ($content)"
 fi
 
 echo

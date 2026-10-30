@@ -444,6 +444,12 @@ model ProxmoxNode {
   /// Monthly Hetzner cost, in paise.
   monthlyCost Int
 
+  /// This node's own Proxmox API token, e.g. "root@pam!sowsi" (set by scripts/node/install-node.ts).
+  /// Null = PROXMOX_USER / PROXMOX_TOKEN_ID / PROXMOX_TOKEN_SECRET from .env (node 1).
+  apiTokenId     String?
+  /// AES-256-GCM encrypted (src/lib/crypto.ts).
+  apiTokenSecret String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -451,6 +457,49 @@ model ProxmoxNode {
   volumes  HetznerVolume[]
 
   @@index([status])
+}
+
+enum NodeInstallStatus {
+  /// Bought; steps still running, or interrupted (a re-run resumes).
+  IN_PROGRESS
+  /// Every step passed; the ProxmoxNode row exists (closed until opened by hand).
+  REGISTERED
+  /// A step failed; the server was deleted.
+  FAILED
+  /// Removed with --destroy.
+  DESTROYED
+}
+
+/// One run of scripts/node/install-node.ts: a Hetzner server becoming a Proxmox node.
+/// Holds what a re-run needs to resume. Not read by the engine.
+model NodeInstall {
+  id                 String            @id @default(cuid())
+  /// Node (and Hetzner server) name, e.g. "sowsi-proxmox-02".
+  name               String            @unique
+  serverType         String
+  location           String
+  status             NodeInstallStatus @default(IN_PROGRESS)
+  hetznerServerId    String?           @unique
+  ipv4               String?
+  /// Routed /64 without "::", e.g. "2a01:4f8:1c1c:abcd".
+  ipv6Subnet         String?
+  /// SHA-256 of the server's SSH host key, pinned at the first login.
+  hostKeySha256      String?
+  /// boot_id just before the reboot into Proxmox; the reboot step waits for a new one.
+  bootIdBeforeReboot String?
+  /// Steps that finished, in order (see src/lib/nodes/installNode.ts).
+  completedSteps     String[]          @default([])
+  /// Encrypted Proxmox API token secret until the node is registered (then it moves to ProxmoxNode).
+  apiTokenSecret     String?
+  /// Floating IP bought for an --ipv4 test container, until it is released.
+  testFloatingIpId   String?
+  /// In paise.
+  monthlyCostPaise   Int
+  hourlyCostPaise    Int
+  approvedBy         String
+  error              String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
 }
 
 /// A Hetzner Cloud Volume attached to a node (extra disk space).

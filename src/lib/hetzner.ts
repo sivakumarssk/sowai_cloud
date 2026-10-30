@@ -30,11 +30,56 @@ function toVolume(v: ApiVolume): HetznerVolume {
 }
 
 export class HetznerError extends Error {
-  constructor(message: string, readonly status?: number) {
+  /** Hetzner's error code, e.g. "resource_unavailable", "resource_limit_exceeded". */
+  constructor(message: string, readonly status?: number, readonly code?: string) {
     super(message);
     this.name = "HetznerError";
   }
 }
+
+/** A Hetzner Cloud server, as the node installer needs it. */
+export type HetznerServer = {
+  id: number;
+  name: string;
+  status: string;
+  serverType: string;
+  location: string;
+  ipv4: string | null;
+  /** The server's routed IPv6 network, e.g. "2a01:4f8:1c1c:abcd::/64". */
+  ipv6Network: string | null;
+  labels: Record<string, string>;
+};
+
+type ApiServer = {
+  id: number;
+  name: string;
+  status: string;
+  server_type: { name: string };
+  datacenter: { location: { name: string } };
+  public_net: { ipv4: { ip: string } | null; ipv6: { ip: string } | null };
+  labels: Record<string, string>;
+};
+
+function toServer(s: ApiServer): HetznerServer {
+  return {
+    id: s.id,
+    name: s.name,
+    status: s.status,
+    serverType: s.server_type.name,
+    location: s.datacenter.location.name,
+    ipv4: s.public_net.ipv4?.ip ?? null,
+    ipv6Network: s.public_net.ipv6?.ip ?? null,
+    labels: s.labels ?? {},
+  };
+}
+
+export type HetznerSshKey = { id: number; name: string; fingerprint: string; publicKey: string };
+
+/** Gross prices in EUR for one location. */
+export type HetznerPrice = { hourlyEur: number; monthlyEur: number };
+
+type ApiPrice = { location: string; price_hourly: { gross: string }; price_monthly: { gross: string } };
+const toPrice = (p: ApiPrice): HetznerPrice => ({ hourlyEur: Number(p.price_hourly.gross), monthlyEur: Number(p.price_monthly.gross) });
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -70,7 +115,7 @@ export class HetznerService {
   }
 
   private async request<T>(
-    method: "get" | "post" | "delete",
+    method: "get" | "post" | "put" | "delete",
     path: string,
     { data, params }: { data?: unknown; params?: Record<string, string | number> } = {}
   ): Promise<T> {
@@ -81,13 +126,13 @@ export class HetznerService {
       if (err instanceof AxiosError) {
         const body = err.response?.data as { error?: { code: string; message: string } } | undefined;
         const detail = body?.error ? `${body.error.code}: ${body.error.message}` : err.message;
-        throw new HetznerError(`${method.toUpperCase()} ${path} failed: ${detail}`, err.response?.status);
+        throw new HetznerError(`${method.toUpperCase()} ${path} failed: ${detail}`, err.response?.status, body?.error?.code);
       }
       throw err;
     }
   }
 
-  private async waitForAction(action: HetznerAction, timeoutMs = 2 * 60_000): Promise<void> {
+  async waitForAction(action: HetznerAction, timeoutMs = 2 * 60_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let current = action;
     while (current.status === "running") {
@@ -198,6 +243,123 @@ export class HetznerService {
       await this.request("delete", `/volumes/${volumeId}`);
     } catch (err) {
       if (err instanceof HetznerError && err.status === 404) return;
+      throw err;
+    }
+  }
+
+  // ── Servers (Proxmox nodes; see scripts/node/install-node.ts) ──
+
+  /**
+   * Buys a server. Billed hourly from now until it is deleted. Throws a HetznerError
+   * with Hetzner's code (e.g. resource_unavailable, resource_limit_exceeded) when
+   * nothing was created; if the create action itself fails, the server is deleted.
+   */
+  async createServer(input: {
+    name: string;
+    serverType: string;
+    location: string;
+    image: string;
+    sshKeyIds: number[];
+    labels: Record<string, string>;
+  }): Promise<HetznerServer> {
+    const { server, action } = await this.request<{ server: ApiServer; action: HetznerAction }>("post", "/servers", {
+      data: {
+        name: input.name,
+        server_type: input.serverType,
+        location: input.location,
+        image: input.image,
+        ssh_keys: input.sshKeyIds,
+        labels: input.labels,
+        public_net: { enable_ipv4: true, enable_ipv6: true },
+        start_after_create: true,
+        // No backups: they are a separate, paid option that is never enabled here.
+      },
+    });
+    try {
+      await this.waitForAction(action, 5 * 60_000);
+    } catch (err) {
+      await this.deleteServer(server.id).catch(() => {});
+      throw err;
+    }
+    return (await this.getServer(server.id)) ?? toServer(server);
+  }
+
+  async getServer(serverId: number): Promise<HetznerServer | null> {
+    try {
+      return toServer((await this.request<{ server: ApiServer }>("get", `/servers/${serverId}`)).server);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  async findServerByName(name: string): Promise<HetznerServer | null> {
+    const { servers } = await this.request<{ servers: ApiServer[] }>("get", "/servers", { params: { name } });
+    return servers[0] ? toServer(servers[0]) : null;
+  }
+
+  /** Deletes a server and waits until Hetzner has. An already-deleted server is ignored. */
+  async deleteServer(serverId: number): Promise<void> {
+    try {
+      const { action } = await this.request<{ action: HetznerAction }>("delete", `/servers/${serverId}`);
+      await this.waitForAction(action, 5 * 60_000);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return;
+      throw err;
+    }
+  }
+
+  /** Gross EUR prices of a server type, a primary IPv4 and a Floating IPv4 in a location. */
+  async prices(serverType: string, location: string): Promise<{ server: HetznerPrice | null; primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }> {
+    const { pricing } = await this.request<{
+      pricing: {
+        server_types: { name: string; prices: ApiPrice[] }[];
+        primary_ips: { type: string; prices: ApiPrice[] }[];
+        floating_ips: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[];
+      };
+    }>("get", "/pricing");
+    const at = <T extends { location: string }>(prices: T[] | undefined) => prices?.find((p) => p.location === location);
+    const server = at(pricing.server_types.find((t) => t.name === serverType)?.prices);
+    const ip = at(pricing.primary_ips.find((t) => t.type === "ipv4")?.prices);
+    const fip = at(pricing.floating_ips.find((t) => t.type === "ipv4")?.prices);
+    return { server: server ? toPrice(server) : null, primaryIpv4: ip ? toPrice(ip) : null, floatingIpv4MonthlyEur: fip ? Number(fip.price_monthly.gross) : null };
+  }
+
+  /** Whether a server type can be ordered in a location right now (any of its datacenters). */
+  async serverTypeAvailable(serverType: string, location: string): Promise<{ known: boolean; available: boolean }> {
+    const { server_types } = await this.request<{ server_types: { id: number; name: string; deprecation: unknown }[] }>("get", "/server_types", { params: { name: serverType } });
+    const type = server_types[0];
+    if (!type) return { known: false, available: false };
+    const { datacenters } = await this.request<{ datacenters: { location: { name: string }; server_types: { available: number[] } }[] }>("get", "/datacenters");
+    return { known: true, available: datacenters.some((d) => d.location.name === location && d.server_types.available.includes(type.id)) };
+  }
+
+  async listSshKeys(): Promise<HetznerSshKey[]> {
+    const { ssh_keys } = await this.request<{ ssh_keys: { id: number; name: string; fingerprint: string; public_key: string }[] }>("get", "/ssh_keys", { params: { per_page: 50 } });
+    return ssh_keys.map((k) => ({ id: k.id, name: k.name, fingerprint: k.fingerprint, publicKey: k.public_key }));
+  }
+
+  async createSshKey(name: string, publicKey: string, labels: Record<string, string> = {}): Promise<HetznerSshKey> {
+    const { ssh_key } = await this.request<{ ssh_key: { id: number; name: string; fingerprint: string; public_key: string } }>("post", "/ssh_keys", {
+      data: { name, public_key: publicKey, labels },
+    });
+    return { id: ssh_key.id, name: ssh_key.name, fingerprint: ssh_key.fingerprint, publicKey: ssh_key.public_key };
+  }
+
+  async deleteSshKey(id: number): Promise<void> {
+    try {
+      await this.request("delete", `/ssh_keys/${id}`);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return;
+      throw err;
+    }
+  }
+
+  async getFloatingIP(floatingIpId: number): Promise<FloatingIp | null> {
+    try {
+      return toFloatingIp((await this.request<{ floating_ip: ApiFloatingIp }>("get", `/floating_ips/${floatingIpId}`)).floating_ip);
+    } catch (err) {
+      if (err instanceof HetznerError && err.status === 404) return null;
       throw err;
     }
   }

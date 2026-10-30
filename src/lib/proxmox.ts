@@ -107,15 +107,38 @@ export function diskVolumes(items: ContentItem[]): StorageVolume[] {
     .map((i) => ({ volid: i.volid, vmid: i.vmid === undefined ? null : Number(i.vmid), size: i.size ?? 0, used: i.used ?? null }));
 }
 
+/** A Proxmox API token: "user@realm!name" and its secret. */
+export type ProxmoxToken = { tokenId: string; secret: string };
+
+/** The token from .env (node 1): PROXMOX_USER!PROXMOX_TOKEN_ID = PROXMOX_TOKEN_SECRET. */
+export function envToken(): ProxmoxToken {
+  return { tokenId: `${requireEnv("PROXMOX_USER")}!${requireEnv("PROXMOX_TOKEN_ID")}`, secret: requireEnv("PROXMOX_TOKEN_SECRET") };
+}
+
+/**
+ * The token of a registered node: its own (ProxmoxNode.apiTokenId / apiTokenSecret,
+ * set by scripts/node/install-node.ts), else the .env token. Loaded lazily so this
+ * module doesn't pull Prisma into everything that imports it.
+ */
+async function registeredToken(nodeName: string): Promise<ProxmoxToken> {
+  const { prisma } = await import("@/lib/prisma");
+  const row = await prisma.proxmoxNode.findUnique({ where: { name: nodeName }, select: { apiTokenId: true, apiTokenSecret: true } });
+  if (row?.apiTokenId && row.apiTokenSecret) {
+    const { decrypt } = await import("@/lib/crypto");
+    return { tokenId: row.apiTokenId, secret: decrypt(row.apiTokenSecret) };
+  }
+  return envToken();
+}
+
 export class ProxmoxService {
-  private client: AxiosInstance | null = null;
+  private client: Promise<AxiosInstance> | null = null;
 
   /**
-   * Without a target, talks to the node in PROXMOX_NODE / PROXMOX_HOST.
-   * With one, talks to that node's API directly (nodes aren't clustered, so
-   * each has its own API; the same API token must exist on every node).
+   * Without a target, talks to the node in PROXMOX_NODE / PROXMOX_HOST with the .env token.
+   * With one, talks to that node's API directly (nodes aren't clustered, so each has its own
+   * API) with the node's own token, or `token` when given (a node being installed).
    */
-  constructor(private readonly target: { node?: string; host?: string } = {}) {}
+  constructor(private readonly target: { node?: string; host?: string; token?: ProxmoxToken } = {}) {}
 
   // Config is read on first use rather than at import time so a missing env
   // var doesn't break `next build` for every route that imports this module.
@@ -138,24 +161,27 @@ export class ProxmoxService {
     return process.env.PROXMOX_BRIDGE || "vmbr1";
   }
 
-  private api(): AxiosInstance {
+  private api(): Promise<AxiosInstance> {
     if (this.client) return this.client;
+    this.client = this.createClient();
+    // A failed lookup (e.g. database down) is retried on the next call.
+    this.client.catch(() => (this.client = null));
+    return this.client;
+  }
 
+  private async createClient(): Promise<AxiosInstance> {
     const host = this.target.host ?? requireEnv("PROXMOX_HOST");
     const port = process.env.PROXMOX_PORT || "8006";
-    const user = requireEnv("PROXMOX_USER");
-    const tokenId = requireEnv("PROXMOX_TOKEN_ID");
-    const secret = requireEnv("PROXMOX_TOKEN_SECRET");
+    const { tokenId, secret } = this.target.token ?? (this.target.node && this.target.host ? await registeredToken(this.target.node) : envToken());
 
-    this.client = axios.create({
+    return axios.create({
       baseURL: `https://${host}:${port}/api2/json`,
       timeout: 30_000,
-      headers: { Authorization: `PVEAPIToken=${user}!${tokenId}=${secret}` },
+      headers: { Authorization: `PVEAPIToken=${tokenId}=${secret}` },
       // Proxmox ships a self-signed cert. Set PROXMOX_VERIFY_TLS=true once a
       // real certificate is installed on the host.
       httpsAgent: new https.Agent({ rejectUnauthorized: process.env.PROXMOX_VERIFY_TLS === "true" }),
     });
-    return this.client;
   }
 
   private async request<T>(
@@ -172,8 +198,8 @@ export class ProxmoxService {
       // Proxmox expects form-encoded bodies for writes and query params for reads/deletes.
       const res =
         method === "get" || method === "delete"
-          ? await this.api().request({ method, url: path, params: clean })
-          : await this.api().request({
+          ? await (await this.api()).request({ method, url: path, params: clean })
+          : await (await this.api()).request({
               method,
               url: path,
               data: new URLSearchParams(clean).toString(),

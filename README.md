@@ -121,6 +121,33 @@ npm run test:engine && npm run build && pm2 restart <web app> sowsi-engine
   `npx tsx scripts/billing/reprovision.ts --service <id>` (plan), then add
   `--execute --by <name>`. It never touches payments, subscriptions or refunds.
 
+## Adding a Proxmox node
+
+`scripts/node/install-node.ts` turns a fresh Debian 12 Hetzner Cloud server
+into a Proxmox node. It runs only on sowsi-mgmt-01 with `APP_ENV=production`,
+and isn't wired to the engine or approvals yet.
+
+```bash
+npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32                                    # plan: cost, checks
+npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx32 --execute --approved-by <you>      # buy + install (~25 min)
+npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --approved-by <you>]             # remove a throwaway node
+```
+
+- **What it does:**
+  1. Buys the server, checked against the monthly spend cap.
+  2. Installs Proxmox on it.
+  3. Proves the node works with a test container, then deletes the container.
+  4. Registers the node **closed**: status PROVISIONING, `acceptNewClients=false`.
+- **Re-runs and failures:** re-running with the same `--name` resumes at the
+  first unfinished step. Any failure deletes the server, unless you pass
+  `--keep-on-failure`.
+- **Settings it needs in `.env`:** `MGMT_PUBLIC_IP` and
+  `NODE_ADMIN_SSH_PUBLIC_KEY` (see `.env.example`).
+- **Opening the node:** only once you're happy with it.
+  ```sql
+  update "ProxmoxNode" set status = 'READY', "acceptNewClients" = true where name = 'sowsi-proxmox-02';
+  ```
+
 ## Rollback
 
 - **Code only:** the schema changes are additive, so older code runs on the
