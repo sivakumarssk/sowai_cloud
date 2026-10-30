@@ -11,6 +11,7 @@ import { serverTypeOffer, type ApiServerType, type HetznerPrice, type HetznerSer
 import { ipv6ForVmid } from "@/lib/provisioning/nodeTarget";
 import * as S from "./nodeScripts";
 import { rescueDiagnoseAgain, rescueRefusal, rescueRepair, type RescueArgs } from "./rescueRepair";
+import { diagnosticsScript } from "./rescueScripts";
 
 // ── Dependencies (real ones in installNodeDeps.ts, fakes in the tests) ──
 
@@ -48,6 +49,11 @@ export type InstallRecord = {
   /** boot_id just before the reboot into Proxmox (the reboot step waits for a different one). */
   bootIdBeforeReboot: string | null;
   repairedAt: Date | null;
+  purchasedAt: Date | null;
+  /** The real cost of a server that was deleted: set once, when the monthly price is corrected. */
+  costSettledPaise: number | null;
+  createdAt: Date;
+  updatedAt: Date;
   completedSteps: string[];
   /** Encrypted. */
   apiTokenSecret: string | null;
@@ -86,8 +92,8 @@ export type InstallDeps = {
     resetServer(id: number): Promise<void>;
     /** The project's SSH key entry for this public key, registering it under `name` if missing. */
     ensureSshKey(name: string, publicKey: string): Promise<{ id: number; created: boolean }>;
-    /** Removes the project's entry for this public key, if any. */
-    removeSshKey(publicKey: string): Promise<boolean>;
+    /** Removes the installer's own key entries, then lists again: `left` is what's still there. Never any other key. */
+    removeInstallKeys(): Promise<{ removed: string[]; left: string[] }>;
     buyFloatingIP(label: string, location: string): Promise<{ id: number; ip: string }>;
     assignFloatingIP(id: number, serverId: number): Promise<void>;
     releaseFloatingIP(id: number): Promise<void>;
@@ -111,7 +117,7 @@ export type InstallDeps = {
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
     findInstallByServer(serverId: string): Promise<InstallRecord | null>;
-    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "repairedAt" | "apiTokenSecret" | "testFloatingIpId">): Promise<InstallRecord>;
+    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "repairedAt" | "purchasedAt" | "costSettledPaise" | "createdAt" | "updatedAt" | "apiTokenSecret" | "testFloatingIpId">): Promise<InstallRecord>;
     updateInstall(id: string, data: Partial<InstallRecord>): Promise<InstallRecord>;
     /** The registered node on this Hetzner server, with how many services and volumes it has. */
     nodeByServerId(serverId: string): Promise<{ id: string; name: string; services: number; volumes: number; apiTokenId: string | null; apiTokenSecret: string | null; ip: string } | null>;
@@ -156,7 +162,7 @@ export type InstallSettings = {
 export const INSTALL_LABEL = "sowsi-node-install";
 // The firewall comes before the Proxmox install, so port 8006 is never open to the
 // internet: ufw is already denying it when pveproxy first starts listening.
-export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "proxmox", "reboot", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
+export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "ipv6", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
 export type StepId = (typeof STEPS)[number];
 
 export const STEP_TITLES: Record<StepId, string> = {
@@ -164,9 +170,11 @@ export const STEP_TITLES: Record<StepId, string> = {
   ssh: "3a wait for SSH (install key), pin the host key",
   hostname: "3b hostname and /etc/hosts",
   firewall: "3f ufw, fail2ban, key-only SSH (before Proxmox, so 8006 is never open)",
-  bridge: "3c write vmbr0 (/32, point-to-point to 172.31.1.1) and verify it",
+  bridge: "3c write vmbr0 (IPv4 /32, point-to-point to 172.31.1.1) and verify it",
+  "boot-safety": "3c+ pin the card name by MAC, boot-time network guard, persistent journal",
   proxmox: "3d install Proxmox VE, remove the Debian kernel, verify, reboot",
-  reboot: "3e wait for SSH after the reboot, check the Proxmox kernel and network",
+  reboot: "3e wait for SSH after the reboot, check the Proxmox kernel and network (rescue repair if it never answers)",
+  ipv6: "3e+ add IPv6 now the bridge is proven up, reload, verify",
   "host-setup": "3g proxmox-host-setup.sh (vmbr1, routes, sowsi-host, storage, template)",
   "api-token": "3h Proxmox API token, stored encrypted; check :8006 from sowsi-mgmt-01",
   lockdown: "3i provisioning key in (restricted), install key out",
@@ -230,6 +238,7 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { prima
     `${serverType} in ${s.location}: €${price.monthlyEur.toFixed(2)}/month, €${price.hourlyEur.toFixed(4)}/hour (gross)`,
     `primary IPv4: €${ip.monthlyEur.toFixed(2)}/month, €${ip.hourlyEur.toFixed(4)}/hour`,
     `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.eurToInr}/€, HETZNER_EUR_TO_INR). Billed hourly until deleted.`,
+    `against the spend cap: ${inr(monthlyPaise)} if it stays as a node; if it's destroyed, only ${inr(hourlyPaise)} per started hour it lived`,
   ];
   if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 (€${(ips.floatingIpv4MonthlyEur ?? 0).toFixed(2)}/month list price), released right after the test`);
   return { monthlyPaise, hourlyPaise, lines };
@@ -237,7 +246,27 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { prima
 
 // ── Plan ──────────────────────────────────────────────────────────────
 
-export type InstallOptions = { name: string; serverType: string; ipv4Test: boolean; approvedBy: string | null; keepOnFailure: boolean; allowDowntime?: boolean };
+export type InstallOptions = {
+  name: string;
+  serverType: string;
+  ipv4Test: boolean;
+  approvedBy: string | null;
+  keepOnFailure: boolean;
+  allowDowntime?: boolean;
+  /** Throwaway tests: point the bridge at a card that doesn't exist before the reboot. */
+  simulateBadNic?: boolean;
+  /** Throwaway tests: leave a layer of protection out, to prove the next one. */
+  noPin?: boolean;
+  noGuard?: boolean;
+};
+
+/** The test-only switches can't reach a real node: they need a throwaway name and each other. */
+export function testFlagProblems(o: Pick<InstallOptions, "name" | "simulateBadNic" | "noPin" | "noGuard">): string[] {
+  const problems: string[] = [];
+  if ((o.noPin || o.noGuard) && !o.simulateBadNic) problems.push("--no-pin and --no-guard are only for use with --simulate-bad-nic");
+  if (o.simulateBadNic && !/test/.test(o.name)) problems.push(`--simulate-bad-nic is only for a throwaway: the --name must contain "test" (got "${o.name}")`);
+  return problems;
+}
 
 export type InstallPlan = { ok: boolean; problems: string[]; notes?: string[]; resumeFrom: StepId | null; install: InstallRecord | null; cost: Cost | null };
 
@@ -248,6 +277,7 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
   if (await deps.db.nodeNameTaken(o.name)) problems.push(`a ProxmoxNode named ${o.name} is already registered`);
   if (o.ipv4Test === false && !s.mgmtHasIpv6) problems.push("sowsi-mgmt-01 has no global IPv6 address, so it can't SSH into the IPv6-only test container — add --ipv4");
 
+  const notes: string[] = [];
   const install = await deps.db.findInstall(o.name);
   let resumeFrom: StepId | null = "server";
   if (install?.status === "IN_PROGRESS") {
@@ -261,6 +291,10 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
   } else {
     const existing = await deps.hetzner.findServerByName(o.name);
     if (existing) problems.push(`a Hetzner server named ${o.name} already exists (id ${existing.id}) and isn't one this installer is running — pick another --name`);
+    if (install) {
+      const was = install.status === "DESTROYED" ? "was destroyed" : "failed last time";
+      notes.push(`this name ${was}${install.hetznerServerId ? ` (server ${install.hetznerServerId})` : ""}; a new server will be bought. The old record is kept, not reused.`);
+    }
   }
 
   // Availability and price come from the server type's own entry. If they can't be read, the plan fails.
@@ -290,7 +324,6 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
       problems.push(`buying it takes this month's infrastructure spend to ${inr(spent + cost.monthlyPaise)}, over the ${inr(s.spendCapPaise)} cap (ENGINE_SPEND_CAP_PAISE) — already ${inr(spent)}`);
     }
   }
-  const notes: string[] = [];
   if (resumeFrom === "reboot" && install?.ipv4) {
     const reachable = await deps
       .ssh(install.ipv4, "install", { hostKeySha256: install.hostKeySha256, timeoutMs: 20_000 })
@@ -317,6 +350,8 @@ type Ctx = {
   tokenSecret: string | null;
   /** This run issued the reboot, so the node gets the full timeout to come back. */
   rebootedNow: boolean;
+  /** Diagnostics for this failure are already saved. */
+  diagnosed?: boolean;
 };
 
 const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -356,6 +391,42 @@ const fail = (step: string, problems: string[]) => {
 
 const nodeRef = (ctx: Ctx) => ({ name: ctx.rec.name, ip: ctx.rec.ipv4! });
 
+/** Install key entries gone, proven by listing; anything else is reported, never hidden. */
+async function removeInstallKeys(deps: InstallDeps, problems: string[]) {
+  const { left } = await deps.hetzner.removeInstallKeys().catch((e) => ({ removed: [] as string[], left: [errMsg(e)] }));
+  if (left.length) problems.push(`install key entry still at Hetzner: ${left.join(", ")}`);
+}
+
+/**
+ * The cap took the full monthly price at purchase. A server that was deleted only cost the
+ * hours it lived (started hours, as Hetzner bills them), so the difference is given back once.
+ */
+async function settleServerCost(deps: InstallDeps, rec: InstallRecord, endedAt: Date): Promise<InstallRecord> {
+  if (rec.costSettledPaise !== null || !rec.hetznerServerId) return rec;
+  const started = rec.purchasedAt ?? rec.createdAt;
+  const hours = Math.max(1, Math.ceil((endedAt.getTime() - started.getTime()) / 3_600_000));
+  const accrued = Math.min(hours * rec.hourlyCostPaise, rec.monthlyCostPaise);
+  await deps.log({ action: "SERVER_COST_SETTLED", toNode: rec.name, cost: accrued - rec.monthlyCostPaise, after: { hetznerServerId: rec.hetznerServerId, hours, accruedPaise: accrued, monthlyPaise: rec.monthlyCostPaise } });
+  return deps.db.updateInstall(rec.id, { costSettledPaise: accrued });
+}
+
+/** Any failed server, not only one that went dark: what the running system says, before it's gone. */
+async function diagnoseOnNode(ctx: Ctx, step: StepId, problems: string[]) {
+  const { deps, rec } = ctx;
+  if (!rec.ipv4 || !rec.hetznerServerId || ctx.diagnosed) return;
+  try {
+    const { shell } = await deps.ssh(rec.ipv4, "install", { hostKeySha256: rec.hostKeySha256, timeoutMs: 20_000 });
+    try {
+      const path = await deps.saveDiagnostics(rec.hetznerServerId, `-${step}`, await shell.exec("node diagnostics", diagnosticsScript(""), { timeoutMs: 3 * 60_000 }));
+      deps.report(`      diagnostics saved: ${path}`);
+    } finally {
+      shell.close();
+    }
+  } catch (err) {
+    problems.push(`no diagnostics: the server can't be reached (${errMsg(err)})`);
+  }
+}
+
 function api(ctx: Ctx): ContainerApi {
   const secret = ctx.tokenSecret ?? (ctx.rec.apiTokenSecret ? ctx.deps.decrypt(ctx.rec.apiTokenSecret) : null);
   if (!secret) throw new Error("no Proxmox API token for this node yet");
@@ -364,13 +435,13 @@ function api(ctx: Ctx): ContainerApi {
 
 /**
  * Waits for a new boot on the pinned host key, then checks it. Null = the node
- * never answered in time. A repaired node has no IPv6 yet: the host setup brings it up.
+ * never answered in time. The first boot is IPv4 only: the next step adds IPv6.
  */
 async function waitForBoot(ctx: Ctx, timeoutMs: number): Promise<Record<string, string> | null> {
   const { deps } = ctx;
   const before = ctx.rec.bootIdBeforeReboot;
   const deadline = deps.now() + timeoutMs;
-  const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.repairedAt ? null : ctx.rec.ipv6Subnet! };
+  const expected = { ipv4: ctx.rec.ipv4! };
   let problems: string[] = [];
   for (;;) {
     if (deps.now() > deadline) {
@@ -413,7 +484,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     // A run that stopped between Hetzner creating the server and recording it: adopt it.
     const stray = await deps.hetzner.findServerByName(o.name);
     if (stray && stray.labels[INSTALL_LABEL] === "1" && stray.ipv4 && stray.ipv6Network) {
-      await save(ctx, { hetznerServerId: String(stray.id), ipv4: stray.ipv4, ipv6Subnet: S.subnetOf(stray.ipv6Network) });
+      await save(ctx, { hetznerServerId: String(stray.id), ipv4: stray.ipv4, ipv6Subnet: S.subnetOf(stray.ipv6Network), purchasedAt: new Date(deps.now()) });
       await deps.log({ action: "SERVER_PURCHASED", toNode: o.name, cost: ctx.rec.monthlyCostPaise, after: { hetznerServerId: stray.id, adopted: true, approvedBy: o.approvedBy } });
       return `server ${stray.id} (bought by an interrupted run): ${stray.ipv4}, ${stray.ipv6Network}`;
     }
@@ -440,7 +511,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       await deps.hetzner.deleteServer(server.id);
       throw new Error(`Hetzner created server ${server.id} without ${server.ipv4 ? "an IPv6 network" : "an IPv4"} — deleted it`);
     }
-    await save(ctx, { hetznerServerId: String(server.id), ipv4: server.ipv4, ipv6Subnet: S.subnetOf(server.ipv6Network) });
+    await save(ctx, { hetznerServerId: String(server.id), ipv4: server.ipv4, ipv6Subnet: S.subnetOf(server.ipv6Network), purchasedAt: new Date(deps.now()) });
     await deps.log({ action: "SERVER_PURCHASED", toNode: o.name, cost: ctx.rec.monthlyCostPaise, after: { hetznerServerId: server.id, serverType: o.serverType, location: s.location, ipv4: server.ipv4, ipv6: server.ipv6Network, approvedBy: o.approvedBy, hourlyCostPaise: ctx.rec.hourlyCostPaise } });
     return `server ${server.id}: ${server.ipv4}, ${server.ipv6Network}`;
   },
@@ -462,7 +533,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
   async bridge(ctx) {
     const live = S.parseFacts(await onNode(ctx, "bridge facts", S.bridgeFactsScript()));
     if (!live.nic || !live.mac) fail("bridge", [`can't find the uplink NIC (default route via "${live.default_dev}")`]);
-    const content = S.interfacesFile({ nic: live.nic, mac: live.mac, ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! });
+    const content = S.interfacesFile({ nic: live.nic, ipv4: ctx.rec.ipv4! });
     const expected = { ipv4: ctx.rec.ipv4!, nic: live.nic, mac: live.mac, sha: S.sha256(content) };
 
     await onNode(ctx, "stage bridge config", S.stageBridgeScript(), { stdin: content });
@@ -472,7 +543,18 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     await onNode(ctx, "install bridge config", S.installBridgeScript(expected.sha));
     const installed = S.checkBridge(S.parseFacts(await onNode(ctx, "bridge facts", S.bridgeFactsScript())), expected, "installed");
     if (installed.length) fail("bridge (installed)", installed);
-    return `vmbr0 on ${live.nic} (${live.mac}): ${ctx.rec.ipv4}/32 via ${S.HETZNER_GATEWAY4}, ${ctx.rec.ipv6Subnet}::1/64 — active from the next boot`;
+    return `vmbr0 on ${live.nic} (${live.mac}): ${ctx.rec.ipv4}/32 via ${S.HETZNER_GATEWAY4}, IPv4 only — active from the next boot`;
+  },
+
+  async "boot-safety"(ctx) {
+    const { o, s } = ctx;
+    const live = S.parseFacts(await onNode(ctx, "bridge facts", S.bridgeFactsScript()));
+    if (!o.noPin) await onNode(ctx, "pin nic", S.pinNicScript({ nic: live.nic, mac: live.mac }), { timeoutMs: 5 * 60_000 });
+    if (!o.noGuard) await onNode(ctx, "install guard", S.installGuardScript({ mac: live.mac, ipv4: ctx.rec.ipv4!, mgmtIp: s.mgmtIp }), { stdin: S.guardScript() });
+    await onNode(ctx, "journald", S.journaldScript());
+    const problems = S.checkBootSafety(S.parseFacts(await onNode(ctx, "boot safety check", S.bootSafetyFactsScript(live.nic))), { nic: live.nic, mac: live.mac, pin: !o.noPin, guard: !o.noGuard });
+    if (problems.length) fail("boot safety", problems);
+    return `${o.noPin ? "NO name pin" : `${live.nic} pinned to ${live.mac}, in every initramfs`}; ${o.noGuard ? "NO guard" : "boot guard enabled"}; journal persistent`;
   },
 
   async proxmox(ctx) {
@@ -499,10 +581,17 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
 
     // The last look before the reboot: the server must come back on vmbr0 with the Proxmox kernel.
     const live = S.parseFacts(await onNode(ctx, "pre-reboot check", S.preRebootFactsScript()));
-    const content = S.interfacesFile({ nic: live.nic, mac: live.mac, ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! });
+    const content = S.interfacesFile({ nic: live.nic, ipv4: ctx.rec.ipv4! });
     const problems = S.checkBridge(live, { ipv4: ctx.rec.ipv4!, nic: live.nic, mac: live.mac, sha: S.sha256(content) }, "pre-reboot");
     if (problems.length) fail("pre-reboot check (not rebooted)", problems);
+    // The Proxmox kernel has its own initramfs: the pin has to be in that one, not only Debian's.
+    const safety = S.checkBootSafety(S.parseFacts(await onNode(ctx, "boot safety check", S.bootSafetyFactsScript(live.nic))), { nic: live.nic, mac: live.mac, pin: !ctx.o.noPin, guard: !ctx.o.noGuard });
+    if (safety.length) fail("pre-reboot check (not rebooted)", safety);
 
+    if (ctx.o.simulateBadNic) {
+      ctx.deps.report(`      --simulate-bad-nic: pointing vmbr0 at ${S.BAD_NIC}`);
+      await onNode(ctx, "simulate bad nic", S.simulateBadNicScript(live.nic));
+    }
     await save(ctx, { bootIdBeforeReboot: live.boot_id });
     await onNode(ctx, "reboot", S.REBOOT_SCRIPT);
     dropShell(ctx);
@@ -526,6 +615,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       const repair = await rescueRepair(args).catch((err) => {
         throw new Error(`${unreachable}. Rescue repair failed: ${errMsg(err)}`);
       });
+      ctx.diagnosed = true;
       if (!repair.repaired) throw new Error(`${unreachable}. ${repair.summary} Diagnostics: ${repair.diagnosticsPath}`);
       dropShell(ctx);
       deps.report(`      ${repair.summary}; booting from its own disk`);
@@ -540,6 +630,13 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const firewall = S.checkFirewall(await onNode(ctx, "firewall check", S.firewallStatusScript()), s.mgmtIp);
     if (firewall.length) fail("firewall check after the reboot", firewall);
     return `${facts.pveversion} on ${facts.kernel}${ctx.rec.repairedAt ? " (recovered by the rescue repair)" : ""}`;
+  },
+
+  async ipv6(ctx) {
+    const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! };
+    const problems = S.checkIpv6(S.parseFacts(await onNode(ctx, "ipv6", S.ipv6Script(expected.ipv6Subnet), { timeoutMs: 2 * 60_000 })), expected);
+    if (problems.length) fail("ipv6", problems);
+    return `${expected.ipv6Subnet}::1/64 on vmbr0 via fe80::1; IPv4 still up; host reaches the internet over IPv6`;
   },
 
   async firewall(ctx) {
@@ -690,6 +787,19 @@ export function resumeSummary(rec: InstallRecord): string[] {
   ];
 }
 
+/**
+ * A finished install keeps its record: its server id, cost and history stay readable, and
+ * --destroy still finds it. The name is freed for a new install, which gets its own row.
+ * A server that's gone only cost the hours it lived, so that is settled here if it wasn't yet.
+ */
+async function archiveInstall(deps: InstallDeps, rec: InstallRecord) {
+  const settled = await settleServerCost(deps, rec, rec.updatedAt);
+  const name = `${rec.name}#${rec.hetznerServerId ?? rec.id}`;
+  await deps.db.updateInstall(settled.id, { name });
+  await deps.log({ action: "NODE_INSTALL_ARCHIVED", toNode: rec.name, after: { archivedAs: name, status: rec.status, hetznerServerId: rec.hetznerServerId } });
+  deps.report(`  ${rec.name}'s old install (${rec.status}) is kept as ${name}; this is a new install`);
+}
+
 export type InstallResult = { ok: true; summary: string } | { ok: false; error: string; serverDeleted: boolean };
 
 export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: InstallSettings): Promise<InstallResult> {
@@ -706,10 +816,8 @@ export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: In
   if (!plan.ok) return { ok: false, error: plan.problems.join("; "), serverDeleted: false };
 
   if (!rec || rec.status !== "IN_PROGRESS") {
-    const fresh = { name: o.name, serverType: o.serverType, location: s.location, monthlyCostPaise: plan.cost!.monthlyPaise, hourlyCostPaise: plan.cost!.hourlyPaise, approvedBy: o.approvedBy };
-    rec = rec
-      ? await deps.db.updateInstall(rec.id, { ...fresh, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, apiTokenSecret: null, testFloatingIpId: null })
-      : await deps.db.createInstall(fresh);
+    if (rec) await archiveInstall(deps, rec);
+    rec = await deps.db.createInstall({ name: o.name, serverType: o.serverType, location: s.location, monthlyCostPaise: plan.cost!.monthlyPaise, hourlyCostPaise: plan.cost!.hourlyPaise, approvedBy: o.approvedBy });
   }
   if (rec.completedSteps.length > 0) {
     for (const line of resumeSummary(rec)) deps.report(line);
@@ -735,11 +843,11 @@ export async function executeInstall(deps: InstallDeps, o: InstallOptions, s: In
     return failInstall(ctx, current, err);
   }
   dropShell(ctx);
-  const installKey = await deps.keys.installPublicKey(false);
-  if (installKey) await deps.hetzner.removeSshKey(installKey).catch(() => false);
+  const keyProblems: string[] = [];
+  await removeInstallKeys(deps, keyProblems);
   const summary = `${o.name} is a Proxmox node (Hetzner server ${ctx.rec.hetznerServerId}, ${ctx.rec.ipv4}). Registered closed: status PROVISIONING, acceptNewClients false — open it by hand when you're ready.`;
   await deps.log({ action: "NODE_REGISTERED", toNode: o.name, after: { hetznerServerId: ctx.rec.hetznerServerId, ipv4: ctx.rec.ipv4, ipv6Subnet: ctx.rec.ipv6Subnet, approvedBy: o.approvedBy } });
-  await deps.alert(`New Proxmox node installed: ${o.name}`, summary);
+  await deps.alert(`New Proxmox node installed: ${o.name}`, [summary, ...keyProblems.map((p) => `! ${p}`)].join("\n"));
   return { ok: true, summary };
 }
 
@@ -776,6 +884,8 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
       .catch((e) => cleanup.push(`Floating IP ${id} NOT released: ${errMsg(e)}`));
   }
 
+  await diagnoseOnNode(ctx, step, cleanup);
+
   let serverDeleted = false;
   if (serverId && !o.keepOnFailure) {
     const secret = ctx.tokenSecret ?? (ctx.rec.apiTokenSecret ? deps.decrypt(ctx.rec.apiTokenSecret) : null);
@@ -793,10 +903,9 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
       }
     }
   }
-  if (!o.keepOnFailure) {
-    const installKey = await deps.keys.installPublicKey(false);
-    if (installKey) await deps.hetzner.removeSshKey(installKey).catch((e) => cleanup.push(`install key entry not removed: ${errMsg(e)}`));
-  }
+  // Kept or not: a rescue registers the key again if it's ever needed.
+  await removeInstallKeys(deps, cleanup);
+  if (serverDeleted) ctx.rec = await settleServerCost(deps, ctx.rec, new Date(deps.now()));
 
   const kept = o.keepOnFailure && serverId;
   await save(ctx, kept ? { error } : { status: "FAILED", error, apiTokenSecret: null });
@@ -820,6 +929,12 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
 
 // ── --destroy ─────────────────────────────────────────────────────────
 
+/** What destroying will do to the spend figure. */
+function destroySpendNote(install: InstallRecord | null): string | null {
+  if (!install?.hetznerServerId || install.costSettledPaise !== null) return null;
+  return `correct the spend: ${inr(install.monthlyCostPaise)} was counted; only the started hours it lived, at ${inr(install.hourlyCostPaise)}/hour, will stay`;
+}
+
 export type DestroyPlan = { ok: boolean; problems: string[]; lines: string[]; server: HetznerServer | null; install: InstallRecord | null; nodeId: string | null };
 
 export async function planDestroy(deps: InstallDeps, serverId: string, s: InstallSettings): Promise<DestroyPlan> {
@@ -837,6 +952,9 @@ export async function planDestroy(deps: InstallDeps, serverId: string, s: Instal
   if (server) lines.push(`delete Hetzner server ${server.id} ${server.name} (${server.serverType}, ${server.ipv4}) and its Primary IPs ${server.primaryIpIds.join(", ") || "(none)"} — saves ${install ? `${inr(install.monthlyCostPaise)}/month` : "its monthly cost"}`);
   else lines.push(`server ${serverId} is already gone at Hetzner`);
   if (install?.testFloatingIpId) lines.push(`release test Floating IP ${install.testFloatingIpId}`);
+  lines.push("remove the installer's key entry at Hetzner, if it's there");
+  const spendNote = destroySpendNote(install);
+  if (spendNote) lines.push(spendNote);
   if (node) lines.push(`remove ProxmoxNode ${node.name} (no services, no volumes)`);
   if (install) lines.push(`mark install ${install.name} DESTROYED`);
   return { ok: problems.length === 0, problems, lines, server, install, nodeId: node?.id ?? null };
@@ -862,8 +980,17 @@ export async function executeDestroy(deps: InstallDeps, serverId: string, approv
     await deps.db.deleteNode(plan.nodeId);
     done.push("removed the ProxmoxNode row");
   }
-  if (plan.install) await deps.db.updateInstall(plan.install.id, { status: "DESTROYED", apiTokenSecret: null, testFloatingIpId: null });
+  if (plan.install) {
+    // A server already gone at Hetzner ended when its record last changed.
+    const alreadySettled = plan.install.costSettledPaise !== null;
+    const settled = await settleServerCost(deps, plan.install, plan.server ? new Date(deps.now()) : plan.install.updatedAt);
+    if (!alreadySettled) done.push(`spend corrected: ${inr(settled.costSettledPaise ?? 0)} for the hours it lived, not ${inr(plan.install.monthlyCostPaise)}`);
+    await deps.db.updateInstall(plan.install.id, { status: "DESTROYED", apiTokenSecret: null, testFloatingIpId: null });
+  }
+  const keyProblems: string[] = [];
+  await removeInstallKeys(deps, keyProblems);
+  if (keyProblems.length === 0) done.push("no installer key entry left at Hetzner");
   await deps.log({ action: "NODE_DESTROYED", toNode: plan.install?.name ?? plan.server?.name, after: { hetznerServerId: serverId, approvedBy, done } });
-  await deps.alert(`Node server destroyed: ${plan.install?.name ?? serverId}`, `${done.join("\n")}\nApproved by ${approvedBy}.`);
-  return { ok: true, lines: done };
+  await deps.alert(`Node server destroyed: ${plan.install?.name ?? serverId}`, `${[...done, ...keyProblems].join("\n")}\nApproved by ${approvedBy}.`);
+  return { ok: keyProblems.length === 0, lines: [...done, ...keyProblems] };
 }

@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import * as S from "./nodeScripts";
 import { freshFirewall, runFirewallScript, type FakeFirewall } from "@/lib/testing/fakeUfw";
 
-const bridge = { nic: "eth0", mac: "96:00:03:aa:bb:cc", ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" };
+const bridge = { nic: "eth0", ipv4: "203.0.113.20", mac: "96:00:03:aa:bb:cc", ipv6Subnet: "2a01:4f8:1c1c:abcd" };
 
 test("every generated script is valid bash", () => {
   const scripts: Record<string, string> = {
@@ -24,6 +24,13 @@ test("every generated script is valid bash", () => {
     addKey: S.addProvisioningKeyScript("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL+L152cRvIkX3R0xtdG4toSwTbblpUz6PioDz89wglD sowsi-provisioning"),
     removeKey: S.removeInstallKeyScript("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIInstallKeyBodyInstallKeyBodyInstallKeyBo sowsi-install", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdminKeyBodyAdminKeyBodyAdminKeyBodyAdmin me"),
     container: S.containerOutboundScript(true),
+    pin: S.pinNicScript(bridge),
+    guard: S.guardScript(),
+    installGuard: S.installGuardScript({ mac: bridge.mac, ipv4: bridge.ipv4, mgmtIp: "2.31.11.105" }),
+    journald: S.journaldScript(),
+    bootSafety: S.bootSafetyFactsScript("eth0"),
+    badNic: S.simulateBadNicScript("eth0"),
+    ipv6: S.ipv6Script(bridge.ipv6Subnet),
     hostSetup: readFileSync("scripts/proxmox-host-setup.sh", "utf8"),
   };
   const bash = spawnSync("bash", ["--version"]);
@@ -34,13 +41,13 @@ test("every generated script is valid bash", () => {
   }
 });
 
-test("vmbr0: the server's /32, point-to-point to 172.31.1.1, bridged to the NIC with its MAC, plus the /64", () => {
+test("the first boot is minimal: IPv4 /32, point-to-point to 172.31.1.1, bridged to the card, no IPv6", () => {
   const f = S.interfacesFile(bridge);
-  for (const line of ["iface eth0 inet manual", "auto vmbr0", "address 203.0.113.20/32", "gateway 172.31.1.1", "pointopoint 172.31.1.1", "bridge-ports eth0", "hwaddress 96:00:03:aa:bb:cc", "address 2a01:4f8:1c1c:abcd::1/64", "gateway fe80::1"]) {
+  for (const line of ["iface eth0 inet manual", "auto vmbr0", "address 203.0.113.20/32", "gateway 172.31.1.1", "pointopoint 172.31.1.1", "bridge-ports eth0"]) {
     assert.ok(f.includes(line), line);
   }
   const config = f.split("\n").filter((l) => !l.startsWith("#")).join("\n");
-  assert.doesNotMatch(config, /source|dhcp|vmbr1/, "nothing else is pulled in; vmbr1 comes from the host setup");
+  assert.doesNotMatch(config, /source|dhcp|vmbr1|inet6|hwaddress/, "nothing else is pulled in; vmbr1 comes from the host setup");
 });
 
 const good = (sha: string) => ({
@@ -97,7 +104,7 @@ test("the token secret comes from pveum's JSON and must be root@pam!sowsi withou
 // The real formats, from the tools' own sources and the live server.
 const UFW = `ufw<<
 Status: active
-Logging: on (low)
+Logging: off
 Default: deny (incoming), allow (outgoing), allow (routed)
 New profiles: skip
 
@@ -130,6 +137,7 @@ test("firewall: deny in, 22/80/443, 8006 only from sowsi-mgmt-01, routed vmbr1, 
   assert.match(S.checkFirewall(UFW.replace("sshd_root=without-password", "sshd_root=yes"), "2.31.11.105").join(), /permitrootlogin is yes, expected prohibit-password/);
   assert.deepEqual(S.checkFirewall(UFW.replace("sshd_root=without-password", "sshd_root=prohibit-password"), "2.31.11.105"), [], "either spelling");
   assert.match(S.checkFirewall(UFW.replace("Status: active", "Status: inactive"), "2.31.11.105").join(), /not active/);
+  assert.match(S.checkFirewall(UFW.replace("Logging: off", "Logging: on (low)"), "2.31.11.105").join(), /logging is still on/);
   assert.match(S.checkFirewall(UFW, "2.31.11.106").join(), /8006 isn't limited to 2\.31\.11\.106/);
 });
 
@@ -291,4 +299,71 @@ test("3d doesn't hold the SSH call open for the whole install", () => {
 test("3h finds the token JSON even with other output around it", () => {
   const json = JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: 0 }, value: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" }, null, 2);
   assert.equal(S.parseTokenSecret(`perl: warning: Setting locale failed.\n${json}\n`), "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0");
+});
+
+// ── The name pin, journald and IPv6 steps ────────────────────────────
+
+const pinOk = {
+  pin_file: S.sha256(S.linkFile(bridge)),
+  pin_link: S.LINK_FILE,
+  pin_initrd: "yes",
+  guard_unit: "enabled",
+  guard_script: S.sha256(S.guardScript()),
+  journal_storage: "persistent",
+  journal_dir: "yes",
+};
+
+test("the pin is verified where it counts: the file, what udev applies, and every initramfs", () => {
+  const want = { nic: "eth0", mac: bridge.mac, pin: true, guard: true };
+  assert.deepEqual(S.checkBootSafety(pinOk, want), []);
+  assert.match(S.checkBootSafety({ ...pinOk, pin_link: "/usr/lib/systemd/network/99-default.link" }, want).join(), /udev doesn't apply the pin/);
+  assert.match(S.checkBootSafety({ ...pinOk, pin_initrd: "no" }, want).join(), /every initramfs/);
+  assert.match(S.checkBootSafety({ ...pinOk, pin_file: "0" }, want).join(), /isn't exactly the generated pin/);
+  assert.match(S.checkBootSafety({ ...pinOk, guard_unit: "disabled" }, want).join(), /not enabled/);
+  assert.match(S.checkBootSafety({ ...pinOk, guard_script: "0" }, want).join(), /isn't exactly the generated guard/);
+  assert.match(S.checkBootSafety({ ...pinOk, journal_storage: "auto" }, want).join(), /not persistent/);
+  assert.deepEqual(S.checkBootSafety({ journal_storage: "persistent", journal_dir: "yes" }, { ...want, pin: false, guard: false }), [], "switched off for a test");
+  assert.throws(() => S.pinNicScript({ nic: "eth0; reboot", mac: bridge.mac }), /card name/);
+  assert.throws(() => S.pinNicScript({ nic: "eth0", mac: "nope" }), /MAC/);
+});
+
+test("the pin goes into the initramfs on Debian's kernel and again on Proxmox's", () => {
+  assert.match(S.pinNicScript(bridge), /update-initramfs -u -k all/);
+  const install = S.pveInstallScript();
+  assert.ok(install.indexOf("update-initramfs -u -k all") > install.indexOf("install proxmox-ve"));
+  assert.ok(install.indexOf("update-initramfs -u -k all") < install.indexOf("update-grub"));
+});
+
+test("real udevadm, lsinitramfs and systemd-analyze output parses", (t) => {
+  if (spawnSync("bash", ["--version"]).error) return t.skip("no bash");
+  const stubs = `udevadm() { printf 'ID_NET_DRIVER=virtio_net\\nID_NET_LINK_FILE=${S.LINK_FILE}\\nID_NET_NAME=eth0\\n'; }
+sha256sum() { echo "abc  $1"; }
+lsinitramfs() { echo usr/lib/systemd/network/10-sowsi-uplink.link; }
+systemctl() { echo enabled; }
+systemd-analyze() { printf '# /etc/systemd/journald.conf\\n[Journal]\\n#Storage=auto\\n# /etc/systemd/journald.conf.d/00-sowsi.conf\\n[Journal]\\nStorage=persistent\\n'; }`;
+  const r = spawnSync("bash", ["-s"], { input: `${stubs}\n${S.bootSafetyFactsScript("eth0")}`, encoding: "utf8" });
+  const f = S.parseFacts(r.stdout);
+  assert.equal(f.pin_link, S.LINK_FILE);
+  assert.equal(f.pin_initrd, "yes");
+  assert.equal(f.guard_unit, "enabled");
+  assert.equal(f.journal_storage, "persistent", "the last value, not the commented default");
+});
+
+test("IPv6 is added by its own step, idempotently, and proven", () => {
+  const script = S.ipv6Script(bridge.ipv6Subnet);
+  assert.match(script, /grep -q '\^iface vmbr0 inet6'/);
+  assert.ok(script.indexOf("cp -a") < script.indexOf(">> \"$F\""), "backed up first");
+  assert.ok(script.indexOf(">> \"$F\"") < script.indexOf("ifreload -a"));
+  const ok = { ipv6: "2a01:4f8:1c1c:abcd::1/64", route6: "fe80::1 vmbr0", ipv4: bridge.ipv4, out6: "ok" };
+  const want = { ipv4: bridge.ipv4, ipv6Subnet: bridge.ipv6Subnet };
+  assert.deepEqual(S.checkIpv6(ok, want), []);
+  assert.match(S.checkIpv6({ ...ok, ipv4: "" }, want).join(), /lost its IPv4/);
+  assert.match(S.checkIpv6({ ...ok, route6: "" }, want).join(), /default route/);
+  assert.match(S.checkIpv6({ ...ok, out6: "fail" }, want).join(), /over IPv6/);
+});
+
+test("--simulate-bad-nic only rewrites vmbr0's port", () => {
+  const script = S.simulateBadNicScript("eth0");
+  assert.match(script, /bridge-ports eth0\$\/bridge-ports sowsibad0/);
+  assert.match(script, /iface eth0 inet manual\/iface sowsibad0 inet manual/);
 });

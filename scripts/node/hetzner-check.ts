@@ -29,7 +29,7 @@ const serverType = i >= 0 ? argv[i + 1] : undefined;
     return res.data;
   };
 
-  const results = await runHetznerChecks(get, { serverType, location: "nbg1" });
+  const results = await runHetznerChecks(get, { serverType, location: "nbg1", ownServerIds: [process.env.HETZNER_SERVER_ID ?? ""].filter(Boolean) });
   console.log(formatResults(results));
   if (results.some((r) => !r.ok)) process.exitCode = 1;
 })().catch((err) => {

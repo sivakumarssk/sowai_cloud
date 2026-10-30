@@ -89,3 +89,28 @@ test("the check can only read: no write method anywhere in the script or its mod
     assert.doesNotMatch(code, /new HetznerService|\bhetzner\.[a-zA-Z]+\(/, `${f} must not use the read-write client`);
   }
 });
+
+test("prints the SSH key names, flags any but sowsi-hosting, and flags servers that aren't ours", async () => {
+  const { hz, get } = setup();
+  const h = new HetznerService({ adapter: hz.adapter, token: "t", pollMs: 1 });
+  await h.createSshKey("sowsi-hosting", "ssh-ed25519 AAAA1");
+  await h.createSshKey("sowsi-install", "ssh-ed25519 AAAA2");
+  for (const name of ["sowsi-mgmt-01", "sowsi-proxmox-01", "sowsi-test-01", "someone-elses"]) {
+    await h.createServer({ name, serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: name === "sowsi-test-01" ? { "sowsi-node-install": "1" } : {} });
+  }
+  const text = formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1" }));
+  assert.match(text, /key sowsi-hosting/);
+  assert.match(text, /UNEXPECTED key sowsi-install \(id \d+\)/);
+  assert.doesNotMatch(text, /UNEXPECTED key sowsi-hosting/);
+  assert.match(text, /NOT OURS: server \d+ someone-elses/);
+  assert.doesNotMatch(text, /NOT OURS: server \d+ sowsi-/);
+  assert.match(text, /All 10 checks passed/, "a flag is a warning, not a failed endpoint");
+});
+
+test("a server is ours by label, by its id, or by our naming", async () => {
+  const { hz, get } = setup();
+  const h = new HetznerService({ adapter: hz.adapter, token: "t", pollMs: 1 });
+  const s = await h.createServer({ name: "renamed-node", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  assert.match(formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1" })), /NOT OURS/);
+  assert.doesNotMatch(formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", ownServerIds: [String(s.id)] })), /NOT OURS/);
+});

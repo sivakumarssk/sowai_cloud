@@ -1,12 +1,11 @@
 // What runs inside the Hetzner rescue system when a new node doesn't come back
 // from its first reboot, and how its output is read. Pure: no SSH here.
-import { HETZNER_GATEWAY4, parseFacts, sha256 } from "./nodeScripts";
+import { interfacesFile, LINK_FILE, linkFile, parseFacts, sha256 } from "./nodeScripts";
+
+export { LINK_FILE, linkFile };
 
 /** Where the node's own disk is mounted in the rescue system. */
 export const ROOT = "/mnt/sowsi-root";
-/** Pins the card's name by MAC, on the node's disk and in its initramfs. */
-export const LINK_FILE = "/etc/systemd/network/10-sowsi-uplink.link";
-
 export const LSBLK_COMMAND = "lsblk -J -b -o NAME,PATH,LABEL,SIZE,FSTYPE,TYPE,MOUNTPOINT";
 
 type BlockDevice = { path?: string; name?: string; label?: string | null; size?: number | string; fstype?: string | null; type?: string; mountpoint?: string | null; children?: BlockDevice[] };
@@ -42,10 +41,10 @@ export const UNMOUNT_SCRIPT = `sync; umount ${ROOT} 2>/dev/null || umount -l ${R
 
 /**
  * Everything worth knowing about why the node has no network. Reads only.
- * Key facts come last, as sowsi_* lines.
+ * Key facts come last, as sowsi_* lines. `root` "" reads the running system instead of a mounted disk.
  */
-export function diagnosticsScript(): string {
-  return `R=${ROOT}
+export function diagnosticsScript(root: string = ROOT): string {
+  return `R=${root}
 section() { echo; echo "=== $1"; }
 show() { for f in "$@"; do [ -e "$f" ] || continue; echo "--- $f"; cat "$f" 2>&1; done; }
 journal() { journalctl -D "$R/var/log/journal" --no-pager "$@" 2>&1; }
@@ -66,7 +65,9 @@ section "ufw log setting"; grep -E '^(ENABLED|LOGLEVEL)' "$R/etc/ufw/ufw.conf" 2
 
 section "facts"
 ports=$(awk '$1=="bridge-ports"{print $2; exit}' "$R/etc/network/interfaces")
-mac=$(awk '$1=="hwaddress"{print $NF; exit}' "$R/etc/network/interfaces" | tr 'A-Z' 'a-z')
+mac=$(awk -F= '$1=="MACAddress"{print $2; exit}' "$R${LINK_FILE}" 2>/dev/null | tr 'A-Z' 'a-z')
+[ -n "$mac" ] || mac=$(awk '$1=="hwaddress"{print $NF; exit}' "$R/etc/network/interfaces" | tr 'A-Z' 'a-z')
+pinned=$(awk -F= '$1=="Name"{print $2; exit}' "$R${LINK_FILE}" 2>/dev/null)
 dev=""; count=0; only=""
 for d in /sys/class/net/*; do
   n=\${d##*/}; [ "$n" = lo ] && continue
@@ -89,6 +90,7 @@ echo "sowsi_bridge_ports=$ports"
 echo "sowsi_mac=$mac"
 echo "sowsi_rescue_dev=$dev"
 echo "sowsi_name_udev=$udev"
+echo "sowsi_name_pin=$pinned"
 echo "sowsi_name_journal=$named"
 echo "sowsi_port_errors=$porterr"
 echo "sowsi_journal=$([ -d "$R/var/log/journal" ] && echo yes || echo no)"
@@ -107,11 +109,12 @@ export type Diagnosis = {
 export function diagnose(text: string): Diagnosis {
   const f = parseFacts(text);
   const ports = f.sowsi_bridge_ports ?? "";
-  const real = f.sowsi_name_journal || f.sowsi_name_udev || "";
+  // What the kernel really did, then what the pin says, then the name udev would pick.
+  const real = f.sowsi_name_journal || f.sowsi_name_pin || f.sowsi_name_udev || "";
   const evidence = [
     `bridge-ports in /etc/network/interfaces: ${ports || "none"}`,
     `card MAC ${f.sowsi_mac || "unknown"}, ${f.sowsi_rescue_dev ? `found as ${f.sowsi_rescue_dev} on the rescue system` : "not found on the rescue system"}`,
-    `its name on the node's own kernel: ${f.sowsi_name_journal ? `${f.sowsi_name_journal} (failed boot's journal)` : "not in the journal"}; udev path name: ${f.sowsi_name_udev || "none"}`,
+    `its name on the node's own kernel: ${f.sowsi_name_journal ? `${f.sowsi_name_journal} (failed boot's journal)` : "not in the journal"}; pinned: ${f.sowsi_name_pin || "no"}; udev path name: ${f.sowsi_name_udev || "none"}`,
     `journal lines saying ${ports || "the port"} is missing: ${f.sowsi_port_errors ?? "0"}`,
   ];
   const usable = Boolean(f.sowsi_rescue_dev && f.sowsi_mac);
@@ -128,35 +131,6 @@ export function diagnose(text: string): Diagnosis {
     evidence,
     repair: { nic: real, mac: f.sowsi_mac },
   };
-}
-
-/** The known-good shape from node 1: IPv4 only. proxmox-host-setup.sh adds vmbr1, which brings IPv6 up. */
-export function minimalInterfacesFile({ nic, ipv4 }: { nic: string; ipv4: string }): string {
-  return `# Written by Sowsi install-node (rescue repair). proxmox-host-setup.sh appends vmbr1.
-auto lo
-iface lo inet loopback
-
-iface ${nic} inet manual
-
-auto vmbr0
-iface vmbr0 inet static
-    address ${ipv4}/32
-    gateway ${HETZNER_GATEWAY4}
-    pointopoint ${HETZNER_GATEWAY4}
-    bridge-ports ${nic}
-    bridge-stp off
-    bridge-fd 0
-`;
-}
-
-export function linkFile({ nic, mac }: { nic: string; mac: string }): string {
-  return `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.
-[Match]
-MACAddress=${mac}
-
-[Link]
-Name=${nic}
-`;
 }
 
 export type RepairPlan = { nic: string; mac: string; ipv4: string; stamp: string };
@@ -196,7 +170,7 @@ echo "sowsi_initrd_pin=$pin"`;
 export function checkRepair(output: string, plan: RepairPlan): string[] {
   const f = parseFacts(output);
   const problems: string[] = [];
-  if (f.sowsi_interfaces_sha !== sha256(minimalInterfacesFile(plan))) problems.push("/etc/network/interfaces isn't exactly the repaired config");
+  if (f.sowsi_interfaces_sha !== sha256(interfacesFile(plan))) problems.push("/etc/network/interfaces isn't exactly the repaired config");
   if (f.sowsi_link_sha !== sha256(linkFile(plan))) problems.push(`${LINK_FILE} isn't exactly what was written`);
   if (f.sowsi_initrd_pin !== "yes") problems.push("the name pin isn't in every initramfs");
   if (!f.sowsi_backup) problems.push("no backup of the original interfaces file was reported");

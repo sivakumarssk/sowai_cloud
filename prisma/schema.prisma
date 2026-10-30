@@ -487,6 +487,10 @@ model NodeInstall {
   hostKeySha256      String?
   /// boot_id just before the reboot into Proxmox; the reboot step waits for a new one.
   bootIdBeforeReboot String?
+  /// When Hetzner billing started.
+  purchasedAt        DateTime?
+  /// What a deleted server really cost (started hours), in paise. Set once, when the spend is corrected.
+  costSettledPaise   Int?
   /// When the rescue repair ran. It runs at most once per install (src/lib/nodes/rescueRepair.ts).
   repairedAt         DateTime?
   /// Steps that finished, in order (see src/lib/nodes/installNode.ts).

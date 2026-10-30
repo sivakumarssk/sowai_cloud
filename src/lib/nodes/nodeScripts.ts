@@ -74,15 +74,15 @@ export function checkHostname(facts: Record<string, string>, name: string, ipv4:
 
 // ── c) bridge config, verified before any reboot ────────────────────
 
-export type BridgeInput = { nic: string; mac: string; ipv4: string; ipv6Subnet: string };
+export type BridgeInput = { nic: string; ipv4: string };
 
 /**
- * The complete /etc/network/interfaces: vmbr0 bridged to the NIC with the
- * server's /32, point-to-point to Hetzner's gateway, and the NIC's MAC (Hetzner
- * only forwards traffic from it). proxmox-host-setup.sh appends vmbr1 later.
+ * The complete /etc/network/interfaces for the first boot: vmbr0 bridged to the card with
+ * the server's /32, point-to-point to Hetzner's gateway. IPv4 only, as on node 1: IPv6 is
+ * added by a later step, once SSH is back. proxmox-host-setup.sh appends vmbr1.
  */
-export function interfacesFile({ nic, mac, ipv4, ipv6Subnet }: BridgeInput): string {
-  return `# Written by Sowsi install-node (step c). proxmox-host-setup.sh appends vmbr1.
+export function interfacesFile({ nic, ipv4 }: BridgeInput): string {
+  return `# Written by Sowsi install-node. proxmox-host-setup.sh appends vmbr1.
 auto lo
 iface lo inet loopback
 
@@ -96,12 +96,218 @@ iface vmbr0 inet static
     bridge-ports ${nic}
     bridge-stp off
     bridge-fd 0
-    hwaddress ${mac}
-
-iface vmbr0 inet6 static
-    address ${ipv6Subnet}::1/64
-    gateway fe80::1
 `;
+}
+
+/** Pins the card's name by MAC, on the disk and in the initramfs. */
+export const LINK_FILE = "/etc/systemd/network/10-sowsi-uplink.link";
+
+export function linkFile({ nic, mac }: { nic: string; mac: string }): string {
+  return `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.
+[Match]
+MACAddress=${mac}
+
+[Link]
+Name=${nic}
+`;
+}
+
+const assertNic = (nic: string) => {
+  if (!/^[a-z][a-z0-9]{1,14}$/.test(nic)) throw new Error(`unexpected card name "${nic}"`);
+};
+const assertMac = (mac: string) => {
+  if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) throw new Error(`unexpected MAC "${mac}"`);
+};
+
+/** Writes the pin and rebuilds the initramfs: the rename happens there, before the root disk is mounted. */
+export function pinNicScript({ nic, mac }: { nic: string; mac: string }): string {
+  assertNic(nic);
+  assertMac(mac);
+  return `set -euo pipefail
+mkdir -p /etc/systemd/network
+cat > ${LINK_FILE} <<'EOF'
+${linkFile({ nic, mac }).trimEnd()}
+EOF
+update-initramfs -u -k all`;
+}
+
+export const GUARD_SCRIPT = "/usr/local/sbin/sowsi-net-guard";
+export const GUARD_UNIT = "sowsi-net-guard.service";
+export const GUARD_CONF = "/etc/sowsi-net-guard.conf";
+
+/**
+ * Runs at every boot. Does nothing if the network works. Otherwise it finds the card by MAC,
+ * corrects vmbr0's port and reloads; if that isn't enough it drops the bridge for this boot and
+ * falls back to DHCP, so the node can be reached. The fallback isn't written to disk: the next
+ * boot tries the bridge again.
+ *
+ * sowsi-mgmt-01 being down must not look like a broken node, so reaching anything counts.
+ */
+export function guardScript(): string {
+  return `#!/usr/bin/env bash
+CONF=\${SOWSI_GUARD_CONF:-${GUARD_CONF}}
+IFACES=\${SOWSI_GUARD_INTERFACES:-/etc/network/interfaces}
+SYS=\${SOWSI_GUARD_SYS:-/sys/class/net}
+LOG=\${SOWSI_GUARD_LOG:-/var/log/sowsi-net-guard.log}
+. "$CONF"
+
+log() { echo "$(date -Is) $*" >> "$LOG"; }
+can_reach() { timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; }
+online() { can_reach "$MGMT_IP" 22 || can_reach 185.12.64.1 53 || can_reach 1.1.1.1 443; }
+wait_online() {
+  for _ in $(seq 1 $(($1 / 5))); do
+    online && return 0
+    sleep 5
+  done
+  return 1
+}
+
+wait_online 90 && exit 0
+
+log "no network after 90 seconds"
+card=""
+for d in "$SYS"/*; do
+  [ -e "$d/device" ] || continue
+  [ "$(cat "$d/address")" = "$MAC" ] && card=\${d##*/}
+done
+if [ -z "$card" ]; then
+  log "no card with MAC $MAC; nothing changed"
+  exit 1
+fi
+
+port=$(awk '$1=="bridge-ports" && $2!="none"{print $2; exit}' "$IFACES")
+if [ "$port" != "$card" ]; then
+  cp -a "$IFACES" "$IFACES.sowsi-guard-$(date +%s)"
+  sed -i -e "s/^iface $port inet manual/iface $card inet manual/" -e "/^iface vmbr0 inet static/,/^\\$/s/bridge-ports .*/bridge-ports $card/" "$IFACES"
+  log "vmbr0 pointed at $port; the card with MAC $MAC is $card: interfaces file corrected"
+fi
+ifreload -a
+if wait_online 30; then
+  log "network is back on vmbr0 ($card)"
+  exit 0
+fi
+
+log "still no network: dropping vmbr0 for this boot, falling back to DHCP on $card"
+ip link set vmbr0 down
+ip link del vmbr0
+ip link set "$card" up
+if command -v dhclient >/dev/null; then
+  timeout 30 dhclient -1 "$card"
+else
+  ip addr add "$IPV4/32" dev "$card"
+  ip route add "$GATEWAY" dev "$card"
+  ip route add default via "$GATEWAY" dev "$card"
+fi
+if wait_online 30; then log "network is back on $card without the bridge"; else log "still no network"; fi
+`;
+}
+
+/** Installs the guard, its settings and its unit. The script arrives on stdin. */
+export function installGuardScript({ mac, ipv4, mgmtIp }: { mac: string; ipv4: string; mgmtIp: string }): string {
+  assertMac(mac);
+  return `set -euo pipefail
+cat > ${GUARD_SCRIPT}
+chmod 755 ${GUARD_SCRIPT}
+cat > ${GUARD_CONF} <<'EOF'
+MAC=${mac}
+IPV4=${ipv4}
+GATEWAY=${HETZNER_GATEWAY4}
+MGMT_IP=${mgmtIp}
+EOF
+cat > /etc/systemd/system/${GUARD_UNIT} <<'EOF'
+[Unit]
+Description=Sowsi network guard: repairs the node's network if it can't reach anything at boot
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=${GUARD_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable ${GUARD_UNIT}`;
+}
+
+/** A failed boot has to be readable afterwards. */
+export function journaldScript(): string {
+  return `set -euo pipefail
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+printf '[Journal]\\nStorage=persistent\\n' > /etc/systemd/journald.conf.d/00-sowsi.conf
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+systemctl restart systemd-journald
+journalctl --flush`;
+}
+
+/** What protects the first boot, as it really is on the machine. */
+export function bootSafetyFactsScript(nic: string): string {
+  assertNic(nic);
+  return `echo "pin_file=$(sha256sum ${LINK_FILE} 2>/dev/null | cut -d' ' -f1)"
+echo "pin_link=$(udevadm test-builtin net_setup_link /sys/class/net/${nic} 2>/dev/null | sed -n 's/^ID_NET_LINK_FILE=//p')"
+pin=yes
+for f in /boot/initrd.img-*; do lsinitramfs "$f" | grep -q 10-sowsi-uplink.link || pin=no; done
+echo "pin_initrd=$pin"
+echo "guard_unit=$(systemctl is-enabled ${GUARD_UNIT} 2>/dev/null)"
+echo "guard_script=$(sha256sum ${GUARD_SCRIPT} 2>/dev/null | cut -d' ' -f1)"
+echo "journal_storage=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= '/^Storage=/{v=$2} END{print v}')"
+echo "journal_dir=$([ -d /var/log/journal ] && echo yes || echo no)"`;
+}
+
+export function checkBootSafety(facts: Record<string, string>, expected: { nic: string; mac: string; pin: boolean; guard: boolean }): string[] {
+  const problems: string[] = [];
+  if (expected.pin) {
+    if (facts.pin_file !== sha256(linkFile(expected))) problems.push(`${LINK_FILE} isn't exactly the generated pin`);
+    if (facts.pin_link !== LINK_FILE) problems.push(`udev doesn't apply the pin to ${expected.nic} (it uses ${facts.pin_link || "nothing"})`);
+    if (facts.pin_initrd !== "yes") problems.push("the name pin isn't in every initramfs");
+  }
+  if (expected.guard) {
+    if (facts.guard_unit !== "enabled") problems.push(`${GUARD_UNIT} is ${facts.guard_unit || "missing"}, not enabled`);
+    if (facts.guard_script !== sha256(guardScript())) problems.push(`${GUARD_SCRIPT} isn't exactly the generated guard`);
+  }
+  if (facts.journal_storage !== "persistent") problems.push(`journald Storage is ${facts.journal_storage || "unknown"}, not persistent`);
+  if (facts.journal_dir !== "yes") problems.push("/var/log/journal doesn't exist");
+  return problems;
+}
+
+/** A card name that doesn't exist, for proving the guard and the rescue repair on a throwaway. */
+export const BAD_NIC = "sowsibad0";
+
+/** Points vmbr0 at the bad name. Only with --simulate-bad-nic, after every check has passed. */
+export function simulateBadNicScript(nic: string): string {
+  assertNic(nic);
+  return `sed -i -e 's/^iface ${nic} inet manual/iface ${BAD_NIC} inet manual/' -e 's/bridge-ports ${nic}$/bridge-ports ${BAD_NIC}/' /etc/network/interfaces
+grep -c 'bridge-ports ${BAD_NIC}' /etc/network/interfaces`;
+}
+
+/** After the bridge is proven up: adds the IPv6 stanza and reloads. Safe to run again. */
+export function ipv6Script(ipv6Subnet: string): string {
+  return `set -euo pipefail
+F=/etc/network/interfaces
+if ! grep -q '^iface vmbr0 inet6' "$F"; then
+  cp -a "$F" "$F.sowsi-before-ipv6"
+  printf '\\niface vmbr0 inet6 static\\n    address ${ipv6Subnet}::1/64\\n    gateway fe80::1\\n' >> "$F"
+fi
+ifreload -a
+out6=fail
+for _ in $(seq 1 15); do
+  if curl -6 -fsS -o /dev/null -m 5 ${OUTBOUND_URL}; then out6=ok; break; fi
+  sleep 2
+done
+echo "ipv6=$(ip -o -6 addr show dev vmbr0 scope global | awk '{print $4; exit}')"
+echo "route6=$(ip -6 route show default | awk '{print $3" "$5; exit}')"
+echo "ipv4=$(ip -o -4 addr show dev vmbr0 | awk '{print $4; exit}' | cut -d/ -f1)"
+echo "out6=$out6"`;
+}
+
+export function checkIpv6(facts: Record<string, string>, expected: { ipv4: string; ipv6Subnet: string }): string[] {
+  const problems: string[] = [];
+  if (facts.ipv6 !== `${expected.ipv6Subnet}::1/64`) problems.push(`vmbr0 has IPv6 "${facts.ipv6}", expected ${expected.ipv6Subnet}::1/64`);
+  if (facts.route6 !== "fe80::1 vmbr0") problems.push(`IPv6 default route is "${facts.route6}", expected via fe80::1 on vmbr0`);
+  if (facts.ipv4 !== expected.ipv4) problems.push(`vmbr0 lost its IPv4 (now "${facts.ipv4}")`);
+  if (facts.out6 !== "ok") problems.push("the host can't reach the internet over IPv6");
+  return problems;
 }
 
 export const STAGED_INTERFACES = "/etc/network/interfaces.sowsi-new";
@@ -210,6 +416,8 @@ ls /boot/vmlinuz-*-pve >/dev/null
 debian=$(dpkg-query -W -f='\${Package} \${Status}\\n' 'linux-image-*' 2>/dev/null | awk '/install ok installed/{print $1}' || true)
 if [[ -n $debian ]]; then $APT remove $debian; fi
 $APT remove os-prober || true
+# The Proxmox kernel's initramfs must carry the name pin too.
+update-initramfs -u -k all
 update-grub
 echo "PVE_INSTALL_DONE"
 `;
@@ -256,8 +464,8 @@ echo "pve_services=$(systemctl is-active pve-cluster pvedaemon pveproxy | tr '\\
 echo "boot_id=$(cat /proc/sys/kernel/random/boot_id)"`;
 }
 
-/** `ipv6Subnet` null = no IPv6 expected yet (a repaired node, IPv4 only until the host setup). */
-export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4: string; ipv6Subnet: string | null }): string[] {
+/** The first boot is IPv4 only: `ipv6Subnet` is checked only when given. */
+export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4: string; ipv6Subnet?: string | null }): string[] {
   const problems: string[] = [];
   if (!facts.kernel?.endsWith("-pve")) problems.push(`running kernel "${facts.kernel}" isn't a Proxmox kernel`);
   if (!facts.pveversion?.startsWith("pve-manager/")) problems.push(`pveversion says "${facts.pveversion}"`);
@@ -295,6 +503,8 @@ sysctl -q -w net.ipv4.ip_forward=1
 ufw default deny incoming
 ufw default allow outgoing
 ufw default allow routed
+# Scanner hits otherwise fill the VNC console with [UFW BLOCK] lines.
+ufw logging off
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -333,6 +543,7 @@ export function checkFirewall(output: string, mgmtIp: string): string[] {
   const ufw = /ufw<<([\s\S]*)>>ufw/.exec(output)?.[1] ?? "";
   const facts = parseFacts(output);
   if (!/Status: active/.test(ufw)) problems.push("ufw is not active");
+  if (!/^Logging: off/m.test(ufw)) problems.push("ufw logging is still on");
   const defaults = /Default: (\S+) \(incoming\), (\S+) \(outgoing\), (\S+) \(routed\)/.exec(ufw);
   if (!defaults) problems.push("ufw status has no Default: line");
   else {

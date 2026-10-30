@@ -4,6 +4,9 @@ import type { InstallDeps } from "./installNode";
 /** Type + base64 body of an OpenSSH public key (the comment doesn't count). */
 export const keyId = (publicKey: string) => publicKey.trim().split(/\s+/).slice(0, 2).join(" ");
 
+/** Names the installer gives its own entry (a suffix when the name was taken). No other key is ever removed. */
+export const isInstallKeyEntry = (name: string) => /^sowsi-install(-\d+)?$/.test(name);
+
 /** The Hetzner calls the installer makes. Tests run this same code against a simulated Hetzner. */
 export function installHetznerApi(hetzner: HetznerService): InstallDeps["hetzner"] {
   return {
@@ -25,11 +28,13 @@ export function installHetznerApi(hetzner: HetznerService): InstallDeps["hetzner
       const created = await hetzner.createSshKey(taken ? `${name}-${Date.now()}` : name, publicKey, { "sowsi-key": name });
       return { id: created.id, created: true };
     },
-    async removeSshKey(publicKey) {
-      const existing = (await hetzner.listSshKeys()).find((k) => keyId(k.publicKey) === keyId(publicKey));
-      if (!existing) return false;
-      await hetzner.deleteSshKey(existing.id);
-      return true;
+    async removeInstallKeys() {
+      const removed: string[] = [];
+      for (const key of (await hetzner.listSshKeys()).filter((k) => isInstallKeyEntry(k.name))) {
+        await hetzner.deleteSshKey(key.id);
+        removed.push(key.name);
+      }
+      return { removed, left: (await hetzner.listSshKeys()).filter((k) => isInstallKeyEntry(k.name)).map((k) => `${k.name} (${k.id})`) };
     },
     buyFloatingIP: (label, location) => hetzner.buyFloatingIP(label, location),
     assignFloatingIP: (id, serverId) => hetzner.assignFloatingIP(id, serverId),

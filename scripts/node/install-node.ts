@@ -16,6 +16,9 @@
  * system: power cycle, diagnostics saved to /root/node-diagnostics, network repaired, install
  * resumed. A node holding customers is refused unless --allow-downtime is given.
  *
+ * Throwaway tests (--name must contain "test"): --simulate-bad-nic points the bridge at a card that
+ * doesn't exist before the reboot; add --no-guard to prove the rescue repair instead of the guard.
+ *
  * .env: MGMT_PUBLIC_IP, NODE_ADMIN_SSH_PUBLIC_KEY, HETZNER_API_TOKEN, PROVISIONING_SSH_* ;
  * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_EUR_TO_INR [100].
  */
@@ -97,7 +100,9 @@ function lock(): () => void {
     }
 
     // ── install ──
-    const options = { name: value("--name") ?? "", serverType: value("--type") ?? "", ipv4Test: flag("--ipv4"), approvedBy, keepOnFailure: flag("--keep-on-failure"), allowDowntime: flag("--allow-downtime") };
+    const options = { name: value("--name") ?? "", serverType: value("--type") ?? "", ipv4Test: flag("--ipv4"), approvedBy, keepOnFailure: flag("--keep-on-failure"), allowDowntime: flag("--allow-downtime"), simulateBadNic: flag("--simulate-bad-nic"), noPin: flag("--no-pin"), noGuard: flag("--no-guard") };
+    const flagProblems = N.testFlagProblems(options);
+    if (flagProblems.length) throw new Error(flagProblems.join("; "));
     const plan = await N.planInstall(deps, options, settings);
 
     console.log(`Install node ${options.name || "?"} (${options.serverType || "?"}, ${settings.location}, ${settings.image})`);

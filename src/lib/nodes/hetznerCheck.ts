@@ -3,8 +3,18 @@
 // Takes a GET function, so nothing here can create, change or delete anything.
 import { serverTypeOffer, toServer, type ApiServerType } from "@/lib/hetzner";
 
+const INSTALL_LABEL = "sowsi-node-install";
+
 /** The only thing this module can do to Hetzner. */
 export type HetznerGet = (path: string, params?: Record<string, string | number>) => Promise<unknown>;
+
+/** The only SSH key that should stay in the project. */
+export const EXPECTED_SSH_KEY = "sowsi-hosting";
+
+/** Created by the installer, node 1 or the management server. */
+export function isOurServer(s: { id: number; name: string; labels: Record<string, string> }, ownServerIds: string[]): boolean {
+  return s.labels[INSTALL_LABEL] === "1" || ownServerIds.includes(String(s.id)) || /^sowsi-(mgmt|proxmox)-\d+$/.test(s.name);
+}
 
 export type CheckResult = { endpoint: string; ok: boolean; detail: string; fields: string[]; missing: string[]; notes: string[] };
 
@@ -55,8 +65,8 @@ async function check(
 }
 
 /** Every Hetzner read we depend on. Plain GETs, in the order the installer uses them. */
-export async function runHetznerChecks(get: HetznerGet, opts: { serverType: string; location: string }): Promise<CheckResult[]> {
-  const { serverType, location } = opts;
+export async function runHetznerChecks(get: HetznerGet, opts: { serverType: string; location: string; ownServerIds?: string[] }): Promise<CheckResult[]> {
+  const { serverType, location, ownServerIds = [] } = opts;
   const results: CheckResult[] = [];
   const add = async (...args: Parameters<typeof check> extends [HetznerGet, ...infer R] ? R : never) => {
     const r = await check(get, ...args);
@@ -84,13 +94,16 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
     return [`Primary IPv4 in ${location}: €${monthly(p.primary_ips) ?? "?"}/month`, `Floating IPv4 in ${location}: €${monthly(p.floating_ips) ?? "?"}/month`];
   });
 
-  await add("GET /ssh_keys", "/ssh_keys", { per_page: 50 }, "ssh_keys", ["id", "name", "fingerprint", "public_key"]);
+  await add("GET /ssh_keys", "/ssh_keys", { per_page: 50 }, "ssh_keys", ["id", "name", "fingerprint", "public_key"], (rows) =>
+    rows.map((k) => (k.name === EXPECTED_SSH_KEY ? `key ${String(k.name)}` : `UNEXPECTED key ${String(k.name)} (id ${String(k.id)}): only ${EXPECTED_SSH_KEY} should be here`))
+  );
 
   const servers = await add("GET /servers", "/servers", { per_page: 50 }, "servers", ["id", "name", "status", "server_type.name", "location.name", "public_net.ipv4", "public_net.ipv6", "rescue_enabled", "labels"], (rows) => {
     if (rows.length === 0) return [];
     try {
       const s = toServer(rows[0] as never);
-      return [`parsed ${s.name}: ${s.location}, ${s.ipv4}, ${s.ipv6Network}, Primary IPs ${s.primaryIpIds.join(", ") || "none"}`];
+      const foreign = rows.map((r) => toServer(r as never)).filter((r) => !isOurServer(r, ownServerIds));
+      return [`parsed ${s.name}: ${s.location}, ${s.ipv4}, ${s.ipv6Network}, Primary IPs ${s.primaryIpIds.join(", ") || "none"}`, ...foreign.map((r) => `NOT OURS: server ${r.id} ${r.name} (${r.ipv4})`)];
     } catch (err) {
       return [`toServer can't parse this answer: ${err instanceof Error ? err.message : String(err)}`];
     }

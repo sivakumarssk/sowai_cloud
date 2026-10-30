@@ -145,11 +145,26 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
 - **Re-runs and failures:** re-running with the same `--name` resumes at the
   first unfinished step. Any failure deletes the server and its Primary IPs,
   unless you pass `--keep-on-failure`.
-- **A node that doesn't come back from its first reboot** is recovered once,
-  automatically, by re-running the same command: power cycle into the Hetzner
-  rescue system, diagnostics saved to `/root/node-diagnostics/`, network repaired
-  only if the evidence supports it, install resumed. Rescue is downtime, so a
-  node holding customers is refused unless you pass `--allow-downtime`.
+- **Three layers protect the first reboot:**
+  1. The card's name is pinned by MAC (a `.link` file, in every initramfs).
+  2. A boot-time guard (`sowsi-net-guard.service`) corrects vmbr0 if the node
+     can't reach anything after 90 seconds, then falls back to DHCP for that
+     boot. It does nothing when the network works. Log:
+     `/var/log/sowsi-net-guard.log`.
+  3. If the node still never answers, the installer power-cycles it into the
+     Hetzner rescue system, saves diagnostics to `/root/node-diagnostics/`, and
+     repairs the network once if the evidence supports it, then resumes. Rescue
+     is downtime, so a node holding customers is refused unless you pass
+     `--allow-downtime`.
+- **First boot is IPv4 only,** as on node 1. IPv6 is added once SSH is back.
+- **Re-using a name:** a name whose install was destroyed or failed gets a new
+  row and a new server, and the plan says so. The old record is kept as
+  `<name>#<serverId>`.
+- **Throwaway tests:** `--simulate-bad-nic` points the bridge at a card that
+  doesn't exist before the reboot (the `--name` must contain `test`). Add
+  `--no-guard` to prove the rescue repair instead of the guard.
+- **Spend cap:** the monthly price counts while a node stays. A destroyed server
+  counts only the started hours it lived.
 - **Settings it needs in `.env`:** `MGMT_PUBLIC_IP` and
   `NODE_ADMIN_SSH_PUBLIC_KEY` (see `.env.example`).
 - **VM ids repeat across nodes**, so a VM id means nothing without its node.

@@ -4,8 +4,8 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkRepair, diagnose, diagnosticsScript, LINK_FILE, linkFile, minimalInterfacesFile, mountRootScript, repairScript, rootCandidates } from "./rescueScripts";
-import { parseFacts, sha256 } from "./nodeScripts";
+import { checkRepair, diagnose, diagnosticsScript, LINK_FILE, linkFile, mountRootScript, repairScript, rootCandidates } from "./rescueScripts";
+import { interfacesFile, parseFacts, sha256 } from "./nodeScripts";
 
 const plan = { nic: "enp1s0", mac: "92:00:0a:57:96:63", ipv4: "2.28.75.244", stamp: "2026-10-30T10-00-00-000Z" };
 const lsblk = (children: Record<string, unknown>[], name = "sda") => JSON.stringify({ blockdevices: [{ name, path: `/dev/${name}`, size: 85899345920, type: "disk", children }, { name: "sr0", path: "/dev/sr0", size: 1024, type: "rom" }] });
@@ -48,6 +48,7 @@ test("the cause and how sure, from the output only", () => {
   assert.deepEqual(onlyUdev.repair, { nic: "enp1s0", mac: plan.mac });
 
   assert.equal(diagnose(report({ sowsi_name_journal: "ens3" })).repair!.nic, "ens3", "what the kernel really did wins");
+  assert.equal(diagnose(report({ sowsi_bridge_ports: "sowsibad0", sowsi_name_journal: "", sowsi_name_pin: "eth0" })).repair!.nic, "eth0", "the pin beats the name udev would pick");
 });
 
 test("no repair without evidence it would help", () => {
@@ -67,7 +68,7 @@ test("no repair without evidence it would help", () => {
 });
 
 test("the repaired config is node 1's shape: IPv4 /32, gateway, pointopoint, the real port, no IPv6", () => {
-  const f = minimalInterfacesFile(plan);
+  const f = interfacesFile(plan);
   for (const line of ["iface enp1s0 inet manual", "auto vmbr0", "address 2.28.75.244/32", "gateway 172.31.1.1", "pointopoint 172.31.1.1", "bridge-ports enp1s0"]) assert.ok(f.includes(line), line);
   assert.doesNotMatch(f.split("\n").filter((l) => !l.startsWith("#")).join("\n"), /inet6|source|dhcp|vmbr1/);
   assert.equal(linkFile(plan), `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.\n[Match]\nMACAddress=${plan.mac}\n\n[Link]\nName=enp1s0\n`);
@@ -94,7 +95,7 @@ test("the repair backs up first, pins the name, rebuilds the initramfs, and touc
 });
 
 test("what the repair reports is checked against what it was meant to write", () => {
-  const good = `sowsi_backup=/etc/network/interfaces.x\nsowsi_interfaces_sha=${sha256(minimalInterfacesFile(plan))}\nsowsi_link_sha=${sha256(linkFile(plan))}\nsowsi_initrd_pin=yes`;
+  const good = `sowsi_backup=/etc/network/interfaces.x\nsowsi_interfaces_sha=${sha256(interfacesFile(plan))}\nsowsi_link_sha=${sha256(linkFile(plan))}\nsowsi_initrd_pin=yes`;
   assert.deepEqual(checkRepair(good, plan), []);
   assert.match(checkRepair(good.replace("pin=yes", "pin=no"), plan).join(), /isn't in every initramfs/);
   assert.match(checkRepair(good.replace("sowsi_interfaces_sha=", "sowsi_interfaces_sha=0"), plan).join(), /isn't exactly the repaired config/);
@@ -133,6 +134,7 @@ ip() { echo 'eth0 UP'; }`;
     assert.equal(f.sowsi_rescue_dev, "eth0");
     assert.equal(f.sowsi_name_journal, "enp1s0", "a container's veth rename isn't the card");
     assert.equal(f.sowsi_name_udev, "enp1s0");
+    assert.equal(f.sowsi_name_pin, "");
     assert.equal(f.sowsi_port_errors, "1");
     assert.equal(f.sowsi_journal, "yes");
     assert.equal(f.sowsi_images, "");
@@ -145,4 +147,29 @@ ip() { echo 'eth0 UP'; }`;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("with a pin on the disk, the MAC and the name come from it, and the script also reads a running system", (t) => {
+  if (spawnSync("bash", ["--version"]).error) return t.skip("no bash");
+  const dir = mkdtempSync(path.join(tmpdir(), "sowsi-diag-"));
+  const put = (file: string, text = "") => {
+    mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    writeFileSync(path.join(dir, file), text);
+  };
+  try {
+    put(`root${LINK_FILE}`, linkFile({ nic: "eth0", mac: plan.mac }));
+    put("root/etc/network/interfaces", "    bridge-ports sowsibad0\n");
+    put("sys/class/net/eth0/address", `${plan.mac}\n`);
+    put("sys/class/net/eth0/device/x");
+    const script = diagnosticsScript("./root").replaceAll("/sys/class/net", "./sys/class/net");
+    const r = spawnSync("bash", ["-s"], { input: `lsblk() { :; }\nudevadm() { echo ID_NET_NAME_PATH=enp1s0; }\nip() { :; }\n${script}`, encoding: "utf8", cwd: dir });
+    const f = parseFacts(r.stdout);
+    assert.equal(f.sowsi_mac, plan.mac);
+    assert.equal(f.sowsi_name_pin, "eth0");
+    assert.equal(f.sowsi_rescue_dev, "eth0");
+    assert.equal(diagnose(r.stdout).repair!.nic, "eth0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.match(diagnosticsScript(""), /^R=\n/, "the same script, on the running system");
 });

@@ -6,7 +6,7 @@
 // and only when the evidence says rewriting the network config will help. The
 // rescue host key is used for this session only: the node's own pin is untouched.
 import type { InstallDeps, InstallRecord, InstallSettings, Shell } from "./installNode";
-import { sha256 } from "./nodeScripts";
+import { interfacesFile, sha256 } from "./nodeScripts";
 import * as R from "./rescueScripts";
 
 export type RescueArgs = {
@@ -77,7 +77,8 @@ async function inRescue<T>({ deps, rec, s }: RescueArgs, body: (shell: Shell) =>
     const server = await deps.hetzner.getServer(serverId).catch(() => null);
     if (server?.rescueEnabled) await deps.hetzner.disableRescue(serverId).catch((e) => cleanup.push(`disable rescue: ${String(e)}`));
     if (powerCycled) await deps.hetzner.resetServer(serverId).catch((e) => cleanup.push(`reset: ${String(e)}`));
-    await deps.hetzner.removeSshKey(installKey).catch((e) => cleanup.push(`install key entry: ${String(e)}`));
+    const keys = await deps.hetzner.removeInstallKeys().catch((e) => ({ removed: [], left: [String(e)] }));
+    if (keys.left.length) cleanup.push(`install key entry still at Hetzner: ${keys.left.join(", ")}`);
     if (cleanup.length) await deps.alert(`Rescue cleanup incomplete on ${rec.name}`, cleanup.join("\n"));
   }
 }
@@ -109,12 +110,12 @@ export async function rescueRepair(args: RescueArgs): Promise<RepairResult> {
     const plan: R.RepairPlan = { ...found.repair, ipv4: rec.ipv4!, stamp: new Date(deps.now()).toISOString().replace(/[:.]/g, "-") };
     // Recorded first, so even a crash below can't lead to a second attempt.
     await args.markRepairAttempt(new Date(deps.now()));
-    const out = await shell.exec("rescue repair", R.repairScript(plan), { stdin: R.minimalInterfacesFile(plan), timeoutMs: 5 * 60_000 });
+    const out = await shell.exec("rescue repair", R.repairScript(plan), { stdin: interfacesFile(plan), timeoutMs: 5 * 60_000 });
     const problems = R.checkRepair(out, plan);
     if (problems.length) throw new Error(`rescue repair: ${problems.join("; ")}`);
 
     const changes = [
-      `/etc/network/interfaces rewritten (backup /etc/network/interfaces.sowsi-before-repair-${plan.stamp}): vmbr0 on ${plan.nic}, IPv4 only, sha ${sha256(R.minimalInterfacesFile(plan)).slice(0, 12)}`,
+      `/etc/network/interfaces rewritten (backup /etc/network/interfaces.sowsi-before-repair-${plan.stamp}): vmbr0 on ${plan.nic}, IPv4 only, sha ${sha256(interfacesFile(plan)).slice(0, 12)}`,
       `${R.LINK_FILE} pins ${plan.mac} to ${plan.nic}`,
       "initramfs rebuilt with the pin",
     ];

@@ -70,6 +70,8 @@ export type FakeHetznerConfig = {
   actionPollsRunning?: number;
   /** enable_rescue answers with this error. */
   rescueError?: { status: number; code: string; message: string };
+  /** DELETE /ssh_keys fails. */
+  sshKeyDeleteFails?: boolean;
 };
 
 type Row = Record<string, unknown> & { id: number };
@@ -243,6 +245,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
       return ok({ ssh_key: key }, 201);
     }
     if ((m = /^\/ssh_keys\/(\d+)$/.exec(path)) && method === "DELETE") {
+      if (cfg.sshKeyDeleteFails) throw new Reply(423, "locked", "resource is locked");
       if (!state.sshKeys.delete(Number(m[1]))) throw notFound();
       return ok(undefined, 204);
     }

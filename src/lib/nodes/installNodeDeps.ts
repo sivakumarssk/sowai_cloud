@@ -67,7 +67,7 @@ async function sshAsRoot(host: string, key: "install" | "provisioning", { hostKe
   }
 }
 
-const toRecord = (r: NonNullable<Awaited<ReturnType<typeof prisma.nodeInstall.findUnique>>>): InstallRecord => ({ ...r, status: r.status });
+const toRecord = (r: NonNullable<Awaited<ReturnType<typeof prisma.nodeInstall.findUnique>>>): InstallRecord => r;
 
 export function prismaInstallDeps(): InstallDeps {
   return {

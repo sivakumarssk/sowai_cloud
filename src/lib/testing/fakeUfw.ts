@@ -12,6 +12,7 @@ export type FakeFirewall = {
   policy: { incoming: Policy; outgoing: Policy; routed: Policy };
   rules: string[];
   ipForward: 0 | 1;
+  logging: "on (low)" | "off";
   /** Drop-in written to sshd_config.d. Null = Debian's defaults apply. */
   sshDropIn: string | null;
   /** State at the moment ufw was enabled, to prove the order. */
@@ -23,6 +24,7 @@ export const freshFirewall = (): FakeFirewall => ({
   policy: { incoming: "deny", outgoing: "allow", routed: "deny" },
   rules: [],
   ipForward: 0,
+  logging: "on (low)",
   sshDropIn: null,
   atEnable: null,
 });
@@ -44,7 +46,7 @@ function status(fw: FakeFirewall): string {
   const routed = fw.ipForward === 1 ? fw.policy.routed : "disabled";
   return [
     "Status: active",
-    "Logging: on (low)",
+    `Logging: ${fw.logging}`,
     `Default: ${fw.policy.incoming} (incoming), ${fw.policy.outgoing} (outgoing), ${routed} (routed)`,
     "New profiles: skip",
     "",
@@ -73,6 +75,8 @@ export function runFirewallScript(fw: FakeFirewall, script: string): string {
     } else if (line.startsWith("ufw default ")) {
       const [, , value, direction] = line.split(" ");
       fw.policy[direction as keyof FakeFirewall["policy"]] = value as Policy;
+    } else if (line === "ufw logging off") {
+      fw.logging = "off";
     } else if (line === "ufw --force enable") {
       fw.active = true;
       fw.atEnable = { policy: { ...fw.policy }, ipForward: fw.ipForward, rules: fw.rules.length };

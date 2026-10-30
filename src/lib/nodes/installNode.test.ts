@@ -10,6 +10,7 @@ import {
   resumeSummary,
   SshAuthError,
   STEPS,
+  testFlagProblems,
   type InstallDeps,
   type InstallOptions,
   type InstallRecord,
@@ -22,7 +23,9 @@ import { installHetznerApi } from "./hetznerApi";
 import { HetznerService } from "@/lib/hetzner";
 import { CPX22, deprecatedUse, fakeHetzner, RESCUE_ROOT_PASSWORD, type FakeHetznerConfig } from "@/lib/testing/fakeHetzner";
 import { freshFirewall, runFirewallScript } from "@/lib/testing/fakeUfw";
-import { linkFile } from "./rescueScripts";
+
+/** Always with a message: a bare assert.ok that fails under tsx spins instead of reporting. */
+const ok = (value: unknown, message = "expected a true value") => assert.ok(value, message);
 
 // ── A simulated Hetzner project, server and Proxmox node ─────────────
 
@@ -76,6 +79,10 @@ type WorldCfg = {
     nameUnknown?: boolean;
     /** Container images on the disk. */
     diskImages?: string;
+    /** update-initramfs didn't pick the pin up. */
+    pinNotInInitrd?: boolean;
+    /** The IPv6 step can't reach anything. */
+    ipv6Fails?: boolean;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -100,6 +107,11 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     tokenMade: false,
     firewall: freshFirewall(),
     saved: [] as { suffix: string; text: string }[],
+    /** Card name pinned by the .link file. */
+    pinName: null as string | null,
+    guardInstalled: false,
+    /** What the rescue repair wrote. */
+    repaired: "",
     servicesStarting: cfg.servicesStartingPolls ?? 0,
   };
 
@@ -114,8 +126,18 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     }).map(([k, v]) => `${k}=${v}`).join("\n");
 
   const REAL_NIC = "enp1s0";
+  const MAC = "96:00:03:aa:bb:cc";
   const bridgePort = () => /bridge-ports (\S+)/.exec(w.installed)?.[1] ?? "";
-  const netDown = () => Boolean(cfg.renameNic && w.kernel.endsWith("-pve") && (cfg.repairDoesntHelp || bridgePort() !== REAL_NIC));
+  /** The card's name on the Proxmox kernel: the pin wins, or the rename happens. */
+  const cardName = () => (cfg.renameNic ? (w.pinName ?? REAL_NIC) : "eth0");
+  /** A bridge on any other name has no port, so the server has no network. */
+  const netDown = () => w.kernel.endsWith("-pve") && (Boolean(cfg.repairDoesntHelp) || bridgePort() !== cardName());
+  /** The boot-time guard: finds the card and corrects vmbr0. Nothing if the network works. */
+  const runGuard = () => {
+    if (!w.guardInstalled || !netDown()) return;
+    w.installed = w.installed.replace(/bridge-ports \S+/, `bridge-ports ${cardName()}`);
+    w.commands.push("guard repaired");
+  };
 
   const rescueShell = (): Shell => ({
     async exec(label, _command, o) {
@@ -127,13 +149,16 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "rescue mount":
           return "root=ok";
         case "rescue diagnostics": {
-          const real = cfg.nameUnknown ? "" : cfg.renameNic ? REAL_NIC : bridgePort();
-          return `=== /etc/network/interfaces\n${w.installed}\n=== facts\nsowsi_bridge_ports=${bridgePort()}\nsowsi_mac=96:00:03:aa:bb:cc\nsowsi_rescue_dev=eth0\nsowsi_name_udev=${real}\nsowsi_name_journal=${real}\nsowsi_port_errors=1\nsowsi_journal=yes\nsowsi_images=${cfg.diskImages ?? ""}`;
+          const unknown = cfg.nameUnknown;
+          const journal = !unknown && cfg.renameNic && !w.pinName ? REAL_NIC : "";
+          return `=== /etc/network/interfaces\n${w.installed}\n=== facts\nsowsi_bridge_ports=${bridgePort()}\nsowsi_mac=${MAC}\nsowsi_rescue_dev=eth0\nsowsi_name_udev=${unknown ? "" : cardName()}\nsowsi_name_pin=${unknown ? "" : (w.pinName ?? "")}\nsowsi_name_journal=${journal}\nsowsi_port_errors=1\nsowsi_journal=yes\nsowsi_images=${cfg.diskImages ?? ""}`;
         }
         case "rescue repair": {
           w.installed = o!.stdin!;
+          w.repaired = o!.stdin!;
           const nic = bridgePort();
-          return `sowsi_backup=/etc/network/interfaces.sowsi-before-repair-x\nsowsi_interfaces_sha=${S.sha256(o!.stdin!)}\nsowsi_link_sha=${S.sha256(linkFile({ nic, mac: "96:00:03:aa:bb:cc" }))}\nsowsi_initrd_pin=yes`;
+          w.pinName = nic;
+          return `sowsi_backup=/etc/network/interfaces.sowsi-before-repair-x\nsowsi_interfaces_sha=${S.sha256(o!.stdin!)}\nsowsi_link_sha=${S.sha256(S.linkFile({ nic, mac: MAC }))}\nsowsi_initrd_pin=yes`;
         }
         default:
           return "";
@@ -153,6 +178,22 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "stage bridge config": w.staged = o!.stdin!; return "";
         case "install bridge config": w.installed = w.staged; return "";
         case "kernel": return `kernel=${w.kernel}`;
+        case "pin nic": w.pinName = /Name=(\S+)/.exec(command)![1]; return "";
+        case "install guard": w.guardInstalled = true; return "";
+        case "boot safety check":
+          return [
+            `pin_file=${w.pinName ? S.sha256(S.linkFile({ nic: w.pinName, mac: MAC })) : ""}`,
+            `pin_link=${w.pinName ? S.LINK_FILE : ""}`,
+            `pin_initrd=${cfg.pinNotInInitrd ? "no" : "yes"}`,
+            `guard_unit=${w.guardInstalled ? "enabled" : "disabled"}`,
+            `guard_script=${S.sha256(S.guardScript())}`,
+            "journal_storage=persistent",
+            "journal_dir=yes",
+          ].join("\n");
+        case "simulate bad nic": w.installed = w.installed.replace(/bridge-ports \S+/, `bridge-ports ${S.BAD_NIC}`); return "1";
+        case "ipv6":
+          if (!/inet6/.test(w.installed)) w.installed += "\niface vmbr0 inet6 static\n";
+          return `ipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\nroute6=fe80::1 vmbr0\nipv4=${SERVER_IPV4}\nout6=${cfg.ipv6Fails ? "fail" : "ok"}`;
         case "start Proxmox install": w.pveInstall = "running"; return "started=yes";
         case "install status": if (w.pveInstall === "running") { w.pveInstall = "done"; return "state=activating\nresult=success"; } return "state=active\nresult=success";
         case "pre-reboot check": return facts();
@@ -196,6 +237,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         w.booted = "boot-2";
         w.kernel = "6.8.12-4-pve";
         if (cfg.hostKeyAfterReboot) w.hostKey = cfg.hostKeyAfterReboot;
+        runGuard();
       }
       if (netDown()) throw new Error("connect ETIMEDOUT");
       if (o.hostKeySha256 && o.hostKeySha256 !== w.hostKey) throw new HostKeyMismatchError("host key changed");
@@ -226,13 +268,17 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       findInstall: async (name) => w.installs.get(name) ?? null,
       findInstallByServer: async (id) => [...w.installs.values()].find((r) => r.hetznerServerId === id) ?? null,
       async createInstall(d) {
-        const r: InstallRecord = { id: `ni_${w.installs.size + 1}`, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, apiTokenSecret: null, testFloatingIpId: null, ...d };
+        const r: InstallRecord = { id: `ni_${w.installs.size + 1}`, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, purchasedAt: null, costSettledPaise: null, createdAt: new Date(w.clock), updatedAt: new Date(w.clock), apiTokenSecret: null, testFloatingIpId: null, ...d };
         w.installs.set(r.name, r);
         return { ...r };
       },
       async updateInstall(id, d) {
         const r = [...w.installs.values()].find((x) => x.id === id)!;
-        Object.assign(r, d);
+        if (d.name && d.name !== r.name) {
+          w.installs.delete(r.name);
+          w.installs.set(d.name, r);
+        }
+        Object.assign(r, d, { updatedAt: new Date(w.clock) });
         return { ...r, completedSteps: [...r.completedSteps] };
       },
       async nodeByServerId(id) {
@@ -276,7 +322,7 @@ test("plan: monthly and hourly cost from the live prices, nothing bought", async
   assert.match(p.cost!.lines.join("\n"), /€22\.99\/month, €0\.0368\/hour[\s\S]*₹2,349\/month, ₹3\.76\/hour/);
   assert.equal(p.resumeFrom, "server");
   assert.equal(servers(w).size, 0);
-  assert.ok(hetznerRequests(w).every((r) => r.method === "GET"), "plan mode only reads");
+  ok(hetznerRequests(w).every((r) => r.method === "GET"), "plan mode only reads");
 });
 
 const nbg1 = (over: Record<string, unknown>) => ({ ...CPX22, locations: CPX22.locations.map((l) => (l.name === "nbg1" ? { ...l, ...over } : l)) });
@@ -373,14 +419,14 @@ test("execute: every step in order; registered closed with measured specs and th
 
   // Order on the server: bridge verified before Proxmox, the reboot only after the pre-reboot check.
   const c = w.commands;
-  assert.ok(c.indexOf("firewall") >= 0 && c.indexOf("firewall") < c.indexOf("start Proxmox install"), "8006 is denied before Proxmox exists");
-  assert.ok(c.indexOf("firewall check") < c.indexOf("start Proxmox install"), "and checked right before the install");
-  assert.ok(c.lastIndexOf("firewall check") > c.indexOf("after reboot"), "and again after the reboot");
-  assert.ok(c.indexOf("install bridge config") < c.indexOf("start Proxmox install"));
-  assert.ok(c.indexOf("pre-reboot check") < c.indexOf("reboot"));
-  assert.ok(c.indexOf("add provisioning key") < c.indexOf("remove install key"));
+  ok(c.indexOf("firewall") >= 0 && c.indexOf("firewall") < c.indexOf("start Proxmox install"), "8006 is denied before Proxmox exists");
+  ok(c.indexOf("firewall check") < c.indexOf("start Proxmox install"), "and checked right before the install");
+  ok(c.lastIndexOf("firewall check") > c.indexOf("after reboot"), "and again after the reboot");
+  ok(c.indexOf("install bridge config") < c.indexOf("start Proxmox install"));
+  ok(c.indexOf("pre-reboot check") < c.indexOf("reboot"));
+  ok(c.indexOf("add provisioning key") < c.indexOf("remove install key"));
   assert.deepEqual(w.authorized.filter((k) => k === INSTALL_KEY), [], "install key gone from the server");
-  assert.ok(w.authorized.includes(ADMIN_KEY));
+  ok(w.authorized.includes(ADMIN_KEY));
   assert.deepEqual([...w.hz.state.sshKeys.values()].map((k) => k.public_key), [ADMIN_KEY], "install key entry removed from Hetzner; admin key kept");
   assert.deepEqual(w.containers, [], "test container deleted");
   assert.match(w.alerts[0].subject, /New Proxmox node installed/);
@@ -408,7 +454,7 @@ test("type not available, limit reached, quota: a clear message and nothing boug
     assert.match((r as { error: string }).error, why);
     assert.match((r as { error: string }).error, /Nothing was bought/);
     assert.equal(servers(w).size, 0);
-    assert.ok(!w.logs.some((l) => l.action === "SERVER_PURCHASED"), code);
+    ok(!w.logs.some((l) => l.action === "SERVER_PURCHASED"), code);
     assert.equal(w.installs.get("sowsi-proxmox-02")!.status, "FAILED");
   }
 });
@@ -421,12 +467,12 @@ test("a bridge config that doesn't match the server is caught before any reboot;
   const r = await executeInstall(w.deps, opts(), settings);
   assert.equal(r.ok, false);
   assert.match((r as { error: string }).error, /bridge \(staged\): the server's live IPv4 is "203\.0\.113\.99", but Hetzner says 203\.0\.113\.20/);
-  assert.ok(!w.commands.includes("reboot"));
-  assert.ok(!w.commands.includes("start Proxmox install"));
+  ok(!w.commands.includes("reboot"));
+  ok(!w.commands.includes("start Proxmox install"));
   assert.equal(servers(w).size, 0, "server deleted");
-  assert.ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY), "install key entry removed");
+  ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY), "install key entry removed");
   assert.equal(w.installs.get("sowsi-proxmox-02")!.status, "FAILED");
-  assert.ok(w.logs.some((l) => l.action === "NODE_INSTALL_FAILED"));
+  ok(w.logs.some((l) => l.action === "NODE_INSTALL_FAILED"));
   assert.match(w.alerts[0].subject, /failed: sowsi-proxmox-02 at bridge/);
   assert.match(w.alerts[0].detail, /was deleted/);
 });
@@ -438,7 +484,7 @@ test("the pre-reboot check refuses to reboot without ifupdown2 or a Proxmox kern
     const r = await executeInstall(w.deps, opts(), settings);
     assert.equal(r.ok, false);
     assert.match((r as { error: string }).error, /pre-reboot check \(not rebooted\)/);
-    assert.ok(!w.commands.includes("reboot"));
+    ok(!w.commands.includes("reboot"));
     assert.equal(servers(w).size, 0);
   }
 });
@@ -483,7 +529,7 @@ test("--keep-on-failure keeps the server for inspection and a re-run resumes it"
   assert.match(w.alerts[0].detail, /KEPT and still billed/);
   const rec = w.installs.get("sowsi-proxmox-02")!;
   assert.equal(rec.status, "IN_PROGRESS");
-  assert.ok(!rec.completedSteps.includes("firewall"));
+  ok(!rec.completedSteps.includes("firewall"));
 });
 
 // ── Resume ────────────────────────────────────────────────────────────
@@ -500,14 +546,14 @@ test("a re-run resumes at the first unfinished step and repeats nothing before i
   assert.equal(r.ok, true, (r as { error?: string }).error);
   const after = resumed.commands.slice(before);
   assert.equal(after[0], "proxmox-host-setup.sh", "starts at the failed step");
-  for (const earlier of ["hostname", "firewall", "stage bridge config", "start Proxmox install", "reboot"]) assert.ok(!after.includes(earlier), earlier);
+  for (const earlier of ["hostname", "firewall", "stage bridge config", "start Proxmox install", "reboot"]) ok(!after.includes(earlier), earlier);
   assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, purchases, "not bought twice");
 });
 
 /** The same simulated Hetzner, server and records, with no injected failure unless `cfg` says so. */
 function resumeWorld(w: World, cfg: WorldCfg = {}): World {
   const fresh = world(cfg, w.hz);
-  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt"] as const) {
+  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt", "pinName", "guardInstalled", "repaired"] as const) {
     (fresh as Record<string, unknown>)[key] = (w as Record<string, unknown>)[key];
   }
   return fresh;
@@ -519,7 +565,7 @@ test("a run that stopped right after removing the install key counts the lockdow
   const rec = w.installs.get("sowsi-proxmox-02")!;
   // Pretend the lockdown never got recorded, though it happened on the server.
   rec.completedSteps = rec.completedSteps.filter((s) => s !== "lockdown");
-  assert.ok(!w.authorized.includes(INSTALL_KEY), "the install key was removed from the server");
+  ok(!w.authorized.includes(INSTALL_KEY), "the install key was removed from the server");
   const resumed = resumeWorld(w);
   const r = await executeInstall(resumed.deps, opts(), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
@@ -579,7 +625,7 @@ test("--destroy --execute: needs --approved-by; deletes the server and the node 
   assert.equal(servers(w).size, 0);
   assert.equal(w.nodes.length, 0);
   assert.equal(w.installs.get("sowsi-proxmox-02")!.status, "DESTROYED");
-  assert.ok(w.logs.some((l) => l.action === "NODE_DESTROYED"));
+  ok(w.logs.some((l) => l.action === "NODE_DESTROYED"));
 });
 
 // ── The 8006 window, Primary IPs, deprecated calls ────────────────────
@@ -588,7 +634,7 @@ test("Proxmox is never installed while the firewall is down", async () => {
   const w = world({ failLabel: "firewall check" });
   const r = await executeInstall(w.deps, opts(), settings);
   assert.equal(r.ok, false);
-  assert.ok(!w.commands.includes("start Proxmox install"));
+  ok(!w.commands.includes("start Proxmox install"));
   assert.equal(servers(w).size, 0);
 });
 
@@ -628,7 +674,7 @@ test("a whole install and destroy touches nothing deprecated", async () => {
   await executeInstall(w.deps, opts({ ipv4Test: true }), settings);
   await executeDestroy(w.deps, String([...servers(w).keys()][0]), "sivakumar", settings);
   assert.deepEqual(hetznerRequests(w).flatMap(deprecatedUse), []);
-  assert.ok(!hetznerRequests(w).some((r) => r.path.startsWith("/datacenters")));
+  ok(!hetznerRequests(w).some((r) => r.path.startsWith("/datacenters")));
   assert.equal(w.hz.state.primaryIps.size, 0);
 });
 
@@ -665,7 +711,7 @@ test("a re-run on the half-configured server resumes at 3f, buys no second serve
   assert.equal(r.ok, true, (r as { error?: string }).error);
 
   assert.equal(resumed.commands[before], "firewall", "3f is the first thing it runs");
-  assert.ok(!resumed.commands.slice(before).includes("hostname"));
+  ok(!resumed.commands.slice(before).includes("hostname"));
   assert.equal(hetznerRequests(resumed).filter((q) => q.method === "POST" && q.path === "/servers").length, 1, "one server, ever");
   assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 1);
   assert.equal(servers(resumed).size, 1);
@@ -699,7 +745,7 @@ test("Proxmox services that never start fail after the timeout; a wrong kernel f
   const started = wrong.clock;
   const r2 = await executeInstall(wrong.deps, opts(), settings);
   assert.match((r2 as { error: string }).error, /after reboot: running kernel/);
-  assert.ok(wrong.clock - started < 60_000 + 30_000, "doesn't wait out the timeout");
+  ok(wrong.clock - started < 60_000 + 30_000, "doesn't wait out the timeout");
 });
 
 // ── A node that doesn't come back from the first reboot ───────────────
@@ -712,7 +758,7 @@ const noRescueTraffic = (w: World) => requested(w, "/enable_rescue").length === 
 /** Server 173512291 as it stands: Proxmox installed, rebooted, dark, Hetzner install key removed. */
 async function darkServer() {
   const w = world({ renameNic: true, hetzner: { rescueError: { status: 503, code: "unavailable", message: "not this time" } } });
-  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  await executeInstall(w.deps, opts({ keepOnFailure: true, noPin: true, noGuard: true }), settings);
   assert.equal(w.installs.get(NAME)!.completedSteps.at(-1), "proxmox");
   delete w.hz.cfg.rescueError;
   hetznerRequests(w).length = 0;
@@ -724,7 +770,7 @@ async function darkServer() {
 
 test("a fresh install whose card is renamed at the reboot recovers by itself and finishes", async () => {
   const w = world({ renameNic: true });
-  const r = await executeInstall(w.deps, opts(), settings);
+  const r = await executeInstall(w.deps, opts({ noPin: true, noGuard: true }), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
   assert.deepEqual(steps(w), [...STEPS]);
   assert.equal(w.nodes.length, 1);
@@ -737,7 +783,7 @@ test("the live case: a re-run finds the dark server, repairs it once, resumes at
   const plan = await planInstall(w.deps, opts(), settings);
   assert.equal(plan.resumeFrom, "reboot");
   assert.match(plan.notes!.join(), /doesn't answer SSH.*POWER-CYCLE/);
-  assert.ok(noRescueTraffic(w), "the plan changes nothing");
+  ok(noRescueTraffic(w), "the plan changes nothing");
 
   const resumed = resumeWorld(w, { renameNic: true });
   const before = steps(resumed).length;
@@ -754,14 +800,14 @@ test("the live case: a re-run finds the dark server, repairs it once, resumes at
 
 test("rescue is cleaned up, and the install key is registered for it and removed after", async () => {
   const w = await darkServer();
-  assert.ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY), "removed earlier");
+  ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY), "removed earlier");
   const resumed = resumeWorld(w, { renameNic: true });
   await executeInstall(resumed.deps, opts(), settings);
   const paths = hetznerRequests(resumed).map((q) => `${q.method} ${q.path}`);
-  assert.ok(paths.indexOf("POST /ssh_keys") < paths.findIndex((p) => p.endsWith("/enable_rescue")), "registered first");
+  ok(paths.indexOf("POST /ssh_keys") < paths.findIndex((p) => p.endsWith("/enable_rescue")), "registered first");
   const keyId = (requested(resumed, "/enable_rescue")[0].body!.ssh_keys as number[])[0];
-  assert.ok(hetznerRequests(resumed).some((q) => q.method === "DELETE" && q.path === `/ssh_keys/${keyId}`), "removed afterwards");
-  assert.ok(![...resumed.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
+  ok(hetznerRequests(resumed).some((q) => q.method === "DELETE" && q.path === `/ssh_keys/${keyId}`), "removed afterwards");
+  ok(![...resumed.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
   assert.equal(rescueOf(resumed).rescue_enabled, false);
   assert.equal(rescueOf(resumed).bootedRescue, false, "booted from its own disk");
 });
@@ -771,10 +817,10 @@ test("diagnostics are saved before anything on the disk changes", async () => {
   const resumed = resumeWorld(w, { renameNic: true });
   await executeInstall(resumed.deps, opts(), settings);
   const c = resumed.commands;
-  assert.ok(c.indexOf("rescue mount") < c.indexOf("rescue diagnostics"));
-  assert.ok(c.indexOf("rescue diagnostics") < c.indexOf("saved diagnostics"));
-  assert.ok(c.indexOf("saved diagnostics") < c.indexOf("rescue repair"));
-  assert.ok(c.indexOf("rescue repair") < c.indexOf("rescue unmount"));
+  ok(c.indexOf("rescue mount") < c.indexOf("rescue diagnostics"));
+  ok(c.indexOf("rescue diagnostics") < c.indexOf("saved diagnostics"));
+  ok(c.indexOf("saved diagnostics") < c.indexOf("rescue repair"));
+  ok(c.indexOf("rescue repair") < c.indexOf("rescue unmount"));
   assert.match(resumed.saved[0].text, /bridge-ports eth0/, "the original config is in the evidence");
   const diagnosed = resumed.logs.find((l) => l.action === "NODE_RESCUE_DIAGNOSED")!.after as { cause: string; confidence: string };
   assert.equal(diagnosed.confidence, "high");
@@ -784,7 +830,7 @@ test("diagnostics are saved before anything on the disk changes", async () => {
 test("the rescue host key is for that session only: the node's own pin survives, and is what's checked after", async () => {
   const w = await darkServer();
   const pinned = w.installs.get(NAME)!.hostKeySha256;
-  assert.ok(pinned && pinned !== "hk-rescue");
+  ok(pinned && pinned !== "hk-rescue");
   const resumed = resumeWorld(w, { renameNic: true });
   await executeInstall(resumed.deps, opts(), settings);
   assert.equal(resumed.installs.get(NAME)!.hostKeySha256, pinned);
@@ -794,8 +840,9 @@ test("a repaired node is IPv4 only at first, and it's the node's own host key th
   const w = await darkServer();
   const resumed = resumeWorld(w, { renameNic: true });
   await executeInstall(resumed.deps, opts(), settings);
-  assert.doesNotMatch(resumed.installed.split("\n").filter((l) => !l.startsWith("#")).join("\n"), /inet6|vmbr1|hwaddress/);
-  assert.match(resumed.installed, /address 203\.0\.113\.20\/32[\s\S]*gateway 172\.31\.1\.1[\s\S]*pointopoint 172\.31\.1\.1[\s\S]*bridge-ports enp1s0/);
+  assert.doesNotMatch(resumed.repaired.split("\n").filter((l) => !l.startsWith("#")).join("\n"), /inet6|vmbr1|hwaddress/);
+  assert.match(resumed.repaired, /address 203\.0\.113\.20\/32[\s\S]*gateway 172\.31\.1\.1[\s\S]*pointopoint 172\.31\.1\.1[\s\S]*bridge-ports enp1s0/);
+  assert.match(resumed.installed, /inet6/, "the IPv6 step added it after");
 });
 
 test("the repair runs once: if it doesn't help, it looks again, changes nothing more, and follows --keep-on-failure", async () => {
@@ -807,7 +854,7 @@ test("the repair runs once: if it doesn't help, it looks again, changes nothing 
   assert.deepEqual(stuck.saved.map((d) => d.suffix), ["", "-after-repair"]);
   assert.match(stuck.alerts.at(-1)!.detail, /didn't bring the server back[\s\S]*What changed:/);
   assert.equal(servers(stuck).size, 1, "kept");
-  assert.ok(stuck.installs.get(NAME)!.repairedAt);
+  ok(stuck.installs.get(NAME)!.repairedAt);
 
   const resets = requested(stuck, "/reset").length;
   const again = resumeWorld(stuck, { renameNic: true, repairDoesntHelp: true });
@@ -832,9 +879,9 @@ test("a node holding customers is never power-cycled without --allow-downtime", 
   const refused = resumeWorld(w, { renameNic: true });
   const r = await executeInstall(refused.deps, opts({ keepOnFailure: true }), settings);
   assert.match((r as { error: string }).error, /No automatic repair: rescue power-cycles the server, and node already-open has 2 service\(s\).*--allow-downtime/);
-  assert.ok(noRescueTraffic(refused));
+  ok(noRescueTraffic(refused));
   assert.equal(refused.commands.filter((c) => c.startsWith("rescue")).length, 0);
-  assert.ok(refused.logs.some((l) => l.action === "NODE_RESCUE_REFUSED"));
+  ok(refused.logs.some((l) => l.action === "NODE_RESCUE_REFUSED"));
 
   const allowed = resumeWorld(refused, { renameNic: true });
   const r2 = await executeInstall(allowed.deps, opts({ allowDowntime: true }), settings);
@@ -846,13 +893,13 @@ test("never node 1, and never a server the installer didn't create", async () =>
   const id = String([...servers(one).keys()][0]);
   const r = await executeInstall(resumeWorld(one, { renameNic: true }).deps, opts({ keepOnFailure: true }), { ...settings, protectedServerId: id });
   assert.match((r as { error: string }).error, /HETZNER_SERVER_ID \(node 1\)/);
-  assert.ok(noRescueTraffic(one));
+  ok(noRescueTraffic(one));
 
   const other = await darkServer();
   (servers(other).get(Number(String([...servers(other).keys()][0])))!.labels as Record<string, string>)[INSTALL_LABEL] = "0";
   const r2 = await executeInstall(resumeWorld(other, { renameNic: true }).deps, opts({ keepOnFailure: true }), settings);
   assert.match((r2 as { error: string }).error, /wasn't created by install-node/);
-  assert.ok(noRescueTraffic(other));
+  ok(noRescueTraffic(other));
 });
 
 test("container images on the disk stop the repair without --allow-downtime", async () => {
@@ -860,21 +907,21 @@ test("container images on the disk stop the repair without --allow-downtime", as
   const blocked = resumeWorld(w, { renameNic: true, diskImages: "104 " });
   const r = await executeInstall(blocked.deps, opts({ keepOnFailure: true }), settings);
   assert.match((r as { error: string }).error, /disk holds container images \(104\)/);
-  assert.ok(!blocked.commands.includes("rescue repair"));
+  ok(!blocked.commands.includes("rescue repair"));
   assert.equal(rescueOf(blocked).bootedRescue, false, "booted back");
 });
 
 test("no evidence, no repair: the disk isn't touched, and rescue is still cleaned up", async () => {
   for (const cfg of [{ nameUnknown: true, renameNic: true }, { neverBack: true }] as WorldCfg[]) {
     const w = world(cfg);
-    const r = await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+    const r = await executeInstall(w.deps, opts({ keepOnFailure: true, noPin: true, noGuard: true }), settings);
     assert.equal(r.ok, false);
     assert.equal(w.commands.includes("rescue repair"), false);
-    assert.ok(w.commands.includes("saved diagnostics"));
+    ok(w.commands.includes("saved diagnostics"));
     assert.equal(w.installs.get(NAME)!.repairedAt, null, "the attempt isn't used up");
     assert.equal(rescueOf(w).rescue_enabled, false);
     assert.equal(rescueOf(w).bootedRescue, false);
-    assert.ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
+    ok(![...w.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
   }
 });
 
@@ -885,7 +932,7 @@ test("a rescue system that never answers still ends with rescue off, the server 
   assert.match((r as { error: string }).error, /Rescue repair failed/);
   assert.equal(rescueOf(silent).bootedRescue, false);
   assert.equal(requested(silent, "/reset").length, 2);
-  assert.ok(![...silent.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
+  ok(![...silent.hz.state.sshKeys.values()].some((k) => k.public_key === INSTALL_KEY));
 });
 
 test("rescue's root password never reaches a log, and nothing deprecated is called", async () => {
@@ -894,4 +941,301 @@ test("rescue's root password never reaches a log, and nothing deprecated is call
   await executeInstall(resumed.deps, opts(), settings);
   assert.doesNotMatch(JSON.stringify([resumed.logs, resumed.alerts, resumed.saved]), new RegExp(RESCUE_ROOT_PASSWORD));
   assert.deepEqual(hetznerRequests(resumed).flatMap(deprecatedUse), []);
+});
+
+// ── Three layers against a renamed card ───────────────────────────────
+
+const onlyRescue = (w: World) => requested(w, "/enable_rescue").length;
+
+test("without any of the fixes, a renamed card leaves the server dark", async () => {
+  const w = world({ renameNic: true, hetzner: { rescueError: { status: 503, code: "unavailable", message: "no rescue today" } } });
+  const r = await executeInstall(w.deps, opts({ noPin: true, noGuard: true }), settings);
+  assert.equal(r.ok, false);
+  assert.match((r as { error: string }).error, /didn't come back/);
+  assert.equal(w.nodes.length, 0);
+});
+
+test("the pin alone fixes it: the card keeps its name, and neither the guard nor rescue is needed", async () => {
+  const w = world({ renameNic: true });
+  const r = await executeInstall(w.deps, opts({ noGuard: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.equal(onlyRescue(w), 0);
+  ok(!w.commands.includes("guard repaired"));
+  assert.match(w.installed, /bridge-ports eth0/);
+});
+
+test("with the pin off, the guard fixes it, with no rescue and no power cycle", async () => {
+  const w = world({ renameNic: true });
+  const r = await executeInstall(w.deps, opts({ noPin: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  ok(w.commands.includes("guard repaired"));
+  assert.equal(onlyRescue(w), 0);
+  assert.match(w.installed, /bridge-ports enp1s0/);
+});
+
+test("with both off, rescue repairs it, once", async () => {
+  const w = world({ renameNic: true });
+  const r = await executeInstall(w.deps, opts({ noPin: true, noGuard: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.equal(onlyRescue(w), 1);
+  assert.equal(w.commands.filter((c) => c === "rescue repair").length, 1);
+});
+
+test("the guard does nothing on a healthy network", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  ok(w.guardInstalled);
+  ok(!w.commands.includes("guard repaired"));
+});
+
+test("--simulate-bad-nic proves the guard, and with --no-guard the rescue repair, on a healthy pinned server", async () => {
+  const guard = world();
+  const r = await executeInstall(guard.deps, opts({ simulateBadNic: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  ok(guard.commands.indexOf("pre-reboot check") < guard.commands.indexOf("simulate bad nic"));
+  ok(guard.commands.indexOf("simulate bad nic") < guard.commands.indexOf("reboot"));
+  ok(guard.commands.includes("guard repaired"));
+  assert.equal(onlyRescue(guard), 0);
+
+  const rescue = world();
+  const r2 = await executeInstall(rescue.deps, opts({ simulateBadNic: true, noGuard: true }), settings);
+  assert.equal(r2.ok, true, (r2 as { error?: string }).error);
+  assert.equal(onlyRescue(rescue), 1);
+  assert.match(rescue.repaired, /bridge-ports eth0/, "the pinned name, not a guess");
+  assert.match(rescue.saved[0].text, /sowsi_bridge_ports=sowsibad0/);
+});
+
+test("the test switches can't reach a real node", () => {
+  assert.deepEqual(testFlagProblems({ name: "sowsi-test-01", simulateBadNic: true, noGuard: true }), []);
+  assert.match(testFlagProblems({ name: "sowsi-proxmox-02", simulateBadNic: true }).join(), /must contain "test"/);
+  assert.match(testFlagProblems({ name: "sowsi-test-01", noGuard: true }).join(), /only for use with --simulate-bad-nic/);
+  assert.deepEqual(testFlagProblems({ name: "sowsi-proxmox-02" }), []);
+});
+
+test("no reboot unless the pin is really in the initramfs and the guard is enabled", async () => {
+  const w = world({ pinNotInInitrd: true });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /name pin isn't in every initramfs/);
+  ok(!w.commands.includes("reboot"));
+});
+
+test("the pin is checked again after Proxmox installs its own kernel, right before the reboot", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const c = w.commands;
+  ok(c.indexOf("boot safety check") < c.indexOf("start Proxmox install"));
+  ok(c.lastIndexOf("boot safety check") > c.indexOf("install status"));
+  ok(c.lastIndexOf("boot safety check") < c.indexOf("reboot"));
+});
+
+test("IPv6 comes after SSH is back and before the host setup; a failure there stops the install", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const c = w.commands;
+  ok(c.indexOf("after reboot") < c.indexOf("ipv6"));
+  ok(c.indexOf("ipv6") < c.indexOf("proxmox-host-setup.sh"));
+  const bad = world({ ipv6Fails: true });
+  const r = await executeInstall(bad.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /can't reach the internet over IPv6/);
+});
+
+// ── Diagnostics on every failure ──────────────────────────────────────
+
+test("a failure on a reachable server saves diagnostics before the server is deleted", async () => {
+  const w = world({ failLabel: "proxmox-host-setup.sh" });
+  await executeInstall(w.deps, opts(), settings);
+  assert.equal(servers(w).size, 0);
+  assert.deepEqual(w.saved.map((d) => d.suffix), ["-host-setup"]);
+  ok(w.commands.indexOf("saved diagnostics-host-setup") >= 0);
+  ok(w.commands.indexOf("node diagnostics") < w.commands.indexOf("saved diagnostics-host-setup"));
+});
+
+test("a server that can't be reached says so rather than staying silent", async () => {
+  const w = world({ renameNic: true, rescueNeverAnswers: true });
+  await executeInstall(w.deps, opts({ noPin: true, noGuard: true, keepOnFailure: true }), settings);
+  assert.match(w.alerts.at(-1)!.detail, /no diagnostics: the server can't be reached/);
+});
+
+// ── The install key ───────────────────────────────────────────────────
+
+const installEntries = (w: World) => [...w.hz.state.sshKeys.values()].filter((k) => k.name === "sowsi-install");
+const seedHosting = (w: World) => void w.hz.state.sshKeys.set(1, { id: 1, name: "sowsi-hosting", fingerprint: "aa", public_key: ADMIN_KEY, labels: {} } as never);
+
+test("the install key entry goes in every path, and sowsi-hosting is never touched", async () => {
+  const paths: [string, WorldCfg, Partial<InstallOptions>][] = [
+    ["success", {}, {}],
+    ["failure, server deleted", { failLabel: "hostname" }, {}],
+    ["failure, server kept", { failLabel: "hostname" }, { keepOnFailure: true }],
+    ["refused by Hetzner", { hetzner: { createError: { status: 422, code: "resource_unavailable", message: "x" } } }, {}],
+    ["rescue repair", { renameNic: true }, { noPin: true, noGuard: true }],
+    ["rescue fails", { renameNic: true, rescueNeverAnswers: true }, { noPin: true, noGuard: true, keepOnFailure: true }],
+  ];
+  for (const [name, cfg, o] of paths) {
+    const w = world(cfg);
+    seedHosting(w);
+    await executeInstall(w.deps, opts(o), settings);
+    assert.deepEqual(installEntries(w), [], name);
+    ok(w.hz.state.sshKeys.has(1), `${name}: sowsi-hosting kept`);
+    ok(hetznerRequests(w).filter((q) => q.path === "/ssh_keys" && q.method === "GET").length > 0, name);
+  }
+});
+
+test("--destroy removes it and proves it by listing, even for a server long gone", async () => {
+  const w = world();
+  seedHosting(w);
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  const id = String([...servers(w).keys()][0]);
+  await executeDestroy(w.deps, id, "sivakumar", settings);
+
+  // The real leftover: destroyed, but the entry stayed behind.
+  w.hz.state.sshKeys.set(131973547, { id: 131973547, name: "sowsi-install", fingerprint: "bb", public_key: INSTALL_KEY, labels: {} } as never);
+  const again = await executeDestroy(w.deps, id, "sivakumar", settings);
+  assert.equal(again.ok, true, again.lines.join());
+  assert.deepEqual(installEntries(w), []);
+  ok(w.hz.state.sshKeys.has(1));
+  assert.match(again.lines.join(), /no installer key entry left/);
+});
+
+test("an entry that can't be removed is reported, and --destroy doesn't claim success", async () => {
+  const w = world({ hetzner: { sshKeyDeleteFails: true } });
+  await executeInstall(w.deps, opts(), settings);
+  assert.match(w.alerts.at(-1)!.detail, /install key entry still at Hetzner/);
+  const d = world();
+  await executeInstall(d.deps, opts(), settings);
+  const id = String([...servers(d).keys()][0]);
+  d.hz.cfg.sshKeyDeleteFails = true;
+  d.hz.state.sshKeys.set(9, { id: 9, name: "sowsi-install", fingerprint: "cc", public_key: INSTALL_KEY, labels: {} } as never);
+  const r = await executeDestroy(d.deps, id, "sivakumar", settings);
+  assert.equal(r.ok, false);
+  assert.match(r.lines.join(), /still at Hetzner/);
+});
+
+// ── Cost accounting ───────────────────────────────────────────────────
+
+const MONTHLY = Math.ceil(23.49 * 100 * 100);
+const HOURLY = Math.ceil((0.0368 + 0.0008) * 100 * 100);
+const spend = (w: World) => w.logs.filter((l) => ["SERVER_PURCHASED", "SERVER_COST_SETTLED"].includes(l.action)).reduce((sum, l) => sum + (l.cost ?? 0), 0);
+
+test("a node that stays registered counts its full monthly price", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  assert.equal(spend(w), MONTHLY);
+  ok(!w.logs.some((l) => l.action === "SERVER_COST_SETTLED"));
+});
+
+test("a destroyed throwaway counts the started hours it lived, not the month: 73 minutes is 2 hours", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const started = w.installs.get(NAME)!.purchasedAt!.getTime();
+  w.clock = started + 73 * 60_000;
+  const r = await executeDestroy(w.deps, String([...servers(w).keys()][0]), "sivakumar", settings);
+  assert.equal(r.ok, true);
+  assert.equal(spend(w), 2 * HOURLY);
+  assert.equal(w.installs.get(NAME)!.costSettledPaise, 2 * HOURLY);
+  assert.match(r.lines.join(), /spend corrected/);
+
+  await executeDestroy(w.deps, String(w.installs.get(NAME)!.hetznerServerId), "sivakumar", settings);
+  assert.equal(w.logs.filter((l) => l.action === "SERVER_COST_SETTLED").length, 1, "only once");
+});
+
+test("a failed install whose server was deleted is settled too; a kept one isn't", async () => {
+  const gone = world({ failLabel: "hostname" });
+  await executeInstall(gone.deps, opts(), settings);
+  assert.equal(spend(gone), HOURLY, "one started hour");
+  const kept = world({ failLabel: "hostname" });
+  await executeInstall(kept.deps, opts({ keepOnFailure: true }), settings);
+  assert.equal(spend(kept), MONTHLY);
+});
+
+test("a server that lives long enough can't cost more than the month", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  w.clock = w.installs.get(NAME)!.purchasedAt!.getTime() + 2000 * 3_600_000;
+  await executeDestroy(w.deps, String([...servers(w).keys()][0]), "sivakumar", settings);
+  assert.equal(spend(w), MONTHLY);
+});
+
+test("a server already gone is settled from when its record last changed", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const rec = w.installs.get(NAME)!;
+  servers(w).clear();
+  Object.assign(rec, { status: "DESTROYED", purchasedAt: null, createdAt: new Date(1_000_000), updatedAt: new Date(1_000_000 + 73 * 60_000) });
+  w.nodes.length = 0;
+  await executeDestroy(w.deps, String(rec.hetznerServerId), "sivakumar", settings);
+  assert.equal(spend(w), 2 * HOURLY);
+});
+
+test("the plan shows both numbers", async () => {
+  const w = world();
+  const p = await planInstall(w.deps, opts(), settings);
+  assert.match(p.cost!.lines.join(), /against the spend cap: ₹2,349 if it stays as a node; if it's destroyed, only ₹3\.76 per started hour/);
+});
+
+// ── A name that was used before ───────────────────────────────────────
+
+test("the plan for a destroyed name says so, says a new server will be bought, and shows the cost", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const old = String([...servers(w).keys()][0]);
+  await executeDestroy(w.deps, old, "sivakumar", settings);
+
+  const p = await planInstall(w.deps, opts(), settings);
+  assert.equal(p.ok, true, p.problems.join());
+  assert.equal(p.resumeFrom, "server");
+  assert.match(p.notes!.join(), new RegExp(`this name was destroyed \\(server ${old}\\); a new server will be bought`));
+  assert.match(p.cost!.lines.join(), /₹2,349\/month/);
+  assert.equal(w.installs.get(NAME)!.hetznerServerId, old, "the plan changes nothing");
+});
+
+test("re-installing a destroyed name never reuses the row: the old record stays whole, and --destroy still finds it", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  const old = String([...servers(w).keys()][0]);
+  w.clock += 73 * 60_000;
+  await executeDestroy(w.deps, old, "sivakumar", settings);
+  const before = { ...w.installs.get(NAME)! };
+
+  const shown: string[] = [];
+  w.deps.report = (l) => void shown.push(l);
+  // A brand-new server this time.
+  Object.assign(w, { authorized: [INSTALL_KEY, ADMIN_KEY], pveInstall: "none", kernel: "6.1.0-26-cloud-amd64", staged: "", installed: "original", rebootAt: null, booted: "boot-1", pinName: null, guardInstalled: false });
+  w.nodes.length = 0;
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+
+  const archived = w.installs.get(`${NAME}#${old}`)!;
+  assert.equal(archived.id, before.id);
+  assert.equal(archived.status, "DESTROYED");
+  assert.equal(archived.hetznerServerId, old);
+  assert.equal(archived.costSettledPaise, before.costSettledPaise);
+  assert.deepEqual(archived.completedSteps, before.completedSteps);
+
+  const current = w.installs.get(NAME)!;
+  assert.notEqual(current.id, before.id, "a new row");
+  assert.notEqual(current.hetznerServerId, old);
+  assert.equal(current.status, "REGISTERED");
+  assert.equal(w.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 2, "and a second purchase, on the record");
+  ok(w.logs.some((l) => l.action === "NODE_INSTALL_ARCHIVED"), "archived");
+  assert.match(shown.join(), new RegExp(`kept as ${NAME}#${old}; this is a new install`));
+  assert.equal((await w.deps.db.findInstallByServer(old))!.status, "DESTROYED");
+});
+
+test("a failed name is kept the same way, and an old unsettled record is corrected when it's archived", async () => {
+  const w = world({ failLabel: "hostname" });
+  await executeInstall(w.deps, opts(), settings);
+  const old = w.installs.get(NAME)!;
+  Object.assign(old, { costSettledPaise: null, purchasedAt: null, createdAt: new Date(0), updatedAt: new Date(73 * 60_000), status: "DESTROYED" });
+  w.logs.length = 0;
+  w.logs.push({ action: "SERVER_PURCHASED", cost: MONTHLY });
+
+  const next = resumeWorld(w);
+  const p = await planInstall(next.deps, opts(), settings);
+  assert.match(p.notes!.join(), /this name was destroyed/);
+  await executeInstall(next.deps, opts(), settings);
+  assert.equal(next.logs.filter((l) => l.action === "SERVER_COST_SETTLED").at(0)!.cost, 2 * HOURLY - MONTHLY, "₹2,359 becomes the hours it lived");
+
+  const f = world({ failLabel: "hostname" });
+  await executeInstall(f.deps, opts(), settings);
+  assert.match((await planInstall(f.deps, opts(), settings)).notes!.join(), /this name failed last time.*a new server will be bought/);
 });
