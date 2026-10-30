@@ -62,6 +62,8 @@ section "failed boot: networking, ifup, ifreload, vmbr0, renamed, Failed"
 [ -d "$R/var/log/journal" ] && journal -b 0 -o short-iso | grep -Ei 'networking|ifup|ifreload|vmbr0|renamed|failed' | tail -200
 section "ifupdown2 log"; ls -t "$R"/var/log/ifupdown2 2>/dev/null | head -3
 section "ufw log setting"; grep -E '^(ENABLED|LOGLEVEL)' "$R/etc/ufw/ufw.conf" 2>&1
+section "DNS"; ls -l "$R/etc/resolv.conf" 2>&1; cat "$R/etc/resolv.conf" 2>&1
+section "IPv6 on this system"; ip -6 addr 2>&1; ip -6 route 2>&1; ip -6 neigh 2>&1
 
 section "facts"
 ports=$(awk '$1=="bridge-ports"{print $2; exit}' "$R/etc/network/interfaces")

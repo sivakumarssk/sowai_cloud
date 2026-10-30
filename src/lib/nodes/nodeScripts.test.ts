@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import * as S from "./nodeScripts";
 import { freshFirewall, runFirewallScript, type FakeFirewall } from "@/lib/testing/fakeUfw";
 
@@ -271,13 +273,19 @@ pveam() { echo 'local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst   141.0
 systemctl() { echo enabled; }
 pvesh() { echo '{"content":"iso,vztmpl,backup,rootdir,images","digest":"x","type":"dir"}'; }
 ip() { echo 'vmbr1            DOWN           bc:24:11:aa:bb:cc <NO-CARRIER,BROADCAST,MULTICAST,UP>'; }
-test() { return 0; }`
+test() { return 0; }
+sysctl() { echo 1; }
+grep() { case "$*" in *sysctl*|*proxy*) echo 2 ;; *) echo 1 ;; esac; }`
   );
   if (!facts) return;
   assert.equal(facts.vmbr1, "<NO-CARRIER,BROADCAST,MULTICAST,UP>");
   assert.deepEqual(S.checkHostSetup("== Done", facts), []);
   assert.match(S.checkHostSetup("== Done", { ...facts, vmbr1: "<BROADCAST,MULTICAST>" }).join(), /vmbr1 isn't up/);
   assert.match(S.checkHostSetup("== Done", { ...facts, vmbr1: "" }).join(), /missing/);
+  assert.match(S.checkHostSetup("== Done", { ...facts, forward6: "0" }).join(), /forwarding is off/);
+  assert.match(S.checkHostSetup("== Done", { ...facts, forward_saved: "1" }).join(), /aren't both in \/etc\/sysctl\.d/);
+  assert.match(S.checkHostSetup("== Done", { ...facts, proxy_ndp: "0" }).join(), /proxy_ndp/);
+  assert.match(S.checkHostSetup("== Done", { ...facts, proxy_saved: "1" }).join(), /wouldn't survive a reboot/);
 });
 
 test("3f parses real sshd -T output", () => {
@@ -366,4 +374,99 @@ test("--simulate-bad-nic only rewrites vmbr0's port", () => {
   const script = S.simulateBadNicScript("eth0");
   assert.match(script, /bridge-ports eth0\$\/bridge-ports sowsibad0/);
   assert.match(script, /iface eth0 inet manual\/iface sowsibad0 inet manual/);
+});
+
+// ── 3e+ against the timing of a real reload ──────────────────────────
+
+/** Runs the real script with the network simulated by shell functions. `ping` answers from the Nth try. */
+function ipv6Run(opts: { tentativePolls?: number; gatewayFrom?: number; outboundFrom?: number; dns?: boolean } = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), "sowsi-ipv6-"));
+  writeFileSync(path.join(dir, "interfaces"), "auto vmbr0\n");
+  const stubs = `
+gw=0; out=0
+ifreload() { echo ifreload >> calls; }
+sleep() { echo "sleep $1" >> calls; }
+date() { echo 2026-11-01 12:01:10; }
+ip() {
+  case "$*" in
+    "-o -6 addr show dev vmbr0 scope global")
+      polls=$(($(cat polls 2>/dev/null || echo 0) + 1)); echo "$polls" > polls
+      if [ "$polls" -le "${opts.tentativePolls ?? 0}" ]; then echo '2: vmbr0    inet6 2a01:4f8:1c18:1f8d::1/64 scope global tentative'; else echo '2: vmbr0    inet6 2a01:4f8:1c18:1f8d::1/64 scope global'; fi ;;
+    "-6 route show default") echo 'default via fe80::1 dev vmbr0 metric 1024 onlink pref medium' ;;
+    "-o -4 addr show dev vmbr0") echo '2: vmbr0    inet 203.0.113.20 peer 172.31.1.1/32 scope global vmbr0' ;;
+    "-6 addr show dev vmbr0") echo 'inet6 2a01:4f8:1c18:1f8d::1/64 scope global' ;;
+    "-6 route") echo 'default via fe80::1 dev vmbr0' ;;
+    "-6 neigh show dev vmbr0") echo 'fe80::1 FAILED' ;;
+  esac
+}
+ping() {
+  echo "ping $*" >> calls
+  case "$*" in
+    *fe80::1%vmbr0*) gw=$((gw + 1)); [ "$gw" -ge "${opts.gatewayFrom ?? 1}" ] ;;
+    *) out=$((out + 1)); [ "$out" -ge "${opts.outboundFrom ?? 1}" ] ;;
+  esac
+}
+journalctl() { echo "journal $*"; }
+getent() { ${opts.dns === false ? "return 2" : "return 0"}; }
+curl() { echo curl >> calls; return 6; }
+`;
+  const script = S.ipv6Script("2a01:4f8:1c18:1f8d").replaceAll("/etc/network/interfaces", "interfaces");
+  const r = spawnSync("bash", ["-s"], { input: `${stubs}\n${script}`, encoding: "utf8", cwd: dir });
+  const calls = existsSync(path.join(dir, "calls")) ? readFileSync(path.join(dir, "calls"), "utf8") : "";
+  const file = readFileSync(path.join(dir, "interfaces"), "utf8");
+  rmSync(dir, { recursive: true, force: true });
+  return { ...r, calls, file, facts: S.parseFacts(r.stdout) };
+}
+
+const want = { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c18:1f8d" };
+const whenBash = (name: string, fn: () => void) => test(name, (t) => (spawnSync("bash", ["--version"]).error ? t.skip("no bash") : fn()));
+
+whenBash("3e+ waits for tentative to clear, then warms the gateway, then tries outbound", () => {
+  const r = ipv6Run({ tentativePolls: 3 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(S.checkIpv6(r.facts, want), []);
+  const calls = r.calls.split("\n");
+  assert.equal(calls.filter((c) => c === "sleep 1").length, 3, "three polls while tentative");
+  const gateway = calls.findIndex((c) => c.includes("fe80::1%vmbr0"));
+  const outbound = calls.findIndex((c) => c.includes("2001:4860:4860::8888"));
+  assert.ok(calls.indexOf("sleep 1") < gateway, "the gateway only after the address is usable");
+  assert.ok(gateway < outbound, "the neighbour entry before going outbound");
+});
+
+whenBash("a network that needs a few seconds passes: the ping retries, alternating targets", () => {
+  const r = ipv6Run({ gatewayFrom: 3, outboundFrom: 6 });
+  assert.equal(r.facts.gateway6, "ok");
+  assert.equal(r.facts.out6, "ok");
+  assert.deepEqual(S.ipv6Debug(r.stdout), "");
+  assert.match(r.calls, /2606:4700:4700::1111/);
+});
+
+whenBash("broken DNS doesn't fail it: curl is no longer involved, and the state is reported", () => {
+  const r = ipv6Run({ dns: false });
+  assert.equal(r.facts.out6, "ok");
+  assert.equal(r.facts.dns, "broken");
+  assert.doesNotMatch(r.calls, /curl/);
+  assert.deepEqual(S.checkIpv6(r.facts, want), []);
+});
+
+whenBash("about 30 seconds of outbound retries, then it fails with the evidence", () => {
+  const r = ipv6Run({ outboundFrom: 99 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(S.checkIpv6(r.facts, want).join(), /the host can't reach the internet over IPv6/);
+  const tries = r.calls.split("\n").filter((c) => c.startsWith("ping") && !c.includes("fe80"));
+  assert.equal(tries.length, 10);
+  const debug = S.ipv6Debug(r.stdout);
+  for (const part of ["--- ip -6 addr", "--- ip -6 route", "--- ip -6 neigh", "--- journal since the reload", "fe80::1 FAILED", "journal --since 2026-11-01 12:01:10"]) assert.ok(debug.includes(part), part);
+  assert.equal(S.parseFacts(r.stdout).out6, "fail", "facts still read after the debug block");
+});
+
+whenBash("the IPv6 stanza is added once, however often it runs", () => {
+  const r = ipv6Run();
+  assert.match(r.file, /iface vmbr0 inet6 static\n {4}address 2a01:4f8:1c18:1f8d::1\/64\n {4}gateway fe80::1/);
+  assert.equal((S.ipv6Script("2a01:4f8:1c18:1f8d").match(/>> "\$F"/g) ?? []).length, 1);
+  assert.match(S.ipv6Script("2a01:4f8:1c18:1f8d"), /if ! grep -q '\^iface vmbr0 inet6'/);
+});
+
+test("an IPv6-only container is checked by ping first: it can't reach IPv4 resolvers", () => {
+  assert.match(S.containerOutboundScript(false), /ping -6 -c 2 -W 3 2001:4860:4860::8888/);
 });

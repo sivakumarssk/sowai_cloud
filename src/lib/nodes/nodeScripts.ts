@@ -281,7 +281,14 @@ export function simulateBadNicScript(nic: string): string {
 grep -c 'bridge-ports ${BAD_NIC}' /etc/network/interfaces`;
 }
 
-/** After the bridge is proven up: adds the IPv6 stanza and reloads. Safe to run again. */
+/** Answer ping and don't depend on DNS, which proxmox-host-setup.sh only repairs in the next step. */
+const IPV6_TARGETS = ["2001:4860:4860::8888", "2606:4700:4700::1111"];
+
+/**
+ * After the bridge is proven up: adds the IPv6 stanza and reloads. Then it waits for the address
+ * to leave "tentative", pings the gateway so its neighbour entry exists, and only then gives the
+ * outbound ping about 30 seconds. Safe to run again.
+ */
 export function ipv6Script(ipv6Subnet: string): string {
   return `set -euo pipefail
 F=/etc/network/interfaces
@@ -289,15 +296,37 @@ if ! grep -q '^iface vmbr0 inet6' "$F"; then
   cp -a "$F" "$F.sowsi-before-ipv6"
   printf '\\niface vmbr0 inet6 static\\n    address ${ipv6Subnet}::1/64\\n    gateway fe80::1\\n' >> "$F"
 fi
+since=$(date '+%Y-%m-%d %H:%M:%S')
 ifreload -a
-out6=fail
 for _ in $(seq 1 15); do
-  if curl -6 -fsS -o /dev/null -m 5 ${OUTBOUND_URL}; then out6=ok; break; fi
-  sleep 2
+  addr=$(ip -o -6 addr show dev vmbr0 scope global)
+  if [ -n "$addr" ] && ! grep -q tentative <<<"$addr"; then break; fi
+  sleep 1
 done
+gateway6=fail
+for _ in $(seq 1 5); do
+  if ping -6 -c 1 -W 2 fe80::1%vmbr0 >/dev/null 2>&1; then gateway6=ok; break; fi
+done
+out6=fail
+for i in $(seq 1 10); do
+  target=${IPV6_TARGETS[0]}
+  if [ $((i % 2)) = 0 ]; then target=${IPV6_TARGETS[1]}; fi
+  if ping -6 -c 1 -W 2 "$target" >/dev/null 2>&1; then out6=ok; break; fi
+  sleep 1
+done
+if [ "$out6" != ok ]; then
+  echo "ipv6_debug<<"
+  echo "--- ip -6 addr"; ip -6 addr show dev vmbr0
+  echo "--- ip -6 route"; ip -6 route
+  echo "--- ip -6 neigh"; ip -6 neigh show dev vmbr0
+  echo "--- journal since the reload"; journalctl --since "$since" --no-pager 2>&1 | head -30 || true
+  echo ">>ipv6_debug"
+fi
 echo "ipv6=$(ip -o -6 addr show dev vmbr0 scope global | awk '{print $4; exit}')"
 echo "route6=$(ip -6 route show default | awk '{print $3" "$5; exit}')"
 echo "ipv4=$(ip -o -4 addr show dev vmbr0 | awk '{print $4; exit}' | cut -d/ -f1)"
+echo "gateway6=$gateway6"
+echo "dns=$(getent hosts deb.debian.org >/dev/null && echo ok || echo broken)"
 echo "out6=$out6"`;
 }
 
@@ -308,6 +337,11 @@ export function checkIpv6(facts: Record<string, string>, expected: { ipv4: strin
   if (facts.ipv4 !== expected.ipv4) problems.push(`vmbr0 lost its IPv4 (now "${facts.ipv4}")`);
   if (facts.out6 !== "ok") problems.push("the host can't reach the internet over IPv6");
   return problems;
+}
+
+/** ip -6 addr, route, neigh and the journal, printed only when the outbound ping failed. */
+export function ipv6Debug(output: string): string {
+  return /ipv6_debug<<\n([\s\S]*?)\n?>>ipv6_debug/.exec(output)?.[1] ?? "";
 }
 
 export const STAGED_INTERFACES = "/etc/network/interfaces.sowsi-new";
@@ -583,7 +617,13 @@ echo "template=$(pveam list local 2>/dev/null | grep -c ubuntu-22.04-standard)"
 echo "routes_service=$(systemctl is-enabled sowsi-routes.service 2>/dev/null)"
 echo "dispatcher=$(test -x /usr/local/sbin/sowsi-host && echo yes || echo no)"
 echo "vmbr1=$(ip -br link show vmbr1 2>/dev/null | awk '{print $NF}')"
-echo "storage=$(pvesh get /storage/local --output-format json | sed -n 's/.*"content":"\\([^"]*\\)".*/\\1/p')"`;
+echo "storage=$(pvesh get /storage/local --output-format json | sed -n 's/.*"content":"\\([^"]*\\)".*/\\1/p')"
+echo "forward4=$(sysctl -n net.ipv4.ip_forward)"
+echo "forward6=$(sysctl -n net.ipv6.conf.all.forwarding)"
+echo "forward_saved=$(grep -c '^net.ip' /etc/sysctl.d/99-sowsi-routing.conf)"
+echo "proxy_ndp=$(sysctl -n net.ipv6.conf.vmbr0.proxy_ndp)"
+echo "proxy_arp=$(sysctl -n net.ipv4.conf.vmbr1.proxy_arp)"
+echo "proxy_saved=$(grep -cE 'post-up sysctl -qw net\\.(ipv6\\.conf\\.vmbr0\\.proxy_ndp|ipv4\\.conf\\.vmbr1\\.proxy_arp)=1' /etc/network/interfaces)"`;
 }
 
 export function checkHostSetup(setupOutput: string, facts: Record<string, string>): string[] {
@@ -598,6 +638,13 @@ export function checkHostSetup(setupOutput: string, facts: Record<string, string
   if (!/[<,]UP[,>]/.test(facts.vmbr1 ?? "")) problems.push(`vmbr1 isn't up (${facts.vmbr1 || "missing"})`);
   const content = `,${facts.storage ?? ""},`;
   for (const type of ["rootdir", "images", "vztmpl"]) if (!content.includes(`,${type},`)) problems.push(`storage "local" lacks ${type}`);
+  // Containers depend on these, and they must survive a reboot: forwarding through /etc/sysctl.d,
+  // the per-bridge proxies through vmbr1's post-up lines, which run each time the bridge comes up.
+  if (facts.forward4 !== "1" || facts.forward6 !== "1") problems.push(`forwarding is off (IPv4 ${facts.forward4}, IPv6 ${facts.forward6})`);
+  if (facts.forward_saved !== "2") problems.push("IPv4 and IPv6 forwarding aren't both in /etc/sysctl.d/99-sowsi-routing.conf");
+  if (facts.proxy_ndp !== "1") problems.push(`proxy_ndp on vmbr0 is ${facts.proxy_ndp}`);
+  if (facts.proxy_arp !== "1") problems.push(`proxy_arp on vmbr1 is ${facts.proxy_arp}`);
+  if (facts.proxy_saved !== "2") problems.push("the proxy settings aren't in vmbr1's post-up lines, so they wouldn't survive a reboot");
   return problems;
 }
 
@@ -672,7 +719,8 @@ export function parseRoutes(output: string): { ipv4: number; ipv6: number } | nu
 // ── 4) inside the test container ────────────────────────────────────
 
 export function containerOutboundScript(ipv4: boolean): string {
+  // Ping first: an IPv6-only container can't reach the node's IPv4 resolvers, so names may not work there.
   const get = (v: 4 | 6) =>
-    `(curl -${v} -fsS -o /dev/null -m 15 ${OUTBOUND_URL} 2>/dev/null || wget -${v} -q -O /dev/null -T 15 ${OUTBOUND_URL}) && echo ok || echo fail`;
+    `(ping -${v} -c 2 -W 3 ${v === 6 ? IPV6_TARGETS[0] : "1.1.1.1"} >/dev/null 2>&1 || curl -${v} -fsS -o /dev/null -m 15 ${OUTBOUND_URL} 2>/dev/null || wget -${v} -q -O /dev/null -T 15 ${OUTBOUND_URL}) && echo ok || echo fail`;
   return [`echo "out6=$(${get(6)})"`, ipv4 ? `echo "out4=$(${get(4)})"` : `echo "out4=skipped"`].join("\n");
 }

@@ -110,6 +110,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     /** Card name pinned by the .link file. */
     pinName: null as string | null,
     guardInstalled: false,
+    ipv6Fails: cfg.ipv6Fails ?? false,
     /** What the rescue repair wrote. */
     repaired: "",
     servicesStarting: cfg.servicesStartingPolls ?? 0,
@@ -193,7 +194,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "simulate bad nic": w.installed = w.installed.replace(/bridge-ports \S+/, `bridge-ports ${S.BAD_NIC}`); return "1";
         case "ipv6":
           if (!/inet6/.test(w.installed)) w.installed += "\niface vmbr0 inet6 static\n";
-          return `ipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\nroute6=fe80::1 vmbr0\nipv4=${SERVER_IPV4}\nout6=${cfg.ipv6Fails ? "fail" : "ok"}`;
+          return `${w.ipv6Fails ? "ipv6_debug<<\n--- ip -6 addr\ninet6 fe80::1/64\n--- ip -6 neigh\nfe80::1 FAILED\n>>ipv6_debug\n" : ""}ipv6=${S.subnetOf(SERVER_IPV6_NET)}::1/64\nroute6=fe80::1 vmbr0\nipv4=${SERVER_IPV4}\ngateway6=ok\ndns=broken\nout6=${w.ipv6Fails ? "fail" : "ok"}`;
         case "start Proxmox install": w.pveInstall = "running"; return "started=yes";
         case "install status": if (w.pveInstall === "running") { w.pveInstall = "done"; return "state=activating\nresult=success"; } return "state=active\nresult=success";
         case "pre-reboot check": return facts();
@@ -208,7 +209,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           if (cfg.firewallLostOnReboot && w.kernel.endsWith("-pve")) w.firewall.active = false;
           return runFirewallScript(w.firewall, command);
         case "proxmox-host-setup.sh": assert.match(o!.stdin!, /sowsi-routes/); return "== 1. DNS\n…\n== Done";
-        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images";
+        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2";
         case "API token": w.tokenMade = true; return JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: "0" }, value: SECRET });
         case "add provisioning key": w.authorized.push(`restrict,command="/usr/local/sbin/sowsi-host" ${PROV_KEY}`); return "1";
         case "remove install key": w.authorized = w.authorized.filter((k) => k !== INSTALL_KEY); return `install_lines=0\nadmin_lines=${w.authorized.includes(ADMIN_KEY) ? 1 : 0}`;
@@ -1008,7 +1009,8 @@ test("--simulate-bad-nic proves the guard, and with --no-guard the rescue repair
 test("the test switches can't reach a real node", () => {
   assert.deepEqual(testFlagProblems({ name: "sowsi-test-01", simulateBadNic: true, noGuard: true }), []);
   assert.match(testFlagProblems({ name: "sowsi-proxmox-02", simulateBadNic: true }).join(), /must contain "test"/);
-  assert.match(testFlagProblems({ name: "sowsi-test-01", noGuard: true }).join(), /only for use with --simulate-bad-nic/);
+  assert.deepEqual(testFlagProblems({ name: "sowsi-test-01", noPin: true }), [], "--no-pin alone, to see what the pin does");
+  assert.match(testFlagProblems({ name: "sowsi-proxmox-02", noPin: true, noGuard: true }).join(), /--no-pin, --no-guard are only for a throwaway/);
   assert.deepEqual(testFlagProblems({ name: "sowsi-proxmox-02" }), []);
 });
 
@@ -1238,4 +1240,41 @@ test("a failed name is kept the same way, and an old unsettled record is correct
   const f = world({ failLabel: "hostname" });
   await executeInstall(f.deps, opts(), settings);
   assert.match((await planInstall(f.deps, opts(), settings)).notes!.join(), /this name failed last time.*a new server will be bought/);
+});
+
+// ── Stopped at 3e+ ────────────────────────────────────────────────────
+
+test("a failure at 3e+ keeps the message and shows the network state", async () => {
+  const w = world({ ipv6Fails: true });
+  const r = await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  assert.match((r as { error: string }).error, /the host can't reach the internet over IPv6[\s\S]*--- ip -6 addr[\s\S]*--- ip -6 neigh/);
+});
+
+test("a re-run on the server that stopped at 3e+ resumes there, buys nothing, and says so first", async () => {
+  const w = world({ ipv6Fails: true });
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  const done = w.installs.get(NAME)!.completedSteps;
+  assert.deepEqual(done, STEPS.slice(0, STEPS.indexOf("ipv6")), "everything up to 3e");
+
+  const before = w.commands.length;
+  const resumed = resumeWorld(w);
+  const plan = await planInstall(resumed.deps, opts(), settings);
+  assert.equal(plan.ok, true, plan.problems.join());
+  assert.equal(plan.resumeFrom, "ipv6");
+  const lines = resumeSummary(plan.install!).join("\n");
+  assert.match(lines, /Resuming sowsi-proxmox-02 on Hetzner server \d+ \(203\.0\.113\.20\): no new server is bought/);
+  assert.match(lines, /next: 3e\+ add IPv6/);
+
+  const r = await executeInstall(resumed.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.equal(resumed.commands[before], "ipv6");
+  ok(!resumed.commands.slice(before).includes("reboot"), "no second reboot");
+  assert.equal(requested(resumed, "/servers").length, 1, "one server, ever");
+  assert.equal(resumed.logs.filter((l) => l.action === "SERVER_PURCHASED").length, 1);
+});
+
+test("DNS not working yet doesn't fail 3e+: it's noted, and the host setup repairs it", async () => {
+  const w = world();
+  await executeInstall(w.deps, opts(), settings);
+  assert.match(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "ipv6")), /DNS doesn't work yet/);
 });

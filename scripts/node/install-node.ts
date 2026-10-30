@@ -17,7 +17,7 @@
  * resumed. A node holding customers is refused unless --allow-downtime is given.
  *
  * Throwaway tests (--name must contain "test"): --simulate-bad-nic points the bridge at a card that
- * doesn't exist before the reboot; add --no-guard to prove the rescue repair instead of the guard.
+ * doesn't exist before the reboot; --no-pin and --no-guard leave that protection out.
  *
  * .env: MGMT_PUBLIC_IP, NODE_ADMIN_SSH_PUBLIC_KEY, HETZNER_API_TOKEN, PROVISIONING_SSH_* ;
  * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_EUR_TO_INR [100].

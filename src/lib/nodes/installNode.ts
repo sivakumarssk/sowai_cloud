@@ -255,7 +255,7 @@ export type InstallOptions = {
   allowDowntime?: boolean;
   /** Throwaway tests: point the bridge at a card that doesn't exist before the reboot. */
   simulateBadNic?: boolean;
-  /** Throwaway tests: leave a layer of protection out, to prove the next one. */
+  /** Throwaway tests: leave a layer of protection out, to see what happens without it. */
   noPin?: boolean;
   noGuard?: boolean;
 };
@@ -263,8 +263,8 @@ export type InstallOptions = {
 /** The test-only switches can't reach a real node: they need a throwaway name and each other. */
 export function testFlagProblems(o: Pick<InstallOptions, "name" | "simulateBadNic" | "noPin" | "noGuard">): string[] {
   const problems: string[] = [];
-  if ((o.noPin || o.noGuard) && !o.simulateBadNic) problems.push("--no-pin and --no-guard are only for use with --simulate-bad-nic");
-  if (o.simulateBadNic && !/test/.test(o.name)) problems.push(`--simulate-bad-nic is only for a throwaway: the --name must contain "test" (got "${o.name}")`);
+  const flags = [o.simulateBadNic && "--simulate-bad-nic", o.noPin && "--no-pin", o.noGuard && "--no-guard"].filter(Boolean);
+  if (flags.length && !/test/.test(o.name)) problems.push(`${flags.join(", ")} ${flags.length === 1 ? "is" : "are"} only for a throwaway: the --name must contain "test" (got "${o.name}")`);
   return problems;
 }
 
@@ -634,9 +634,11 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
 
   async ipv6(ctx) {
     const expected = { ipv4: ctx.rec.ipv4!, ipv6Subnet: ctx.rec.ipv6Subnet! };
-    const problems = S.checkIpv6(S.parseFacts(await onNode(ctx, "ipv6", S.ipv6Script(expected.ipv6Subnet), { timeoutMs: 2 * 60_000 })), expected);
-    if (problems.length) fail("ipv6", problems);
-    return `${expected.ipv6Subnet}::1/64 on vmbr0 via fe80::1; IPv4 still up; host reaches the internet over IPv6`;
+    const output = await onNode(ctx, "ipv6", S.ipv6Script(expected.ipv6Subnet), { timeoutMs: 3 * 60_000 });
+    const facts = S.parseFacts(output);
+    const problems = S.checkIpv6(facts, expected);
+    if (problems.length) fail("ipv6", [...problems, ...(S.ipv6Debug(output) ? [`\n${S.ipv6Debug(output)}`] : [])]);
+    return `${expected.ipv6Subnet}::1/64 on vmbr0 via fe80::1; IPv4 still up; host reaches the internet over IPv6${facts.dns === "ok" ? "" : "; DNS doesn't work yet (the host setup repairs it next)"}`;
   },
 
   async firewall(ctx) {
