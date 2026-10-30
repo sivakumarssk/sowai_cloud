@@ -2,6 +2,7 @@
  * Step 5 live test: plan (and optionally apply) a RAM change on a container.
  *
  *   npx tsx scripts/engine/ramScale.ts --vmid 100 --plan-ram 2048                    # plan +512 MB, change nothing
+ *   (with more than one node, add --node <name>: VM ids repeat across nodes)
  *   npx tsx scripts/engine/ramScale.ts --vmid 100 --plan-ram 2048 --execute          # apply (admin action)
  *   npx tsx scripts/engine/ramScale.ts --vmid 100 --plan-ram 2048 --to 2048 --execute # put it back to plan size
  *   npx tsx scripts/engine/ramScale.ts --service <serviceId> [--add 512 | --to <MB>] [--execute]

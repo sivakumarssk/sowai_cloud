@@ -21,6 +21,15 @@ export function nodeTarget(node: { name: string; ip: string; hetznerServerId: st
   return { name: node.name, ip: node.ip, hetznerServerId, location: node.location, ipv6Subnet: node.ipv6Subnet.replace(/:+$/, "") };
 }
 
+/**
+ * The node holding a container. VM ids repeat across nodes (each starts at 100), so
+ * a row with no node recorded can only be trusted while there is exactly one node.
+ * Null = it can't be told which container that VM id means: touch nothing.
+ */
+export function containerNode<N>(recorded: N | null | undefined, allNodes: N[]): N | null {
+  return recorded ?? (allNodes.length === 1 ? allNodes[0] : null);
+}
+
 /** "2a01:4f8:1c16:5f1d" + vmid 100 → "2a01:4f8:1c16:5f1d::100" */
 export function ipv6ForVmid(subnet: string, vmid: number): string {
   // The VMID's decimal digits are used as the final hextet, which only fits up to 4 digits.

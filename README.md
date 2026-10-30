@@ -147,10 +147,9 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   unless you pass `--keep-on-failure`.
 - **Settings it needs in `.env`:** `MGMT_PUBLIC_IP` and
   `NODE_ADMIN_SSH_PUBLIC_KEY` (see `.env.example`).
-- **Before opening a second node:** `src/lib/billing/suspension.ts` still talks
-  to node 1 only. Fix that first, or suspending a node-2 service acts on the
-  same VM id on node 1.
-- **Opening the node:** only once you're happy with it, and after the fix above.
+- **VM ids repeat across nodes**, so a VM id means nothing without its node.
+  Scripts taking `--vmid` need `--node` once there's more than one node.
+- **Opening the node:** only once you're happy with it.
   ```sql
   update "ProxmoxNode" set status = 'READY', "acceptNewClients" = true where name = 'sowsi-proxmox-02';
   ```

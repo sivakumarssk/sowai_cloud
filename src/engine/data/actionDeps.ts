@@ -34,9 +34,11 @@ export async function targetForContainer(opts: {
   planRamMB: number;
   planDiskGB: number;
 }): Promise<ContainerTarget> {
-  const name = opts.nodeName ?? process.env.PROXMOX_NODE;
-  const node = await prisma.proxmoxNode.findFirst({ where: name ? { name } : {}, orderBy: { name: "asc" } });
-  if (!node) throw new Error(`node ${name ?? "(any)"} is not registered — run npm run db:seed`);
+  const nodes = await prisma.proxmoxNode.findMany({ orderBy: { name: "asc" } });
+  // VM ids repeat across nodes: with several nodes, one has to be named.
+  if (!opts.nodeName && nodes.length > 1) throw new Error(`container ${opts.vmid} could be on any of ${nodes.map((n) => n.name).join(", ")} — pass --node <name>`);
+  const node = opts.nodeName ? nodes.find((n) => n.name === opts.nodeName) : nodes[0];
+  if (!node) throw new Error(`node ${opts.nodeName ?? "(any)"} is not registered — run npm run db:seed`);
   const service = await prisma.service.findFirst({
     where: { nodeId: node.id, proxmoxVmId: String(opts.vmid), status: { notIn: ["DELETED", "CANCELLED"] } },
     select: { id: true },

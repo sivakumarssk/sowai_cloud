@@ -2,6 +2,7 @@
  * Step 6 live test: plan (and optionally apply) a disk expansion.
  *
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20                          # plan /data +10 GB
+ *   (with more than one node, add --node <name>: VM ids repeat across nodes)
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20 --opt-in --execute       # create /data (test container)
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --plan-disk 20 --opt-in --add 5 --execute  # grow /data by 5 GB
  *   npx tsx scripts/engine/diskExpand.ts --vmid 100 --remove-data                          # test cleanup: remove /data (running → queued until restart, nothing destroyed)

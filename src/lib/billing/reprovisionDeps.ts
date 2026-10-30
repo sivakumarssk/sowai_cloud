@@ -1,8 +1,9 @@
 import { prisma } from "@/lib/prisma";
 import { razorpay } from "@/lib/razorpay";
 import { hetzner } from "@/lib/hetzner";
-import { proxmox, proxmoxForNode, ProxmoxError } from "@/lib/proxmox";
+import { proxmoxForNode, ProxmoxError } from "@/lib/proxmox";
 import { provisionVPS } from "@/lib/provisioning/provisionVPS";
+import { containerNode } from "@/lib/provisioning/nodeTarget";
 import { chooseNode } from "@/lib/provisioning/placement";
 import { nodeLoads, placementConfig } from "@/lib/provisioning/placementDeps";
 import { prismaEngineLog } from "@/engine/data/engineLog";
@@ -48,19 +49,23 @@ export function prismaReprovisionDeps(): ReprovisionDeps {
 
     async findContainers(s) {
       const found: string[] = [];
-      // 1. Its recorded vmid on its recorded node (or the default node for old rows).
+      const nodes = await prisma.proxmoxNode.findMany({ select: { name: true, ip: true } });
+      // 1. Its recorded vmid on its recorded node. VM ids repeat across nodes, so never on another one.
       if (s.proxmoxVmId) {
-        const node = s.nodeName ? await prisma.proxmoxNode.findUnique({ where: { name: s.nodeName }, select: { name: true, ip: true } }) : null;
-        const client = node ? proxmoxForNode(node) : proxmox;
-        try {
-          const st = await client.getLXCStatus(Number(s.proxmoxVmId));
-          found.push(`vmid ${s.proxmoxVmId} on ${node?.name ?? "the default node"} (${st.status})`);
-        } catch (err) {
-          if (!(err instanceof ProxmoxError && /does not exist/i.test(err.message))) throw err;
+        const node = containerNode(nodes.find((n) => n.name === s.nodeName), nodes);
+        if (!node) {
+          found.push(`vmid ${s.proxmoxVmId} with no node recorded and ${nodes.length} nodes registered — can't tell which container that is`);
+        } else {
+          try {
+            const st = await proxmoxForNode(node).getLXCStatus(Number(s.proxmoxVmId));
+            found.push(`vmid ${s.proxmoxVmId} on ${node.name} (${st.status})`);
+          } catch (err) {
+            if (!(err instanceof ProxmoxError && /does not exist/i.test(err.message))) throw err;
+          }
         }
       }
       // 2. Any container named after it, on every registered node.
-      for (const node of await prisma.proxmoxNode.findMany({ select: { name: true, ip: true } })) {
+      for (const node of nodes) {
         for (const ct of await proxmoxForNode(node).listLXC()) {
           if (ct.name === label(s.id)) found.push(`vmid ${ct.vmid} "${ct.name}" on ${node.name} (${ct.status})`);
         }

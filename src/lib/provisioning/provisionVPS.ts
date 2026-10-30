@@ -1,6 +1,6 @@
 import type { Plan, ServiceStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { proxmox, proxmoxForNode, ProxmoxError, type ProxmoxService } from "@/lib/proxmox";
+import { proxmoxForNode, ProxmoxError, type ProxmoxService } from "@/lib/proxmox";
 import { destroyContainerAndDisks } from "@/lib/containerDisks";
 import { prismaEngineLog } from "@/engine/data/engineLog";
 import { hetzner } from "@/lib/hetzner";
@@ -14,7 +14,7 @@ import { alertAdmins } from "@/lib/adminAlert";
 import { cancelAutopayForService } from "@/lib/billing/subscriptions";
 import { placeOrder } from "@/lib/provisioning/placement";
 import { prismaPlacementDeps } from "@/lib/provisioning/placementDeps";
-import { ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
+import { containerNode, ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
 
 export type PlanResources = { cores: number; memory: number; disk: number };
 
@@ -206,11 +206,14 @@ const LEFTOVER_DISKS = "Leftover disks";
 async function releaseResources(
   vmid: number | null,
   floatingIpId: number | null,
-  ctx: { client?: ProxmoxService; serviceId?: string; nodeName?: string; routesHost?: string } = {}
+  ctx: { client?: ProxmoxService; noNode?: string; serviceId?: string; nodeName?: string; routesHost?: string } = {}
 ): Promise<string[]> {
   const errors: string[] = [];
   if (vmid !== null) {
-    const client = ctx.client ?? proxmox;
+    const { client } = ctx;
+    if (!client) {
+      return [`Delete container ${vmid}: ${ctx.noNode}`, ...(floatingIpId !== null ? [`Floating IP ${floatingIpId} kept because the container still exists`] : [])];
+    }
     try {
       const disks = await destroyContainerAndDisks(client, vmid);
       if (disks.leftover.length > 0) {
@@ -248,10 +251,13 @@ async function releaseResources(
   return errors;
 }
 
-/** Proxmox client and route-sync host for the node a service's container is on (falls back to the default node). */
-async function clientForService(serviceId: string): Promise<{ client: ProxmoxService; nodeName?: string; routesHost?: string }> {
+/** Proxmox client and route-sync host for the node a service's container is on, or why that can't be told. */
+async function clientForService(serviceId: string): Promise<{ client?: ProxmoxService; noNode?: string; nodeName?: string; routesHost?: string }> {
   const service = await prisma.service.findUnique({ where: { id: serviceId }, select: { node: { select: { name: true, ip: true } } } });
-  return service?.node ? { client: proxmoxForNode(service.node), nodeName: service.node.name, routesHost: service.node.ip } : { client: proxmox };
+  const nodes = service?.node ? [] : await prisma.proxmoxNode.findMany({ select: { name: true, ip: true } });
+  const node = containerNode(service?.node, nodes);
+  if (!node) return { noNode: `service ${serviceId} has no node recorded and ${nodes.length} nodes are registered, so this VM id can't be matched to a container` };
+  return { client: proxmoxForNode(node), nodeName: node.name, routesHost: node.ip };
 }
 
 async function handleFailure(

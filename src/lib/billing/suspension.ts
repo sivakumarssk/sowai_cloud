@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { realServerWhere } from "@/lib/provisioning/serverReady";
-import { proxmox } from "@/lib/proxmox";
+import { proxmoxForNode } from "@/lib/proxmox";
 import { sendBillingNoticeEmail } from "@/lib/email";
 import { alertAdmins } from "@/lib/adminAlert";
 import { DELETE_AFTER_SUSPENDED_DAYS, BILLING_SUSPEND_REASON } from "./constants";
@@ -30,14 +30,17 @@ export async function suspendForNonPayment(serviceId: string, why: string): Prom
   });
   if (claimed.count === 0) return false;
 
-  const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId }, include: { user: true, plan: true } });
+  const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId }, include: { user: true, plan: true, node: { select: { name: true, ip: true } } } });
 
   if (service.proxmoxVmId) {
     const vmid = Number(service.proxmoxVmId);
     try {
-      await proxmox.setLXCOnboot(vmid, false);
-      const { status } = await proxmox.getLXCStatus(vmid);
-      if (status === "running") await proxmox.shutdownLXC(vmid);
+      // A VM id is only unique per node.
+      if (!service.node) throw new Error("the service has no node recorded");
+      const pve = proxmoxForNode(service.node);
+      await pve.setLXCOnboot(vmid, false);
+      const { status } = await pve.getLXCStatus(vmid);
+      if (status === "running") await pve.shutdownLXC(vmid);
     } catch (err) {
       // Billing state is already SUSPENDED; an admin can stop the container by hand.
       await alertAdmins(
@@ -81,16 +84,18 @@ export async function resumeAfterPayment(serviceId: string): Promise<boolean> {
   });
   if (claimed.count === 0) return false;
 
-  const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId }, include: { user: true, plan: true } });
+  const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId }, include: { user: true, plan: true, node: { select: { name: true, ip: true } } } });
 
   if (service.proxmoxVmId) {
     const vmid = Number(service.proxmoxVmId);
     try {
-      await proxmox.setLXCOnboot(vmid, true);
-      const { status } = await proxmox.getLXCStatus(vmid);
+      if (!service.node) throw new Error("the service has no node recorded");
+      const pve = proxmoxForNode(service.node);
+      await pve.setLXCOnboot(vmid, true);
+      const { status } = await pve.getLXCStatus(vmid);
       if (status !== "running") {
-        await proxmox.startLXC(vmid);
-        await proxmox.waitForLXC(vmid);
+        await pve.startLXC(vmid);
+        await pve.waitForLXC(vmid);
       }
     } catch (err) {
       await alertAdmins(

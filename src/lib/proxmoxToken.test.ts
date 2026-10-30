@@ -22,21 +22,11 @@ function sources(dir: string): string[] {
   });
 }
 
-test("every Proxmox call goes through a node's own client, apart from the listed node-1 uses", () => {
-  // The default `proxmox` client always talks to PROXMOX_HOST with the .env token.
-  const nodeOne = sources("src")
+test("nothing but the by-hand node-1 test uses the default client, which always talks to PROXMOX_HOST with the .env token", () => {
+  const imports = /\{[^}]*\bproxmox\b[^}]*\}\s*(from\s*["'][^"']*lib\/proxmox["']|=\s*await import\(["'][^"']*lib\/proxmox["']\))/;
+  const users = sources("src")
     .concat(sources("scripts"))
-    .filter((f) => f !== "src/lib/proxmox.ts" && /\bproxmox\.[a-zA-Z]+\(/.test(readFileSync(f, "utf8")))
+    .filter((f) => imports.test(readFileSync(f, "utf8")))
     .sort();
-  assert.deepEqual(nodeOne, [
-    "scripts/testProxmox.ts", // by-hand connection test against node 1
-    // KNOWN BUG, not fixed because billing is frozen: suspend and resume act on node 1 whatever
-    // node the service is on. Must move to proxmoxForNode(service.node) before a second node opens.
-    "src/lib/billing/suspension.ts",
-  ]);
-
-  // Fallbacks that exist only for rows with no node: never reached for a service on a registered node.
-  for (const f of ["src/lib/provisioning/provisionVPS.ts", "src/lib/billing/reprovisionDeps.ts"]) {
-    assert.match(readFileSync(f, "utf8"), /proxmoxForNode\(/, f);
-  }
+  assert.deepEqual(users, ["scripts/testProxmox.ts"]);
 });
