@@ -435,8 +435,56 @@ const whenBash = (name: string, fn: () => void) => test(name, (t) => (spawnSync(
 function dispatcher(home: string, command: string) {
   const setup = readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n");
   const script = /cat > \/usr\/local\/sbin\/sowsi-host <<'SCRIPT'\n([\s\S]*?)\nSCRIPT\n/.exec(setup)![1].replaceAll("/root/.ssh", home.replaceAll("\\", "/"));
-  return spawnSync("bash", ["-s"], { input: script, encoding: "utf8", env: { ...process.env, SSH_ORIGINAL_COMMAND: command } });
+  return spawnSync("bash", ["-s"], { input: script, encoding: "utf8", cwd: home, env: { ...process.env, SSH_ORIGINAL_COMMAND: command } });
 }
+
+test("the dispatcher refuses anything but its exact commands, and runs nothing it was handed", (t) => {
+  if (spawnSync("bash", ["--version"]).error) return t.skip("no bash");
+  const home = mkdtempSync(path.join(tmpdir(), "sowsi-host-"));
+  const refused = [
+    // No arguments on the read-only commands.
+    "authorized-keys ;touch pwned",
+    "authorized-keys;touch pwned",
+    "authorized-keys; touch pwned",
+    "authorized-keys && touch pwned",
+    "authorized-keys | touch pwned",
+    "authorized-keys $(touch pwned)",
+    "authorized-keys `touch pwned`",
+    "authorized-keys\ttouch pwned",
+    "authorized-keys\ntouch pwned",
+    "authorized-keys extra",
+    "authorized-keys one two",
+    "routes ;touch pwned",
+    "routes;touch pwned",
+    "routes extra",
+    // Volume commands take one all-digit id.
+    "mount-volume",
+    "mount-volume ;touch pwned",
+    "mount-volume 123;touch pwned",
+    "mount-volume $(touch pwned)",
+    "mount-volume `touch pwned`",
+    "mount-volume 123 456",
+    "mount-volume ../../etc",
+    "mount-volume 1234567890123",
+    "mount-volume 123\ntouch pwned",
+    "unmount-volume ;touch pwned",
+    "unmount-volume 123;touch pwned",
+    "unmount-volume 123 456",
+    // Anything else.
+    "touch pwned",
+    "bash -c 'touch pwned'",
+  ];
+  try {
+    for (const command of refused) {
+      const r = dispatcher(home, command);
+      assert.equal(r.status, 2, `${JSON.stringify(command)}: ${r.stderr}`);
+      assert.equal(r.stdout, "", `${JSON.stringify(command)} printed something`);
+      assert.ok(!existsSync(path.join(home, "pwned")), `${JSON.stringify(command)} ran`);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 const hasKeygen = () => !spawnSync("bash", ["-c", "command -v ssh-keygen"]).status;
 
@@ -457,6 +505,8 @@ test("the fingerprint is the one ssh-keygen prints, and the dispatcher lists onl
     const r = dispatcher(home, "authorized-keys");
     assert.equal(r.status, 0, r.stderr);
     for (const f of ["admin", "prov", "id_rsa"]) assert.ok(!r.stdout.includes(pub(f).split(" ")[1]), `${f}: no key body`);
+    assert.doesNotMatch(r.stdout, /me@laptop|root@node|prov\b/, "no comments: they're free text");
+    assert.deepEqual(r.stdout.trim().split("\n").map((l) => l.replace(/SHA256:\S+/, "FP")), ["lines=3", "key=256 FP (ED25519)", "key=2048 FP (RSA)", "key=256 FP (ED25519)", "node_key=FP"], "these lines and nothing else");
 
     const found = S.parseAuthorizedKeys(r.stdout);
     assert.equal(found.lines, 3);

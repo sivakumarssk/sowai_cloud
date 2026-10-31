@@ -41,6 +41,7 @@ export function prismaServerDeps(): ServerMonitorDeps {
             ...(u.physicalDiskGB > 0 && { physicalDiskGB: u.physicalDiskGB }),
             ...(u.physicalCpu > 0 && { physicalCpu: u.physicalCpu }),
             usedRamMB: u.usedRamMB,
+            hostUsedRamMB: u.hostUsedRamMB,
             usedDiskGB: u.usedDiskGB,
             usedCpuPct: u.usedCpuPct,
             allocatedRamMB: u.allocatedRamMB,

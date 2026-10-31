@@ -4,7 +4,7 @@ import { EventBus } from "../core/EventBus";
 import type { EngineEvent } from "../core/events";
 import { loadEngineConfig } from "../config";
 import { silentLogger } from "../log";
-import { ServerMonitor, freePoolBytes } from "./ServerMonitor";
+import { hostUsedRam, ServerMonitor, freePoolBytes } from "./ServerMonitor";
 import { SimulatedServers, flat, steps, type SimServer } from "../testing/simulatedProxmox";
 
 const GB = 1024 ** 3;
@@ -83,6 +83,20 @@ test("sample: physical usage, allocation, containers, volumes", async () => {
     { ram: saved.usedRamMB, alloc: saved.allocatedRamMB, disk: saved.allocatedDiskGB, count: saved.containerCount, health: saved.health, vols: saved.volumes },
     { ram: 3277, alloc: 6144, disk: 60, count: 2, health: "healthy", vols: [{ id: "vol_1", usedGB: 30 }] }
   );
+});
+
+test("the host's own RAM: the node's use minus its containers'; no reading if that comes to nothing", () => {
+  assert.equal(hostUsedRam(3000, [{ mem: 1000 }, { mem: 500 }, { mem: 0 }]), 1500);
+  assert.equal(hostUsedRam(1000, []), 1000);
+  assert.equal(hostUsedRam(1500, [{ mem: 1500 }]), null);
+  assert.equal(hostUsedRam(1000, [{ mem: 1500 }]), null);
+});
+
+test("each poll saves the host's RAM with the rest of the node", async () => {
+  const { sim, poll } = setup([node()]);
+  await poll();
+  const saved = sim.saved[0];
+  assert.equal(saved.hostUsedRamMB, saved.usedRamMB, "the simulated containers report no memory of their own");
 });
 
 test("RAM escalates through warning, critical, full and emergency; health follows", async () => {

@@ -2,7 +2,7 @@ import type { Addon, Plan } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { addonIncludedInPlan, type PricedAddon, type PublicPlan } from "@/lib/pricing";
 import { planAvailability, type Availability } from "@/lib/provisioning/availability";
-import { placementConfig } from "@/lib/provisioning/placementDeps";
+import { measuredHostRamMB, placementConfig } from "@/lib/provisioning/placementDeps";
 
 /** Feature bullets; older plans stored an object of label → text. */
 export function planFeatures(plan: Pick<Plan, "features">): string[] {
@@ -14,7 +14,8 @@ export function planFeatures(plan: Pick<Plan, "features">): string[] {
 
 /** Checks plans against the registered nodes (one query for any number of plans). */
 export async function availabilityChecker(): Promise<(plan: Plan) => Availability> {
-  const nodes = await prisma.proxmoxNode.findMany({ select: { name: true, status: true, physicalRamMB: true, physicalDiskGB: true } });
+  const rows = await prisma.proxmoxNode.findMany({ select: { name: true, status: true, physicalRamMB: true, physicalDiskGB: true, hostUsedRamMB: true, lastSeenAt: true } });
+  const nodes = rows.map((n) => ({ ...n, monitor: { hostUsedRamMB: measuredHostRamMB(n) } }));
   const config = placementConfig();
   return (plan) => planAvailability(plan, nodes, config);
 }

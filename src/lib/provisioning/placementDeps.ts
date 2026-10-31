@@ -24,9 +24,17 @@ function num(name: string, fallback: number): number {
 /**
  * NODE_RAM_OVERCOMMIT   promised container RAM may reach physical × this [1 = none]
  * DISK_POOL_RESERVE_GB  free-pool space never handed out [20]
+ * HOST_RAM_RESERVE_MB   RAM kept for Proxmox until the monitor has measured it [1536]
  */
 export function placementConfig(): PlacementConfig {
-  return { ramOvercommit: num("NODE_RAM_OVERCOMMIT", 1), diskPoolReserveGB: num("DISK_POOL_RESERVE_GB", 20) };
+  return { ramOvercommit: num("NODE_RAM_OVERCOMMIT", 1), diskPoolReserveGB: num("DISK_POOL_RESERVE_GB", 20), hostRamReserveMB: num("HOST_RAM_RESERVE_MB", 1536) };
+}
+
+const monitorFresh = (n: { lastSeenAt: Date | null }, now: number) => n.lastSeenAt !== null && now - n.lastSeenAt.getTime() < MONITOR_MAX_AGE_MS;
+
+/** The monitor's reading of the host's own RAM, if it's recent enough to trust. */
+export function measuredHostRamMB(n: { lastSeenAt: Date | null; hostUsedRamMB: number | null }, now = Date.now()): number | null {
+  return monitorFresh(n, now) ? n.hostUsedRamMB : null;
 }
 
 const pool = () => (process.env.PROXMOX_STORAGE ?? "").trim() || "local";
@@ -64,7 +72,6 @@ export async function nodeLoads(db: Db, now = Date.now()): Promise<NodeLoad[]> {
       bucket.diskGB += (s.allocatedDiskGB ?? plan.diskGB) + (s.dataDiskStorage === pool() ? s.dataDiskGB : 0);
       bucket.count++;
     }
-    const fresh = n.lastSeenAt !== null && now - n.lastSeenAt.getTime() < MONITOR_MAX_AGE_MS;
     return {
       id: n.id,
       name: n.name,
@@ -77,7 +84,7 @@ export async function nodeLoads(db: Db, now = Date.now()): Promise<NodeLoad[]> {
       physicalRamMB: n.physicalRamMB,
       physicalDiskGB: n.physicalDiskGB,
       maxContainers: n.maxContainers,
-      monitor: fresh ? { allocatedRamMB: n.allocatedRamMB, allocatedDiskGB: n.allocatedDiskGB, containerCount: n.containerCount } : null,
+      monitor: monitorFresh(n, now) ? { allocatedRamMB: n.allocatedRamMB, allocatedDiskGB: n.allocatedDiskGB, containerCount: n.containerCount, hostUsedRamMB: n.hostUsedRamMB } : null,
       settled,
       inFlight,
     };

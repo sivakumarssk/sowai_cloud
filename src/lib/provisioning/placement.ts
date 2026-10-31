@@ -22,7 +22,7 @@ export type NodeLoad = {
   physicalDiskGB: number;
   maxContainers: number;
   /** What the ServerMonitor last saw on the node (includes test/unmanaged containers). Null when stale. */
-  monitor: { allocatedRamMB: number; allocatedDiskGB: number; containerCount: number } | null;
+  monitor: { allocatedRamMB: number; allocatedDiskGB: number; containerCount: number; hostUsedRamMB: number | null } | null;
   /** ACTIVE / SUSPENDED services on the node, from the database. */
   settled: Need & { count: number };
   /** Orders placed on the node but not finished (PROVISIONING / INSTALLING) — the monitor may not see them yet. */
@@ -34,7 +34,21 @@ export type PlacementConfig = {
   ramOvercommit: number;
   /** Free-pool space never handed out (same reserve the DiskExpander keeps). */
   diskPoolReserveGB: number;
+  /** RAM kept for Proxmox itself on a node whose host usage hasn't been measured. */
+  hostRamReserveMB: number;
 };
+
+type HostReading = { monitor?: { hostUsedRamMB: number | null } | null };
+
+/** RAM the host keeps: what the monitor measured, otherwise the reserve. */
+export function hostRamMB(node: HostReading, config: PlacementConfig): number {
+  return node.monitor?.hostUsedRamMB ?? config.hostRamReserveMB;
+}
+
+/** RAM containers may be promised. The host's share is real memory, so it's taken off before any overcommit. */
+export function usableRamMB(node: Pick<NodeLoad, "physicalRamMB"> & HostReading, config: PlacementConfig): number {
+  return Math.floor(Math.max(0, node.physicalRamMB - hostRamMB(node, config)) * config.ramOvercommit);
+}
 
 /** Why a node takes no new containers at all, or null if it's open. */
 export function closedReason(node: Pick<NodeLoad, "name" | "acceptNewClients" | "status">): string | null {
@@ -60,7 +74,7 @@ export function nodeFit(node: NodeLoad, need: Need, config: PlacementConfig): Fi
   const disk = Math.max(node.monitor?.allocatedDiskGB ?? 0, node.settled.diskGB) + node.inFlight.diskGB;
   const count = Math.max(node.monitor?.containerCount ?? 0, node.settled.count) + node.inFlight.count;
 
-  const freeRamMB = Math.floor(node.physicalRamMB * config.ramOvercommit) - ram;
+  const freeRamMB = usableRamMB(node, config) - ram;
   const freeDiskGB = node.physicalDiskGB - config.diskPoolReserveGB - disk;
   if (count >= node.maxContainers) return { ok: false, reason: `${node.name} has ${count}/${node.maxContainers} containers` };
   if (freeRamMB < need.ramMB) return { ok: false, reason: `${node.name} has ${Math.max(0, freeRamMB)} MB RAM free, needs ${need.ramMB} MB` };
@@ -89,8 +103,19 @@ export function chooseNode(nodes: NodeLoad[], need: Need, config: PlacementConfi
 }
 
 /** Whether a node could hold this plan at all, even with nothing else on it. */
-export function fitsWhenEmpty(node: Pick<NodeLoad, "physicalRamMB" | "physicalDiskGB">, need: Need, config: PlacementConfig): boolean {
-  return Math.floor(node.physicalRamMB * config.ramOvercommit) >= need.ramMB && node.physicalDiskGB - config.diskPoolReserveGB >= need.diskGB;
+export function fitsWhenEmpty(node: Pick<NodeLoad, "physicalRamMB" | "physicalDiskGB"> & HostReading, need: Need, config: PlacementConfig): boolean {
+  return usableRamMB(node, config) >= need.ramMB && node.physicalDiskGB - config.diskPoolReserveGB >= need.diskGB;
+}
+
+/** How many more of this plan a node would take right now. */
+export function fitCount(node: NodeLoad, need: Need, config: PlacementConfig): number {
+  const trial = { ...node };
+  let count = 0;
+  while (nodeFit(trial, need, config).ok) {
+    reserve(trial, need);
+    count++;
+  }
+  return count;
 }
 
 /** Counts an order as in flight on a node (for several placements in one pass). */

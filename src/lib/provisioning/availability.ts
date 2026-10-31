@@ -4,7 +4,7 @@
 
 import { fitsWhenEmpty, type Need, type PlacementConfig } from "./placement";
 
-export type NodeCapacity = { name: string; status: string; physicalRamMB: number; physicalDiskGB: number };
+export type NodeCapacity = { name: string; status: string; physicalRamMB: number; physicalDiskGB: number; monitor?: { hostUsedRamMB: number | null } | null };
 
 export type Availability = { orderable: true } | { orderable: false; reason: string };
 

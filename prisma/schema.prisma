@@ -429,6 +429,8 @@ model ProxmoxNode {
 
   // Current usage (written by ServerMonitor)
   usedRamMB  Int   @default(0)
+  /// What the host itself uses: usedRamMB minus what its containers use. Null = not measured.
+  hostUsedRamMB Int?
   usedDiskGB Int   @default(0)
   usedCpuPct Float @default(0)
 

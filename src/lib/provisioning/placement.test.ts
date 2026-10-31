@@ -2,9 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   chooseNode,
+  fitCount,
+  fitsWhenEmpty,
+  hostRamMB,
   nodeFit,
   placeOrder,
   resumeWaitingOrders,
+  usableRamMB,
   REMINDER_EVERY_MS,
   WAITING_STEP,
   type Need,
@@ -15,7 +19,8 @@ import {
 } from "./placement";
 import { ipv6ForVmid, nodeTarget } from "./nodeTarget";
 
-const config = { ramOvercommit: 1, diskPoolReserveGB: 20 };
+const config = { ramOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 0 };
+const reserved = { ...config, hostRamReserveMB: 1536 };
 const empty = { ramMB: 0, diskGB: 0, count: 0 };
 
 /** Two CPX32-like nodes in different locations, each with its own server, IP and /64. */
@@ -85,7 +90,7 @@ test("CRITICAL health is not closure; RAM overcommit is configurable", () => {
 
 test("committed load: the larger of monitor and database, plus orders still being set up", () => {
   // The monitor also sees a 3 GB test container the database doesn't know about.
-  const a = node("A", { monitor: { allocatedRamMB: 3072, allocatedDiskGB: 20, containerCount: 1 }, settled: { ramMB: 1024, diskGB: 20, count: 1 }, inFlight: { ramMB: 2048, diskGB: 20, count: 1 } });
+  const a = node("A", { monitor: { allocatedRamMB: 3072, allocatedDiskGB: 20, containerCount: 1, hostUsedRamMB: null }, settled: { ramMB: 1024, diskGB: 20, count: 1 }, inFlight: { ramMB: 2048, diskGB: 20, count: 1 } });
   const fit = nodeFit(a, { ramMB: 1024, diskGB: 10 }, config);
   assert.deepEqual(fit, { ok: true, freeRamMB: 8192 - 3072 - 2048, freeDiskGB: 160 - 20 - 20 - 20 });
 });
@@ -247,4 +252,49 @@ test("sweep: an order that never started (lost in a restart) is always started, 
 
 test("the waiting step tells the customer what's happening", () => {
   assert.match(WAITING_STEP, /waiting for server capacity/);
+});
+
+// ── RAM kept for the host ─────────────────────────────────────────
+
+const basic = { ramMB: 2048, diskGB: 40 };
+const seen = { allocatedRamMB: 0, allocatedDiskGB: 0, containerCount: 0 };
+
+test("the reserve comes off a node's RAM when nothing has been measured", () => {
+  const n = node("A", { physicalRamMB: 3817, physicalDiskGB: 74 });
+  assert.equal(hostRamMB(n, reserved), 1536);
+  assert.equal(usableRamMB(n, reserved), 2281);
+  const fit = nodeFit(n, basic, reserved);
+  assert.ok(fit.ok && fit.freeRamMB === 2281);
+  assert.ok(!nodeFit(n, { ramMB: 2282, diskGB: 0 }, reserved).ok, "one MB over");
+});
+
+test("a measured host figure replaces the reserve, higher or lower", () => {
+  const measured = (hostUsedRamMB: number | null) => node("A", { monitor: { ...seen, hostUsedRamMB } });
+  assert.equal(usableRamMB(measured(2500), reserved), 8192 - 2500);
+  assert.equal(usableRamMB(measured(700), reserved), 8192 - 700);
+  assert.equal(usableRamMB(measured(null), reserved), 8192 - 1536, "seen, but the reading was no use");
+  assert.equal(usableRamMB(node("A", { monitor: null }), reserved), 8192 - 1536, "stale monitor");
+});
+
+test("the host's share is real memory, so it comes off before any overcommit", () => {
+  assert.equal(usableRamMB(node("A"), { ...reserved, ramOvercommit: 1.5 }), Math.floor((8192 - 1536) * 1.5));
+  assert.equal(usableRamMB(node("A", { physicalRamMB: 1024 }), reserved), 0, "never below zero");
+});
+
+test("a plan that only fits by eating the host's RAM isn't offered, and a paid order for it waits", () => {
+  const n = node("A", { physicalRamMB: 3817, physicalDiskGB: 150 });
+  const fourGig = { ramMB: 3072, diskGB: 40 };
+  assert.ok(fitsWhenEmpty(n, fourGig, config));
+  assert.ok(!fitsWhenEmpty(n, fourGig, reserved));
+  assert.equal(chooseNode([n], fourGig, reserved).node, null);
+});
+
+test("fitCount counts what a node would really take, without changing it", () => {
+  const n = node("A", { physicalRamMB: 3817, physicalDiskGB: 74 });
+  assert.equal(fitCount(n, basic, reserved), 1);
+  assert.deepEqual(n.inFlight, empty, "the node is untouched");
+  assert.equal(fitCount(node("A"), basic, reserved), 3, "(8192 − 1536) ÷ 2048");
+  assert.equal(fitCount(node("A", { settled: { ramMB: 2048, diskGB: 40, count: 1 } }), basic, reserved), 2, "what's already there counts");
+  assert.equal(fitCount(node("A", { acceptNewClients: false }), basic, reserved), 0);
+  assert.equal(fitCount(node("A", { physicalRamMB: 64000, physicalDiskGB: 2000 }), basic, reserved), 6, "maxContainers");
 });

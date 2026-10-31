@@ -57,7 +57,7 @@ test("recognises the database refusing a fake ACTIVE", () => {
 
 // ── Buy is hidden for plans no node can hold ─────────────────────────
 
-const config = { ramOvercommit: 1, diskPoolReserveGB: 20 };
+const config = { ramOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 1536 };
 const cpx32 = { name: "sowsi-proxmox-01", status: "READY", physicalRamMB: 7940, physicalDiskGB: 150 };
 const cpx42 = { ...cpx32, physicalRamMB: 15995, physicalDiskGB: 314 };
 const plans = {
@@ -98,4 +98,13 @@ test("alerts once per paid service that has no container after 10 minutes", asyn
   assert.deepEqual(emails, ["2 paid orders have no server after 10 minutes"]);
   assert.deepEqual(await alertPaidWithoutContainer(deps, now), { alerted: 0 }, "not again on the next cron run");
   assert.equal(emails.length, 1);
+});
+
+test("the Buy button follows the same host reserve as placement, so nothing is sold that can't be placed", () => {
+  const plan = { category: "VPS", ramGB: 7, storageGB: 40 };
+  const big = { ...cpx32, physicalRamMB: 8000 };
+  assert.deepEqual(planAvailability(plan, [big], { ...config, hostRamReserveMB: 500 }), { orderable: true });
+  assert.equal(planAvailability(plan, [big], config).orderable, false, "8000 − 1536 is under 7168");
+  assert.deepEqual(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: 700 } }], config), { orderable: true }, "the measured figure wins");
+  assert.equal(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: null } }], config).orderable, false, "no reading: the reserve");
 });

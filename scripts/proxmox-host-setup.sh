@@ -145,17 +145,20 @@ cat > /usr/local/sbin/sowsi-host <<'SCRIPT'
 #   unmount-volume <hetzner-id>    unregister + unmount it (refused while any disk is on it)
 #   authorized-keys                root's authorized keys as fingerprints, never the keys
 set -euo pipefail
+if [[ "${SSH_ORIGINAL_COMMAND:-}" == *$'\n'* ]]; then echo "one line only" >&2; exit 2; fi
 read -r cmd arg extra <<<"${SSH_ORIGINAL_COMMAND:-routes}"
 if [[ -n "${extra:-}" ]]; then echo "too many arguments" >&2; exit 2; fi
+no_arguments() { if [[ -n "${arg:-}" ]]; then echo "too many arguments" >&2; exit 2; fi; }
 case "$cmd" in
-  routes|sowsi-routes) exec /usr/local/sbin/sowsi-routes ;;
+  routes|sowsi-routes) no_arguments; exec /usr/local/sbin/sowsi-routes ;;
   authorized-keys)
-    if [[ -n "${arg:-}" ]]; then echo "too many arguments" >&2; exit 2; fi
+    no_arguments
     # sshd reads both files. The line count catches anything ssh-keygen can't read.
     keys=$(mktemp)
     cat /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 2>/dev/null > "$keys" || true
     echo "lines=$(grep -cvE '^[[:space:]]*(#|$)' "$keys" || true)"
-    ssh-keygen -lf "$keys" 2>/dev/null | sed 's/^/key=/' || true
+    # Size, fingerprint and type: not the comment, which is free text.
+    ssh-keygen -lf "$keys" 2>/dev/null | awk '{print "key=" $1, $2, $NF}' || true
     rm -f "$keys"
     # Proxmox's own key for this node, derived from the private half that lives here.
     echo "node_key=$(ssh-keygen -y -f /root/.ssh/id_rsa 2>/dev/null | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"

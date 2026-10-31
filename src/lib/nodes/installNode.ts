@@ -231,7 +231,7 @@ export type Cost = { monthlyPaise: number; hourlyPaise: number; lines: string[] 
 const inr = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
 /** The server's price plus its Primary IPv4. A missing price is an error, never a zero. */
-export function serverCost(serverType: string, price: HetznerPrice, ips: { primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }, s: InstallSettings, withIpv4Test: boolean): Cost | { error: string } {
+export function serverCost(serverType: string, price: HetznerPrice, ips: { primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }, s: Pick<InstallSettings, "location" | "eurToInr">, withIpv4Test: boolean): Cost | { error: string } {
   const ip = ips.primaryIpv4;
   if (!ip) return { error: `Hetzner's pricing has no Primary IPv4 price for ${s.location}` };
   const monthlyEur = price.monthlyEur + ip.monthlyEur;

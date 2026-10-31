@@ -29,7 +29,7 @@ export type NodeReading = {
 
 export type StorageReading = { total: number; used: number };
 export type DiskImage = { vmid: number | null; size: number };
-export type NodeContainer = { vmid: number; status: string; maxmem: number };
+export type NodeContainer = { vmid: number; status: string; mem: number; maxmem: number };
 
 export type NodeUpdate = {
   nodeId: string;
@@ -38,6 +38,7 @@ export type NodeUpdate = {
   physicalDiskGB: number;
   physicalCpu: number;
   usedRamMB: number;
+  hostUsedRamMB: number | null;
   usedDiskGB: number;
   usedCpuPct: number;
   allocatedRamMB: number;
@@ -71,6 +72,8 @@ export type ServerSample = {
 
   physicalRam: number;
   physicalRamUsed: number;
+  /** The host's own share of physicalRamUsed. Null when that can't be told. */
+  hostRamUsed: number | null;
   physicalRamPct: number;
 
   /** Container storage: size, bytes actually written, bytes promised to containers. */
@@ -265,6 +268,7 @@ export class ServerMonitor {
       hetznerServerId: node.hetznerServerId,
       physicalRam: status.memory.total,
       physicalRamUsed: status.memory.used,
+      hostRamUsed: hostUsedRam(status.memory.used, containers),
       physicalRamPct: pct(status.memory.used, status.memory.total),
       physicalDisk: disk.total,
       physicalDiskUsed: disk.used,
@@ -300,6 +304,7 @@ export class ServerMonitor {
         physicalDiskGB: Math.floor(sample.physicalDisk / GB),
         physicalCpu: sample.physicalCpu,
         usedRamMB: Math.round(sample.physicalRamUsed / MB),
+        hostUsedRamMB: sample.hostRamUsed === null ? null : Math.round(sample.hostRamUsed / MB),
         usedDiskGB: Math.round(sample.physicalDiskUsed / GB),
         usedCpuPct: sample.physicalCpuPct,
         allocatedRamMB: Math.round(sample.allocatedRam / MB),
@@ -313,6 +318,15 @@ export class ServerMonitor {
 
     return sample;
   }
+}
+
+/**
+ * The node's used memory minus what its containers use. An approximation: the two figures are
+ * counted differently. Zero or less isn't a reading, so placement falls back on the reserve.
+ */
+export function hostUsedRam(nodeUsed: number, containers: Pick<NodeContainer, "mem">[]): number | null {
+  const host = nodeUsed - containers.reduce((sum, c) => sum + c.mem, 0);
+  return host > 0 ? host : null;
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;

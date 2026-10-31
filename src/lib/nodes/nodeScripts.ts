@@ -756,7 +756,7 @@ export function keyFingerprint(publicKey: string): string {
 export type AuthorizedKeys = {
   /** Lines in the files that aren't blank or comments. */
   lines: number;
-  /** ssh-keygen -l lines, e.g. "256 SHA256:abc me@laptop (ED25519)". */
+  /** Size, fingerprint and type, e.g. "256 SHA256:abc (ED25519)". */
   keys: { fingerprint: string; shown: string }[];
   /** Fingerprint of the key Proxmox made for this node; empty if the node has none. */
   nodeKey: string;
