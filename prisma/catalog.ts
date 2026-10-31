@@ -427,7 +427,7 @@ export async function upsertPlans(prisma: PrismaClient): Promise<string[]> {
 
 /**
  * Registers the Proxmox host named in .env (PROXMOX_NODE, PROXMOX_HOST, HETZNER_SERVER_ID).
- * Measured specs (RAM, disk) are only set on create — ServerMonitor keeps them current after that.
+ * Measured specs (RAM, disk) and the cost are only set on create — ServerMonitor keeps the specs current after that.
  * Returns null when those variables aren't set.
  */
 export async function upsertNode(prisma: PrismaClient, env: Record<string, string | undefined> = process.env) {
@@ -440,9 +440,9 @@ export async function upsertNode(prisma: PrismaClient, env: Record<string, strin
     hetznerServerId,
     location: env.HETZNER_LOCATION || "nbg1",
     ipv6Subnet: env.PROXMOX_IPV6_SUBNET || null,
-    monthlyCost: Number(env.PROXMOX_NODE_MONTHLY_COST_PAISE || 330000),
   };
   // Hetzner CPX32: 4 vCPU, 8 GB RAM, 160 GB disk, ~₹3,300/month.
-  const specs = { physicalRamMB: 8192, physicalDiskGB: 160, physicalCpu: 4 };
+  // The cost is only a starting value too: scripts/node/recompute-node-costs.ts keeps it right.
+  const specs = { physicalRamMB: 8192, physicalDiskGB: 160, physicalCpu: 4, monthlyCost: Number(env.PROXMOX_NODE_MONTHLY_COST_PAISE || 330000) };
   return prisma.proxmoxNode.upsert({ where: { name }, update: settings, create: { name, ...settings, ...specs } });
 }

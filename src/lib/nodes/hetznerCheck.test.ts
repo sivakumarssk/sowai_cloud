@@ -50,9 +50,11 @@ test("every endpoint answers, every field we read is there, and only GETs are se
   assert.ok(hz.requests.every((r) => r.method === "GET"), "GET only");
   assert.deepEqual(hz.requests.flatMap(deprecatedUse), []);
   const text = formatResults(results);
-  assert.match(text, /cpx22 is buyable in nbg1: €22\.99\/month, €0\.0368\/hour/);
+  assert.match(text, /cpx22 is buyable in nbg1: \$22\.99\/month, \$0\.0368\/hour/);
   assert.match(text, /nbg1 is in eu-central/);
-  assert.match(text, /Primary IPv4 in nbg1: €0\.50\/month/);
+  assert.match(text, /currency USD\n/);
+  assert.match(text, /Primary IPv4 in nbg1: \$0\.50\/month/);
+  assert.doesNotMatch(text, /€/);
   assert.match(text, /no unattached Primary IPs/);
   assert.match(text, /All 10 checks passed/);
   assert.doesNotMatch(text, /ssh-ed25519/, "public keys aren't printed");
@@ -113,4 +115,9 @@ test("a server is ours by label, by its id, or by our naming", async () => {
   const s = await h.createServer({ name: "renamed-node", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
   assert.match(formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1" })), /NOT OURS/);
   assert.doesNotMatch(formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", ownServerIds: [String(s.id)] })), /NOT OURS/);
+});
+
+test("says so if Hetzner reports anything but dollars", async () => {
+  const eur = setup({ currency: "EUR" });
+  assert.match(formatResults(await runHetznerChecks(eur.get, { serverType: "cpx22", location: "nbg1" })), /currency EUR — costs here are worked out from USD/);
 });

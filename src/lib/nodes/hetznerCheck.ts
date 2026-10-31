@@ -78,7 +78,7 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
     if (rows.length === 0) return [`${serverType} is not a Hetzner server type`];
     const offer = serverTypeOffer(rows[0] as unknown as ApiServerType, location);
     return [
-      offer.buyable ? `${serverType} is buyable in ${location}: €${offer.price!.monthlyEur}/month, €${offer.price!.hourlyEur}/hour (gross)` : `NOT buyable: ${offer.reason}`,
+      offer.buyable ? `${serverType} is buyable in ${location}: $${offer.price!.monthly}/month, $${offer.price!.hourly}/hour (gross)` : `NOT buyable: ${offer.reason}`,
       `architecture ${String(rows[0].architecture)}${rows[0].architecture === "x86" ? "" : " — Proxmox needs x86"}`,
     ];
   });
@@ -88,10 +88,10 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
     return [here ? `${location} is in ${String(here.network_zone)}` : `${location} is not in the list`];
   });
 
-  await add("GET /pricing", "/pricing", undefined, "pricing", ["primary_ips[].type", "primary_ips[].prices[].location", "primary_ips[].prices[].price_hourly.gross", "primary_ips[].prices[].price_monthly.gross", "floating_ips[].type", "floating_ips[].prices[].location", "floating_ips[].prices[].price_monthly.gross"], (rows) => {
-    const p = rows[0] as { primary_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[]; floating_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[] };
+  await add("GET /pricing", "/pricing", undefined, "pricing", ["currency", "primary_ips[].type", "primary_ips[].prices[].location", "primary_ips[].prices[].price_hourly.gross", "primary_ips[].prices[].price_monthly.gross", "floating_ips[].type", "floating_ips[].prices[].location", "floating_ips[].prices[].price_monthly.gross"], (rows) => {
+    const p = rows[0] as { currency?: string; primary_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[]; floating_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[] };
     const monthly = (list: typeof p.primary_ips) => list?.find((t) => t.type === "ipv4")?.prices.find((x) => x.location === location)?.price_monthly.gross;
-    return [`Primary IPv4 in ${location}: €${monthly(p.primary_ips) ?? "?"}/month`, `Floating IPv4 in ${location}: €${monthly(p.floating_ips) ?? "?"}/month`];
+    return [`currency ${String(p.currency)}${p.currency === "USD" ? "" : " — costs here are worked out from USD"}`, `Primary IPv4 in ${location}: $${monthly(p.primary_ips) ?? "?"}/month`, `Floating IPv4 in ${location}: $${monthly(p.floating_ips) ?? "?"}/month`];
   });
 
   await add("GET /ssh_keys", "/ssh_keys", { per_page: 50 }, "ssh_keys", ["id", "name", "fingerprint", "public_key"], (rows) =>

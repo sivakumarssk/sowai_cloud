@@ -37,10 +37,11 @@ async function hetznerPrices(types: readonly string[]) {
         continue;
       }
       if (!offer.buyable) unavailable.push(offer.reason ?? `${name} can't be bought`);
-      const cost = serverCost(name, offer.price, ips, { location: LOCATION, eurToInr: inr.rate }, false);
+      const cost = serverCost(name, offer.price, ips, { location: LOCATION, usdToInr: inr.rate }, false);
       if ("monthlyPaise" in cost) servers.set(name, cost.monthlyPaise);
+      else unavailable.push(cost.error);
     }
-    const floatingIpPaise = ips.floatingIpv4MonthlyEur === null ? null : Math.ceil(ips.floatingIpv4MonthlyEur * inr.rate * 100);
+    const floatingIpPaise = ips.floatingIpv4Monthly === null ? null : Math.ceil(ips.floatingIpv4Monthly * inr.rate * 100);
     return { servers, floatingIpPaise, warning: inr.warning, note: `${LOCATION} prices. ${inr.source}, VAT ${ips.vatRate}%${unavailable.length ? `. ${unavailable.join("; ")}` : ""}` };
   } catch (err) {
     return { servers, floatingIpPaise: null, note: `Hetzner prices not available: ${err instanceof Error ? err.message : err}` };

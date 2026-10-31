@@ -113,7 +113,7 @@ test("Primary IPs that can't be removed are reported, not hidden; an already-del
 // ── Availability and price ───────────────────────────────────────────
 
 test("availability and price come from the server type's own entry for that location", () => {
-  assert.deepEqual(serverTypeOffer(CPX22 as never, "nbg1"), { buyable: true, reason: null, price: { hourlyEur: 0.0368, monthlyEur: 22.99 } });
+  assert.deepEqual(serverTypeOffer(CPX22 as never, "nbg1"), { buyable: true, reason: null, price: { hourly: 0.0368, monthly: 22.99 } });
   assert.match(serverTypeOffer(CPX22 as never, "ash").reason!, /isn't sold in ash/);
 });
 
@@ -121,13 +121,13 @@ test("reads the server type and IP prices", async () => {
   const { h, hz } = client();
   assert.equal((await h.getServerType("cpx22"))!.id, 109);
   assert.equal(await h.getServerType("cpx99"), null);
-  assert.deepEqual(await h.ipPrices("nbg1"), { currency: "EUR", vatRate: "0.00", primaryIpv4: { hourlyEur: 0.0008, monthlyEur: 0.5 }, floatingIpv4MonthlyEur: 3.57 });
-  assert.deepEqual(await h.ipPrices("ash"), { currency: "EUR", vatRate: "0.00", primaryIpv4: null, floatingIpv4MonthlyEur: null });
+  assert.deepEqual(await h.ipPrices("nbg1"), { currency: "USD", vatRate: "0.00", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.57 });
+  assert.deepEqual(await h.ipPrices("ash"), { currency: "USD", vatRate: "0.00", primaryIpv4: null, floatingIpv4Monthly: null });
   assert.deepEqual(hz.requests.flatMap(deprecatedUse), []);
 });
 
 test("the currency is the one Hetzner reports for the project", async () => {
-  assert.equal((await client({ currency: "USD" }).h.ipPrices("nbg1")).currency, "USD");
+  assert.equal((await client({ currency: "EUR" }).h.ipPrices("nbg1")).currency, "EUR");
 });
 
 // ── Floating IPs, Volumes, SSH keys, actions ─────────────────────────

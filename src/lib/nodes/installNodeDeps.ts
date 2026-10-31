@@ -1,3 +1,4 @@
+import { inrRate } from "@/lib/provisioning/capacityReport";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
@@ -191,8 +192,8 @@ export function installSettings(env = process.env): InstallSettings {
     if (prov && keyId(pub) === keyId(prov)) problems.push("the install key is the provisioning key — it must be a dedicated key");
   }
 
-  const rate = Number(env.HETZNER_EUR_TO_INR || 100);
-  if (!(rate > 0)) problems.push(`HETZNER_EUR_TO_INR must be a positive number, got "${env.HETZNER_EUR_TO_INR}"`);
+  const rate = inrRate("USD", env);
+  if ("problem" in rate) problems.push(rate.problem);
 
   return {
     location: "nbg1",
@@ -201,7 +202,8 @@ export function installSettings(env = process.env): InstallSettings {
     mgmtHasIpv6,
     protectedServerId: env.HETZNER_SERVER_ID?.trim() || null,
     wrongHost,
-    eurToInr: rate,
+    usdToInr: "rate" in rate ? rate.rate : 0,
+    rateWarning: "warning" in rate ? rate.warning : undefined,
     spendCapPaise: loadEngineSettings(env).spendCapPaise,
     sshTimeoutMs: Number(env.NODE_SSH_TIMEOUT_SECONDS || 300) * 1000,
     rebootTimeoutMs: Number(env.NODE_REBOOT_TIMEOUT_SECONDS || 600) * 1000,

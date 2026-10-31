@@ -20,7 +20,7 @@
  * doesn't exist before the reboot; --no-pin and --no-guard leave that protection out.
  *
  * .env: MGMT_PUBLIC_IP, NODE_ADMIN_SSH_PUBLIC_KEY, HETZNER_API_TOKEN, PROVISIONING_SSH_* ;
- * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_EUR_TO_INR [100].
+ * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_USD_TO_INR [96].
  */
 import { config as loadEnv } from "dotenv";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
@@ -109,7 +109,7 @@ function lock(): () => void {
     const resuming = plan.install?.status === "IN_PROGRESS";
     if (resuming) for (const l of N.resumeSummary(plan.install!)) console.log(l);
     for (const n of plan.notes ?? []) console.log(`  ! ${n}`);
-    if (plan.cost) for (const l of plan.cost.lines) console.log(`  € ${l}`);
+    if (plan.cost) for (const l of plan.cost.lines) console.log(`  $ ${l}`);
     if (plan.cost && plan.resumeFrom === "server") {
       const spent = await deps.db.spentThisMonthPaise();
       const r = (p: number) => `₹${(p / 100).toLocaleString("en-IN")}`;

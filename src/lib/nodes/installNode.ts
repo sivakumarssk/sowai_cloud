@@ -82,7 +82,7 @@ export type NodeRegistration = {
 export type InstallDeps = {
   hetzner: {
     getServerType(name: string): Promise<ApiServerType | null>;
-    ipPrices(location: string): Promise<{ primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }>;
+    ipPrices(location: string): Promise<{ currency: string; primaryIpv4: HetznerPrice | null; floatingIpv4Monthly: number | null }>;
     findServerByName(name: string): Promise<HetznerServer | null>;
     getServer(id: number): Promise<HetznerServer | null>;
     createServer(input: { name: string; serverType: string; location: string; image: string; sshKeyIds: number[]; labels: Record<string, string> }): Promise<HetznerServer>;
@@ -148,7 +148,9 @@ export type InstallSettings = {
   mgmtHasIpv6: boolean;
   /** HETZNER_SERVER_ID: node 1, never touched. */
   protectedServerId: string | null;
-  eurToInr: number;
+  usdToInr: number;
+  /** Set when usdToInr is a default, not HETZNER_USD_TO_INR. */
+  rateWarning?: string;
   spendCapPaise: number;
   sshTimeoutMs: number;
   rebootTimeoutMs: number;
@@ -230,21 +232,23 @@ export type Cost = { monthlyPaise: number; hourlyPaise: number; lines: string[] 
 
 const inr = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
-/** The server's price plus its Primary IPv4. A missing price is an error, never a zero. */
-export function serverCost(serverType: string, price: HetznerPrice, ips: { primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }, s: Pick<InstallSettings, "location" | "eurToInr">, withIpv4Test: boolean): Cost | { error: string } {
+/** The server's price plus its Primary IPv4. A missing price, or prices not in dollars, is an error, never a guess. */
+export function serverCost(serverType: string, price: HetznerPrice, ips: { currency: string; primaryIpv4: HetznerPrice | null; floatingIpv4Monthly: number | null }, s: Pick<InstallSettings, "location" | "usdToInr" | "rateWarning">, withIpv4Test: boolean): Cost | { error: string } {
+  if (ips.currency !== "USD") return { error: `Hetzner reports prices in ${ips.currency}, and costs here are worked out from USD with HETZNER_USD_TO_INR` };
   const ip = ips.primaryIpv4;
   if (!ip) return { error: `Hetzner's pricing has no Primary IPv4 price for ${s.location}` };
-  const monthlyEur = price.monthlyEur + ip.monthlyEur;
-  const hourlyEur = price.hourlyEur + ip.hourlyEur;
-  const monthlyPaise = Math.ceil(monthlyEur * s.eurToInr * 100);
-  const hourlyPaise = Math.ceil(hourlyEur * s.eurToInr * 100);
+  const monthly = price.monthly + ip.monthly;
+  const hourly = price.hourly + ip.hourly;
+  const monthlyPaise = Math.ceil(monthly * s.usdToInr * 100);
+  const hourlyPaise = Math.ceil(hourly * s.usdToInr * 100);
   const lines = [
-    `${serverType} in ${s.location}: €${price.monthlyEur.toFixed(2)}/month, €${price.hourlyEur.toFixed(4)}/hour (gross)`,
-    `primary IPv4: €${ip.monthlyEur.toFixed(2)}/month, €${ip.hourlyEur.toFixed(4)}/hour`,
-    `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.eurToInr}/€, HETZNER_EUR_TO_INR). Billed hourly until deleted.`,
+    `${serverType} in ${s.location}: $${price.monthly.toFixed(2)}/month, $${price.hourly.toFixed(4)}/hour (gross)`,
+    `primary IPv4: $${ip.monthly.toFixed(2)}/month, $${ip.hourly.toFixed(4)}/hour`,
+    `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.usdToInr}/$, HETZNER_USD_TO_INR). Billed hourly until deleted.`,
     `against the spend cap: ${inr(monthlyPaise)} if it stays as a node; if it's destroyed, only ${inr(hourlyPaise)} per started hour it lived`,
   ];
-  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 (€${(ips.floatingIpv4MonthlyEur ?? 0).toFixed(2)}/month list price), released right after the test`);
+  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 ($${(ips.floatingIpv4Monthly ?? 0).toFixed(2)}/month list price), released right after the test`);
+  if (s.rateWarning) lines.push(s.rateWarning);
   return { monthlyPaise, hourlyPaise, lines };
 }
 

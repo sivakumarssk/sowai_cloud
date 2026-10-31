@@ -91,11 +91,11 @@ export type ServerDeleted = { primaryIpsRemoved: number[]; primaryIpsLeft: numbe
 
 export type HetznerSshKey = { id: number; name: string; fingerprint: string; publicKey: string };
 
-/** Gross prices in EUR for one location. */
-export type HetznerPrice = { hourlyEur: number; monthlyEur: number };
+/** Gross prices for one location, in the project's currency (USD). */
+export type HetznerPrice = { hourly: number; monthly: number };
 
 type ApiPrice = { location: string; price_hourly: { gross: string }; price_monthly: { gross: string } };
-const toPrice = (p: ApiPrice): HetznerPrice => ({ hourlyEur: Number(p.price_hourly.gross), monthlyEur: Number(p.price_monthly.gross) });
+const toPrice = (p: ApiPrice): HetznerPrice => ({ hourly: Number(p.price_hourly.gross), monthly: Number(p.price_monthly.gross) });
 
 /** One entry of GET /server_types. */
 export type ApiServerType = {
@@ -126,7 +126,7 @@ export function serverTypeOffer(type: ApiServerType, location: string): ServerTy
   if (typeof entry.available !== "boolean" || entry.deprecation === undefined) return refuse(`Hetzner's entry for ${type.name} in ${location} has no available/deprecation fields, so availability can't be read`);
   if (entry.deprecation !== null) return refuse(`${type.name} is deprecated in ${location} (unavailable after ${entry.deprecation.unavailable_after})`);
   if (!entry.available) return refuse(`${type.name} isn't available in ${location} right now`);
-  if (!price || !Number.isFinite(price.monthlyEur) || !Number.isFinite(price.hourlyEur)) return refuse(`Hetzner lists no price for ${type.name} in ${location}`);
+  if (!price || !Number.isFinite(price.monthly) || !Number.isFinite(price.hourly)) return refuse(`Hetzner lists no price for ${type.name} in ${location}`);
   return { buyable: true, reason: null, price };
 }
 
@@ -448,7 +448,7 @@ export class HetznerService {
   }
 
   /** Gross prices of a primary IPv4 and a Floating IPv4 in a location, in `currency` (server prices come from getServerType). */
-  async ipPrices(location: string): Promise<{ currency: string; vatRate: string; primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }> {
+  async ipPrices(location: string): Promise<{ currency: string; vatRate: string; primaryIpv4: HetznerPrice | null; floatingIpv4Monthly: number | null }> {
     const { pricing } = await this.request<{
       pricing: {
         currency: string;
@@ -460,7 +460,7 @@ export class HetznerService {
     const at = <T extends { location: string }>(prices: T[] | undefined) => prices?.find((p) => p.location === location);
     const ip = at(pricing.primary_ips.find((t) => t.type === "ipv4")?.prices);
     const fip = at(pricing.floating_ips.find((t) => t.type === "ipv4")?.prices);
-    return { currency: pricing.currency, vatRate: pricing.vat_rate, primaryIpv4: ip ? toPrice(ip) : null, floatingIpv4MonthlyEur: fip ? Number(fip.price_monthly.gross) : null };
+    return { currency: pricing.currency, vatRate: pricing.vat_rate, primaryIpv4: ip ? toPrice(ip) : null, floatingIpv4Monthly: fip ? Number(fip.price_monthly.gross) : null };
   }
 
   // ── SSH keys ──

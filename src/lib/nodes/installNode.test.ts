@@ -17,6 +17,8 @@ import {
   type InstallSettings,
   type NodeRegistration,
   type Shell,
+  serverCost,
+  type Cost,
 } from "./installNode";
 import * as S from "./nodeScripts";
 import { installHetznerApi } from "./hetznerApi";
@@ -42,7 +44,7 @@ const settings: InstallSettings = {
   mgmtIp: "2.31.11.105",
   mgmtHasIpv6: true,
   protectedServerId: "168392011",
-  eurToInr: 100,
+  usdToInr: 100,
   spendCapPaise: 500_000,
   sshTimeoutMs: 60_000,
   rebootTimeoutMs: 120_000,
@@ -348,7 +350,8 @@ test("plan: monthly and hourly cost from the live prices, nothing bought", async
   assert.equal(p.ok, true, p.problems.join());
   assert.equal(p.cost!.monthlyPaise, Math.ceil((22.99 + 0.5) * 100 * 100));
   assert.equal(p.cost!.hourlyPaise, Math.ceil((0.0368 + 0.0008) * 100 * 100));
-  assert.match(p.cost!.lines.join("\n"), /€22\.99\/month, €0\.0368\/hour[\s\S]*₹2,349\/month, ₹3\.76\/hour/);
+  assert.match(p.cost!.lines.join("\n"), /\$22\.99\/month, \$0\.0368\/hour[\s\S]*₹2,349\/month, ₹3\.76\/hour \(at ₹100\/\$, HETZNER_USD_TO_INR\)/);
+  assert.doesNotMatch(p.cost!.lines.join("\n"), /€|EUR/);
   assert.equal(p.resumeFrom, "server");
   assert.equal(servers(w).size, 0);
   ok(hetznerRequests(w).every((r) => r.method === "GET"), "plan mode only reads");
@@ -1447,4 +1450,23 @@ test("IPv6 still doesn't depend on DNS, which is recorded on its own", async () 
   const w = world();
   await executeInstall(w.deps, opts(), settings);
   assert.doesNotMatch(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "ipv6")), /DNS doesn't work/);
+});
+
+test("the cost follows the dollar rate, and a default rate is said out loud", () => {
+  const price = { hourly: 0.0368, monthly: 22.99 };
+  const ips = { currency: "USD", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.57 };
+  const at = (usdToInr: number, rateWarning?: string) => serverCost("cpx22", price, ips, { location: "nbg1", usdToInr, rateWarning }, false);
+  const set = at(96) as Cost;
+  assert.equal(set.monthlyPaise, Math.ceil(23.49 * 96 * 100));
+  assert.equal(set.hourlyPaise, Math.ceil(0.0376 * 96 * 100));
+  assert.ok(!set.lines.some((l) => l.includes("WARNING")));
+  assert.equal((at(96, "WARNING: a default") as Cost).lines.at(-1), "WARNING: a default");
+});
+
+test("prices in another currency are refused, not converted at the dollar rate", async () => {
+  const w = world({ hetzner: { currency: "EUR" } });
+  const p = await planInstall(w.deps, opts(), settings);
+  assert.equal(p.ok, false);
+  assert.match(p.problems.join(), /Hetzner reports prices in EUR/);
+  ok(hetznerRequests(w).every((r) => r.method === "GET"), "nothing bought");
 });

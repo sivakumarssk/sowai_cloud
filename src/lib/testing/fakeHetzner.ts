@@ -132,7 +132,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
       if (cfg.pricingError) throw new Reply(cfg.pricingError.status, cfg.pricingError.code, cfg.pricingError.message);
       return ok({
         pricing: {
-          currency: cfg.currency ?? "EUR",
+          currency: cfg.currency ?? "USD",
           vat_rate: "0.00",
           primary_ips: [
             { type: "ipv4", prices: [{ location: "nbg1", ...price("0.0008", "0.50") }] },
