@@ -447,10 +447,12 @@ export class HetznerService {
     return server_types.find((t) => t.name === name) ?? null;
   }
 
-  /** Gross EUR prices of a primary IPv4 and a Floating IPv4 in a location (server prices come from getServerType). */
-  async ipPrices(location: string): Promise<{ primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }> {
+  /** Gross prices of a primary IPv4 and a Floating IPv4 in a location, in `currency` (server prices come from getServerType). */
+  async ipPrices(location: string): Promise<{ currency: string; vatRate: string; primaryIpv4: HetznerPrice | null; floatingIpv4MonthlyEur: number | null }> {
     const { pricing } = await this.request<{
       pricing: {
+        currency: string;
+        vat_rate: string;
         primary_ips: { type: string; prices: ApiPrice[] }[];
         floating_ips: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[];
       };
@@ -458,7 +460,7 @@ export class HetznerService {
     const at = <T extends { location: string }>(prices: T[] | undefined) => prices?.find((p) => p.location === location);
     const ip = at(pricing.primary_ips.find((t) => t.type === "ipv4")?.prices);
     const fip = at(pricing.floating_ips.find((t) => t.type === "ipv4")?.prices);
-    return { primaryIpv4: ip ? toPrice(ip) : null, floatingIpv4MonthlyEur: fip ? Number(fip.price_monthly.gross) : null };
+    return { currency: pricing.currency, vatRate: pricing.vat_rate, primaryIpv4: ip ? toPrice(ip) : null, floatingIpv4MonthlyEur: fip ? Number(fip.price_monthly.gross) : null };
   }
 
   // ── SSH keys ──

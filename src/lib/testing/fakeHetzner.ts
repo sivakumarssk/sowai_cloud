@@ -60,6 +60,8 @@ export type FakeHetznerConfig = {
   createError?: { status: number; code: string; message: string };
   /** GET /server_types answers with this error. */
   serverTypesError?: { status: number; code: string; message: string };
+  /** The project's currency in GET /pricing. */
+  currency?: string;
   /** GET /pricing answers with this error. */
   pricingError?: { status: number; code: string; message: string };
   /** Server delete leaves its Primary IPs behind, unassigned (auto_delete off). */
@@ -130,7 +132,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
       if (cfg.pricingError) throw new Reply(cfg.pricingError.status, cfg.pricingError.code, cfg.pricingError.message);
       return ok({
         pricing: {
-          currency: "EUR",
+          currency: cfg.currency ?? "EUR",
           vat_rate: "0.00",
           primary_ips: [
             { type: "ipv4", prices: [{ location: "nbg1", ...price("0.0008", "0.50") }] },
