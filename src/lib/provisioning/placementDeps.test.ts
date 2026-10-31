@@ -19,6 +19,23 @@ test("HOST_RAM_RESERVE_MB is 1536 unless set, and a bad value is refused", () =>
   }
 });
 
+test("NODE_DISK_OVERCOMMIT is 1 unless set, and a bad value is refused", () => {
+  const before = process.env.NODE_DISK_OVERCOMMIT;
+  try {
+    delete process.env.NODE_DISK_OVERCOMMIT;
+    assert.equal(placementConfig().diskOvercommit, 1);
+    process.env.NODE_DISK_OVERCOMMIT = "1.5";
+    assert.equal(placementConfig().diskOvercommit, 1.5);
+    for (const bad of ["0", "-1", "lots"]) {
+      process.env.NODE_DISK_OVERCOMMIT = bad;
+      assert.throws(() => placementConfig(), /NODE_DISK_OVERCOMMIT must be a positive number/);
+    }
+  } finally {
+    if (before === undefined) delete process.env.NODE_DISK_OVERCOMMIT;
+    else process.env.NODE_DISK_OVERCOMMIT = before;
+  }
+});
+
 test("a host reading only counts while the monitor is recent", () => {
   const now = Date.parse("2026-10-31T12:00:00Z");
   const ago = (minutes: number) => new Date(now - minutes * 60_000);

@@ -23,11 +23,12 @@ function num(name: string, fallback: number): number {
 
 /**
  * NODE_RAM_OVERCOMMIT   promised container RAM may reach physical × this [1 = none]
+ * NODE_DISK_OVERCOMMIT  promised container disk may reach the pool × this [1 = none]
  * DISK_POOL_RESERVE_GB  free-pool space never handed out [20]
- * HOST_RAM_RESERVE_MB   RAM kept for Proxmox until the monitor has measured it [1536]
+ * HOST_RAM_RESERVE_MB   RAM always kept for Proxmox, more if the monitor measures more [1536]
  */
 export function placementConfig(): PlacementConfig {
-  return { ramOvercommit: num("NODE_RAM_OVERCOMMIT", 1), diskPoolReserveGB: num("DISK_POOL_RESERVE_GB", 20), hostRamReserveMB: num("HOST_RAM_RESERVE_MB", 1536) };
+  return { ramOvercommit: num("NODE_RAM_OVERCOMMIT", 1), diskOvercommit: num("NODE_DISK_OVERCOMMIT", 1), diskPoolReserveGB: num("DISK_POOL_RESERVE_GB", 20), hostRamReserveMB: num("HOST_RAM_RESERVE_MB", 1536) };
 }
 
 const monitorFresh = (n: { lastSeenAt: Date | null }, now: number) => n.lastSeenAt !== null && now - n.lastSeenAt.getTime() < MONITOR_MAX_AGE_MS;

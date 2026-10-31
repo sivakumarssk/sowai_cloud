@@ -32,22 +32,29 @@ export type NodeLoad = {
 export type PlacementConfig = {
   /** Promised container RAM may reach physical RAM × this. 1 = no overcommit. */
   ramOvercommit: number;
+  /** Promised container disk may reach the pool × this. 1 = no thin provisioning. */
+  diskOvercommit: number;
   /** Free-pool space never handed out (same reserve the DiskExpander keeps). */
   diskPoolReserveGB: number;
-  /** RAM kept for Proxmox itself on a node whose host usage hasn't been measured. */
+  /** RAM always kept for Proxmox itself: the host keeps more only if it was measured using more. */
   hostRamReserveMB: number;
 };
 
 type HostReading = { monitor?: { hostUsedRamMB: number | null } | null };
 
-/** RAM the host keeps: what the monitor measured, otherwise the reserve. */
+/** RAM the host keeps: the larger of what the monitor measured and the reserve. */
 export function hostRamMB(node: HostReading, config: PlacementConfig): number {
-  return node.monitor?.hostUsedRamMB ?? config.hostRamReserveMB;
+  return Math.max(node.monitor?.hostUsedRamMB ?? 0, config.hostRamReserveMB);
 }
 
 /** RAM containers may be promised. The host's share is real memory, so it's taken off before any overcommit. */
 export function usableRamMB(node: Pick<NodeLoad, "physicalRamMB"> & HostReading, config: PlacementConfig): number {
   return Math.floor(Math.max(0, node.physicalRamMB - hostRamMB(node, config)) * config.ramOvercommit);
+}
+
+/** Disk containers may be promised. The reserve is real space, so it's taken off before any overcommit. */
+export function usableDiskGB(node: Pick<NodeLoad, "physicalDiskGB">, config: PlacementConfig): number {
+  return Math.floor(Math.max(0, node.physicalDiskGB - config.diskPoolReserveGB) * config.diskOvercommit);
 }
 
 /** Why a node takes no new containers at all, or null if it's open. */
@@ -75,7 +82,7 @@ export function nodeFit(node: NodeLoad, need: Need, config: PlacementConfig): Fi
   const count = Math.max(node.monitor?.containerCount ?? 0, node.settled.count) + node.inFlight.count;
 
   const freeRamMB = usableRamMB(node, config) - ram;
-  const freeDiskGB = node.physicalDiskGB - config.diskPoolReserveGB - disk;
+  const freeDiskGB = usableDiskGB(node, config) - disk;
   if (count >= node.maxContainers) return { ok: false, reason: `${node.name} has ${count}/${node.maxContainers} containers` };
   if (freeRamMB < need.ramMB) return { ok: false, reason: `${node.name} has ${Math.max(0, freeRamMB)} MB RAM free, needs ${need.ramMB} MB` };
   if (freeDiskGB < need.diskGB) return { ok: false, reason: `${node.name} has ${Math.max(0, freeDiskGB)} GB disk free (after ${config.diskPoolReserveGB} GB reserve), needs ${need.diskGB} GB` };
@@ -104,7 +111,7 @@ export function chooseNode(nodes: NodeLoad[], need: Need, config: PlacementConfi
 
 /** Whether a node could hold this plan at all, even with nothing else on it. */
 export function fitsWhenEmpty(node: Pick<NodeLoad, "physicalRamMB" | "physicalDiskGB"> & HostReading, need: Need, config: PlacementConfig): boolean {
-  return usableRamMB(node, config) >= need.ramMB && node.physicalDiskGB - config.diskPoolReserveGB >= need.diskGB;
+  return usableRamMB(node, config) >= need.ramMB && usableDiskGB(node, config) >= need.diskGB;
 }
 
 /** How many more of this plan a node would take right now. */

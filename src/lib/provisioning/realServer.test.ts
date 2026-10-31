@@ -57,7 +57,7 @@ test("recognises the database refusing a fake ACTIVE", () => {
 
 // ── Buy is hidden for plans no node can hold ─────────────────────────
 
-const config = { ramOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 1536 };
+const config = { ramOvercommit: 1, diskOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 1536 };
 const cpx32 = { name: "sowsi-proxmox-01", status: "READY", physicalRamMB: 7940, physicalDiskGB: 150 };
 const cpx42 = { ...cpx32, physicalRamMB: 15995, physicalDiskGB: 314 };
 const plans = {
@@ -105,6 +105,8 @@ test("the Buy button follows the same host reserve as placement, so nothing is s
   const big = { ...cpx32, physicalRamMB: 8000 };
   assert.deepEqual(planAvailability(plan, [big], { ...config, hostRamReserveMB: 500 }), { orderable: true });
   assert.equal(planAvailability(plan, [big], config).orderable, false, "8000 − 1536 is under 7168");
-  assert.deepEqual(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: 700 } }], config), { orderable: true }, "the measured figure wins");
+  assert.deepEqual(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: 700 } }], { ...config, hostRamReserveMB: 500 }), { orderable: true }, "a low measured figure under a low reserve");
+  assert.equal(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: 700 } }], config).orderable, false, "a low reading doesn't lift the reserve");
+  assert.equal(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: 2000 } }], { ...config, hostRamReserveMB: 500 }).orderable, false, "a high reading beats the reserve");
   assert.equal(planAvailability(plan, [{ ...big, monitor: { hostUsedRamMB: null } }], config).orderable, false, "no reading: the reserve");
 });

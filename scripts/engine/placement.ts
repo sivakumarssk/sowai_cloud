@@ -2,8 +2,9 @@
  * Read-only: what each node has committed, where each VPS plan would be placed right now, how
  * many of each plan fit, and what each plan makes or loses per customer.
  *
- *   npx tsx scripts/engine/placement.ts
+ *   npx tsx scripts/engine/placement.ts [--margin 30]
  *
+ * --margin prices each plan for that margin, in percent; without it, for break-even.
  * Changes nothing; Hetzner is only asked for prices. Run
  * `npx tsx scripts/engine/watchServers.ts --live --once` first so the nodes' measured
  * RAM/disk, host usage and current allocations are fresh.
@@ -40,7 +41,7 @@ async function hetznerPrices(types: readonly string[]) {
       if ("monthlyPaise" in cost) servers.set(name, cost.monthlyPaise);
     }
     const floatingIpPaise = ips.floatingIpv4MonthlyEur === null ? null : Math.ceil(ips.floatingIpv4MonthlyEur * inr.rate * 100);
-    return { servers, floatingIpPaise, note: `${LOCATION} prices. ${inr.source}, VAT ${ips.vatRate}%${unavailable.length ? `. ${unavailable.join("; ")}` : ""}` };
+    return { servers, floatingIpPaise, warning: inr.warning, note: `${LOCATION} prices. ${inr.source}, VAT ${ips.vatRate}%${unavailable.length ? `. ${unavailable.join("; ")}` : ""}` };
   } catch (err) {
     return { servers, floatingIpPaise: null, note: `Hetzner prices not available: ${err instanceof Error ? err.message : err}` };
   }
@@ -49,13 +50,14 @@ async function hetznerPrices(types: readonly string[]) {
 (async () => {
   const { nodeLoads, placementConfig, planNeed } = await import("../../src/lib/provisioning/placementDeps");
   const { chooseNode, nodeFit } = await import("../../src/lib/provisioning/placement");
-  const { DOCUMENTED_SIZES, ILLUSTRATIVE_OVERCOMMIT, emptied, fitLines, hostLine, hypotheticalNode, includedIps, planEconomicsLines } = await import("../../src/lib/provisioning/capacityReport");
+  const { DOCUMENTED_SIZES, ILLUSTRATIVE_OVERCOMMIT, emptied, fitLines, hostLine, hypotheticalNode, includedIps, parseMargin, planEconomicsLines } = await import("../../src/lib/provisioning/capacityReport");
   const { planFeatures } = await import("../../src/lib/plans");
   const { prisma } = await import("../../src/lib/prisma");
   try {
+    const marginPct = parseMargin(process.argv.slice(2));
     const config = placementConfig();
     const nodes = await nodeLoads(prisma);
-    console.log(`Placement · RAM overcommit ×${config.ramOvercommit} · disk reserve ${config.diskPoolReserveGB} GB · host RAM reserve ${config.hostRamReserveMB} MB when not measured\n`);
+    console.log(`Placement · RAM overcommit ×${config.ramOvercommit} · disk overcommit ×${config.diskOvercommit} · disk reserve ${config.diskPoolReserveGB} GB · host RAM reserve ${config.hostRamReserveMB} MB, more if measured higher\n`);
     for (const n of nodes) {
       const free = nodeFit(n, { ramMB: 0, diskGB: 0 }, config);
       console.log(
@@ -89,6 +91,7 @@ async function hetznerPrices(types: readonly string[]) {
     const hz = await hetznerPrices(DOCUMENTED_SIZES.map((s) => s.type));
     const costs = await prisma.proxmoxNode.findMany({ select: { id: true, monthlyCost: true } });
     const overcommit = config.ramOvercommit > 1 ? config.ramOvercommit : ILLUSTRATIVE_OVERCOMMIT;
+    const diskOvercommit = config.diskOvercommit > 1 ? config.diskOvercommit : ILLUSTRATIVE_OVERCOMMIT;
     const servers = [
       ...DOCUMENTED_SIZES.flatMap((size) => {
         const cost = hz.servers.get(size.type);
@@ -97,7 +100,9 @@ async function hetznerPrices(types: readonly string[]) {
       ...nodes.map((n) => ({ name: n.name, node: emptied(n), monthlyCostPaise: costs.find((c) => c.id === n.id)!.monthlyCost, estimate: false })),
     ];
     console.log(`\nUnit economics: full nodes, profit after Floating IPs, before tax, payment fees, traffic, backups and support`);
-    console.log(`${hz.note}. "est." = Hetzner's documented size, and a real node measures less. RAM ×${overcommit} is ${config.ramOvercommit > 1 ? "NODE_RAM_OVERCOMMIT" : "illustrative"}. Break-even is per price, in the order shown.\n`);
+    console.log(`${hz.note}. "est." = Hetzner's documented size, and a real node measures less. RAM ×${overcommit} is ${config.ramOvercommit > 1 ? "NODE_RAM_OVERCOMMIT" : "illustrative"}, disk ×${diskOvercommit} is ${config.diskOvercommit > 1 ? "NODE_DISK_OVERCOMMIT" : "illustrative: thin disks aren't enabled"}. Break-even is per price, in the order shown. A registered node shows the cost saved when it was installed.`);
+    if (hz.warning) console.log(hz.warning);
+    console.log();
     for (const p of plans) {
       const plan = {
         ...rows.find((r) => r.name === p.name)!,
@@ -105,7 +110,7 @@ async function hetznerPrices(types: readonly string[]) {
         prices: { intro1Year: p.priceIntro1Year, intro2Year: p.priceIntro2Year, monthly: p.priceMonthly, renewal: p.priceRenewal },
         ips: includedIps(planFeatures(p)),
       };
-      for (const line of planEconomicsLines(plan, servers, { config, overcommit, floatingIpPaise: hz.floatingIpPaise })) console.log(line);
+      for (const line of planEconomicsLines(plan, servers, { config, overcommit, diskOvercommit, marginPct, floatingIpPaise: hz.floatingIpPaise })) console.log(line);
       console.log();
     }
     const skipped = await prisma.plan.count({ where: { category: { not: "VPS" }, isActive: true } });

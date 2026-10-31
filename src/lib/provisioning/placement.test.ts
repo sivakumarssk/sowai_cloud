@@ -8,6 +8,7 @@ import {
   nodeFit,
   placeOrder,
   resumeWaitingOrders,
+  usableDiskGB,
   usableRamMB,
   REMINDER_EVERY_MS,
   WAITING_STEP,
@@ -19,7 +20,7 @@ import {
 } from "./placement";
 import { ipv6ForVmid, nodeTarget } from "./nodeTarget";
 
-const config = { ramOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 0 };
+const config = { ramOvercommit: 1, diskOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 0 };
 const reserved = { ...config, hostRamReserveMB: 1536 };
 const empty = { ramMB: 0, diskGB: 0, count: 0 };
 
@@ -271,7 +272,8 @@ test("the reserve comes off a node's RAM when nothing has been measured", () => 
 test("a measured host figure replaces the reserve, higher or lower", () => {
   const measured = (hostUsedRamMB: number | null) => node("A", { monitor: { ...seen, hostUsedRamMB } });
   assert.equal(usableRamMB(measured(2500), reserved), 8192 - 2500);
-  assert.equal(usableRamMB(measured(700), reserved), 8192 - 700);
+  assert.equal(usableRamMB(measured(700), reserved), 8192 - 1536, "the reserve holds when the host reads lower");
+  assert.equal(usableRamMB(measured(1536), reserved), 8192 - 1536);
   assert.equal(usableRamMB(measured(null), reserved), 8192 - 1536, "seen, but the reading was no use");
   assert.equal(usableRamMB(node("A", { monitor: null }), reserved), 8192 - 1536, "stale monitor");
 });
@@ -297,4 +299,16 @@ test("fitCount counts what a node would really take, without changing it", () =>
   assert.equal(fitCount(node("A", { settled: { ramMB: 2048, diskGB: 40, count: 1 } }), basic, reserved), 2, "what's already there counts");
   assert.equal(fitCount(node("A", { acceptNewClients: false }), basic, reserved), 0);
   assert.equal(fitCount(node("A", { physicalRamMB: 64000, physicalDiskGB: 2000 }), basic, reserved), 6, "maxContainers");
+});
+
+test("NODE_DISK_OVERCOMMIT at 1 changes nothing; above it the pool stretches after the reserve", () => {
+  const n = node("A", { physicalDiskGB: 100 });
+  assert.equal(usableDiskGB(n, config), 80);
+  assert.equal(usableDiskGB(n, { ...config, diskOvercommit: 1.5 }), 120, "(100 - 20) x 1.5, not 100 x 1.5 - 20");
+  assert.equal(usableDiskGB(node("A", { physicalDiskGB: 10 }), { ...config, diskOvercommit: 2 }), 0, "never below zero");
+  const need = { ramMB: 1024, diskGB: 100 };
+  assert.equal(nodeFit(n, need, config).ok, false);
+  assert.equal(nodeFit(n, need, { ...config, diskOvercommit: 1.5 }).ok, true);
+  assert.equal(fitsWhenEmpty(n, need, config), false);
+  assert.equal(fitsWhenEmpty(n, need, { ...config, diskOvercommit: 1.5 }), true);
 });
