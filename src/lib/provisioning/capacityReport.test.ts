@@ -124,7 +124,8 @@ test("a price the plan doesn't have is left out, not treated as zero", () => {
 });
 
 test("the included IPs come from the plan's own bullets", () => {
-  assert.deepEqual(includedIps(["2 vCPU Cores", "1 Dedicated IP"]), { count: 1, stated: true });
+  assert.deepEqual(includedIps(["2 vCPU Cores", "1 IPv4 address"]), { count: 1, stated: true });
+  assert.deepEqual(includedIps(["1 Dedicated IP"]), { count: 1, stated: true }, "a plan row from before the seed");
   assert.deepEqual(includedIps(["3 Dedicated IPs"]), { count: 3, stated: true });
   assert.deepEqual(includedIps(["Daily Backups Included", "99.9% SLA Uptime"]), { count: 1, stated: false });
 });

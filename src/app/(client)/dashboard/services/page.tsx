@@ -202,7 +202,7 @@ function Mono({ children }: { children: React.ReactNode }) {
 /** Credentials, IPs and billing for one server, shown when its row is expanded. */
 function ServerDetails({ service, onChanged }: { service: Service; onChanged: () => void }) {
   const [showPassword, setShowPassword] = useState(false);
-  const os = service.osImage ? getOsImage(service.osImage)?.label.replace(" (Recommended)", "") : null;
+  const os = service.osImage ? getOsImage(service.osImage)?.label ?? service.osImage : null;
   const preset = service.stackPreset && service.stackPreset !== "plain" ? getPreset(service.stackPreset)?.label : null;
   const sshCommand = service.serverIp && service.sshUsername ? `ssh ${service.sshUsername}@${service.serverIp}` : null;
 
@@ -503,7 +503,7 @@ export default function ServicesPage() {
             </svg>
           </div>
           <h2 className="text-fg font-semibold text-lg mb-1">No servers yet</h2>
-          <p className="text-fg-muted text-sm mb-6">Deploy a VPS with root access in a few minutes.</p>
+          <p className="text-fg-muted text-sm mb-6">Deploy a VPS with sudo access, usually in a few minutes.</p>
           <Link href="/pricing">
             <Button>See VPS plans</Button>
           </Link>

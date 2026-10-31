@@ -6,7 +6,7 @@ import { HOSTING_STACKS } from "@/lib/hostingStacks";
 export const metadata: Metadata = {
   title: "Hosting by Technology — Spring Boot, Node.js, Python, FastAPI, ML & More | Sowsi Cloud",
   description:
-    "Find the right hosting for your stack: Spring Boot, Node.js, Python/Django, FastAPI, Machine Learning, Mobile App Backends, Automation Bots, WordPress, and Websites.",
+    "Find the right hosting for your stack: Spring Boot, Node.js, Python/Django, FastAPI, Machine Learning, Mobile App Backends and Automation Bots.",
   keywords:
     "tech stack hosting india, spring boot hosting, node js hosting, python hosting, fastapi hosting, machine learning hosting, mobile backend hosting, automation hosting",
 };

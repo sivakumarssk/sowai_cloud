@@ -85,7 +85,7 @@ const FLOATING_IPS_PROVISIONED = 1;
 /** The IPs a plan promises, read from its feature bullets. Plans that don't say get what provisioning buys. */
 export function includedIps(features: string[]): { count: number; stated: boolean } {
   for (const feature of features) {
-    const m = /^(\d+) Dedicated IPs?$/i.exec(feature.trim());
+    const m = /^(\d+) (?:Dedicated IPs?|IPv4 address(?:es)?)$/i.exec(feature.trim());
     if (m) return { count: Number(m[1]), stated: true };
   }
   return { count: FLOATING_IPS_PROVISIONED, stated: false };

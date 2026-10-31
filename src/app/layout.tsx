@@ -20,9 +20,9 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "Sowsi Cloud Services — Hosting Built for Indian Businesses",
   description:
-    "Fast, reliable cloud hosting in India. Shared hosting, VPS, WordPress hosting, and object storage with GST invoices, UPI payments, and 24/7 support.",
+    "VPS hosting in Germany for Indian businesses, with GST invoices and UPI payments.",
   keywords:
-    "cloud hosting india, vps hosting india, wordpress hosting, object storage, dedicated server hosting india, spring boot hosting, node js hosting, python django hosting, fastapi hosting, machine learning hosting, mobile app backend hosting, automation bot hosting, sowsi cloud",
+    "cloud hosting india, vps hosting india, spring boot hosting, node js hosting, python django hosting, fastapi hosting, machine learning hosting, mobile app backend hosting, automation bot hosting, sowsi cloud",
   openGraph: {
     title: "Sowsi Cloud Services",
     description: "Cloud Hosting Built for Indian Businesses",

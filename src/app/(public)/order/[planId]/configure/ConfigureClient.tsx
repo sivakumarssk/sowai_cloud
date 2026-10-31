@@ -5,14 +5,13 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/landing/Navbar";
 import { Button } from "@/components/ui/Button";
-import { RadioDot, selectCardClass } from "@/components/ui/selection";
 import { OrderSteps } from "@/components/order/OrderSteps";
 import { OrderSummary, MobileOrderBar, PaymentNote } from "@/components/order/OrderSummary";
 import { configureStepHref, planStepHref } from "@/lib/orderFlow";
 import {
   REGIONS,
   DEFAULT_REGION,
-  OS_IMAGES,
+  DEFAULT_OS,
   getOsImage,
   getPresetsForCategory,
   hostnameError,
@@ -49,15 +48,13 @@ export default function ConfigureClient({
   const presets = getPresetsForCategory(plan.category);
   const region = REGIONS.find((r) => r.value === DEFAULT_REGION)!;
 
-  const [stackPreset, setStackPreset] = useState(initialStack);
-  const [osImage, setOsImage] = useState(initialOs);
+  const stackPreset = initialStack;
   const [hostname, setHostname] = useState(normalizeHostname(initialHostname));
   const [touched, setTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const activePreset = presets.find((p) => p.value === stackPreset) || presets[0];
-  const lockedOs = activePreset?.lockedOs ?? null;
   const nameError = hostnameError(hostname, nameKind);
   const showNameError = touched && !!nameError;
 
@@ -68,7 +65,7 @@ export default function ConfigureClient({
       addons: chosenAddonSlugs,
       hostname: next.hostname ?? hostname,
       stack: next.stack ?? stackPreset,
-      os: next.os ?? osImage,
+      os: next.os ?? initialOs,
     };
     window.history.replaceState(null, "", configureStepHref(plan.slug, choices));
   }
@@ -91,7 +88,7 @@ export default function ConfigureClient({
           billingCycle: cycle,
           addons: chosenAddons.map((a) => a.slug),
           region: region.value,
-          osImage: lockedOs || osImage,
+          osImage: DEFAULT_OS,
           stackPreset: activePreset?.value,
           hostname,
         }),
@@ -123,7 +120,7 @@ export default function ConfigureClient({
             <div>
               <h1 className="text-2xl font-semibold text-fg">{isStorage ? "Set up your storage" : "Configure your server"}</h1>
               <p className="text-fg-muted text-sm mt-1">
-                {isStorage ? "Give your bucket a name." : "Name your server and choose what to install."}
+                {isStorage ? "Give your bucket a name." : "Name your server."}
               </p>
             </div>
 
@@ -168,73 +165,16 @@ export default function ConfigureClient({
               )}
             </section>
 
-            {/* Server type */}
-            {!isStorage && presets.length > 1 && (
-              <section aria-labelledby="stack-heading">
-                <h2 id="stack-heading" className="text-fg font-semibold text-lg mb-3">
-                  What should we install?
-                </h2>
-                <div role="radiogroup" aria-labelledby="stack-heading" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {presets.map((p) => {
-                    const isSelected = stackPreset === p.value;
-                    return (
-                      <button
-                        key={p.value}
-                        type="button"
-                        role="radio"
-                        aria-checked={isSelected}
-                        onClick={() => {
-                          setStackPreset(p.value);
-                          sync({ stack: p.value });
-                        }}
-                        className={selectCardClass(isSelected)}
-                      >
-                        <span className="flex items-center gap-2.5 mb-1">
-                          <RadioDot checked={isSelected} />
-                          <span className="text-sm font-semibold text-fg">{p.label}</span>
-                        </span>
-                        <span className="block text-xs text-fg-muted pl-7">{p.description}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-            )}
-
             {/* OS image */}
             {!isStorage && (
               <section aria-labelledby="os-heading">
                 <h2 id="os-heading" className="text-fg font-semibold text-lg mb-3">
                   Operating system
                 </h2>
-                {lockedOs ? (
-                  <div className="rounded-xl bg-surface border border-line p-4">
-                    <p className="text-fg text-sm font-medium">{getOsImage(lockedOs)?.label}</p>
-                    <p className="text-fg-muted text-xs mt-1">Included with {activePreset?.label}.</p>
-                  </div>
-                ) : (
-                  <div role="radiogroup" aria-labelledby="os-heading" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {OS_IMAGES.map((os) => {
-                      const isSelected = osImage === os.value;
-                      return (
-                        <button
-                          key={os.value}
-                          type="button"
-                          role="radio"
-                          aria-checked={isSelected}
-                          onClick={() => {
-                            setOsImage(os.value);
-                            sync({ os: os.value });
-                          }}
-                          className={`${selectCardClass(isSelected)} flex items-center gap-2.5`}
-                        >
-                          <RadioDot checked={isSelected} />
-                          <span className="text-sm font-medium text-fg">{os.label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                <div className="rounded-xl bg-surface border border-line p-4">
+                  <p className="text-fg text-sm font-medium">{getOsImage(DEFAULT_OS)?.label}</p>
+                  <p className="text-fg-muted text-xs mt-1">Nothing is pre-installed.</p>
+                </div>
               </section>
             )}
 

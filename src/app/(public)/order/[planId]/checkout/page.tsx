@@ -92,7 +92,7 @@ export default async function CheckoutPage({
         category: order.plan.category,
         hostname: order.hostname || "",
         region: getRegion(order.region)?.label || order.region,
-        os: order.osImage ? getOsImage(order.osImage)?.label.replace(" (Recommended)", "") ?? order.osImage : null,
+        os: order.osImage ? (getOsImage(order.osImage)?.label ?? order.osImage) ?? order.osImage : null,
         stack: preset && preset.value !== "plain" ? preset.label : null,
       }}
       quote={quote}

@@ -14,7 +14,6 @@ const navLinks = [
   { href: "/hosting", label: "Hosting by Stack" },
   { href: "/#features", label: "Features" },
   { href: "/#why-us", label: "Why Us" },
-  { href: "/#testimonials", label: "Reviews" },
 ];
 
 export default function Navbar() {

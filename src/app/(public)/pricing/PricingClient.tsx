@@ -16,7 +16,7 @@ import {
   formatINR,
   formatStorage,
 } from "@/lib/pricing";
-import { OS_IMAGES, REGIONS, getPresetsForCategory } from "@/lib/provisioning/catalog";
+import { OS_IMAGES, REGIONS } from "@/lib/provisioning/catalog";
 
 type Tab = "VPS" | "STORAGE" | "DEDICATED";
 
@@ -24,15 +24,15 @@ const TABS: { key: Tab; label: string; query: string }[] = [
   { key: "VPS", label: "VPS Hosting", query: "vps" },
   // Object storage is hidden for now; uncomment to bring the tab back.
   // { key: "STORAGE", label: "Object Storage", query: "storage" },
-  { key: "DEDICATED", label: "Dedicated", query: "dedicated" },
+  { key: "DEDICATED", label: "Flat-rate", query: "dedicated" },
 ];
 
 const HEADLINES: Record<Tab, { title: string; sub: string }> = {
-  VPS: { title: "Linux VPS with full root access", sub: "NVMe SSD, a dedicated IPv4 and your choice of OS." },
+  VPS: { title: "Linux VPS with sudo SSH access", sub: "NVMe SSD, a dedicated IPv4 and Ubuntu 22.04." },
   STORAGE: { title: "S3-compatible object storage", sub: "Store backups, media and app assets." },
   DEDICATED: {
-    title: "Dedicated servers and storage",
-    sub: "Guaranteed resources at one flat monthly price.",
+    title: "Flat-rate VPS",
+    sub: "One flat monthly price, or less if you prepay.",
   },
 };
 
@@ -49,17 +49,13 @@ function formatPhone(digits: string): string {
 const STORAGE_CYCLE: CycleKey = "1year";
 
 const regionNames = REGIONS.map((r) => r.label.replace(/^.*—\s*/, "")).join(", ");
-const osNames = OS_IMAGES.map((o) => o.label.replace(" (Recommended)", "")).join(", ");
-const stackNames = getPresetsForCategory("VPS")
-  .filter((p) => p.value !== "plain")
-  .map((p) => p.label)
-  .join(", ");
+const osNames = OS_IMAGES.map((o) => o.label).join(", ");
 
 /* Heroicons-outline paths for the "every plan includes" grid. */
 const INCLUDED: { label: string; detail: string; icon: string }[] = [
   {
-    label: "Full root SSH",
-    detail: "Install anything, your way",
+    label: "SSH with a sudo user",
+    detail: "Direct root login is off",
     icon: "M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z",
   },
   {
@@ -73,13 +69,13 @@ const INCLUDED: { label: string; detail: string; icon: string }[] = [
     icon: "M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4",
   },
   {
-    label: "OS or app stack",
-    detail: "Ubuntu, Debian, Node.js, Python…",
+    label: "Ubuntu 22.04",
+    detail: "Nothing is pre-installed",
     icon: "M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z",
   },
   {
-    label: "Free SSL",
-    detail: "HTTPS for your domains",
+    label: "Ready for your SSL",
+    detail: "Ports 80 and 443 are open for your own certificate",
     icon: "M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z",
   },
   {
@@ -93,8 +89,8 @@ const INCLUDED: { label: string; detail: string; icon: string }[] = [
     icon: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
   },
   {
-    label: "99.9% uptime",
-    detail: "Monitored around the clock",
+    label: "99.9% target",
+    detail: "A target, not a guarantee",
     icon: "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z",
   },
 ];
@@ -117,20 +113,20 @@ const FAQ: { q: string; a: string }[] = [
     a: `${regionNames}. More regions are coming soon.`,
   },
   {
-    q: "Which operating systems and stacks can I choose?",
-    a: `${osNames}, or a ready-made stack: ${stackNames}.`,
+    q: "Which operating system do I get?",
+    a: `${osNames}. Nothing is pre-installed.`,
   },
   {
     q: "How do I get access to my server?",
-    a: "Full root SSH access. Your IP and login details are in your dashboard and email within minutes of payment.",
+    a: "SSH access with a sudo user. Your IP and login details are in your dashboard and email, usually within minutes of payment.",
   },
   {
-    q: "Standard or Dedicated — what's the difference?",
-    a: "Standard plans run on shared resources with an intro price for your first term, then renew monthly. Dedicated plans have guaranteed resources and one flat monthly price that never changes.",
+    q: "Standard or Flat-rate — what's the difference?",
+    a: "Standard plans have an intro price for your first term, then renew monthly. Flat-rate plans have one flat monthly price, with lower rates for 1- or 2-year terms. Both run on shared servers.",
   },
   {
     q: "Can I move to a bigger plan later?",
-    a: "Yes. Open a support ticket and we'll help.",
+    a: "Open a ticket and we'll move you by hand.",
   },
 ];
 
@@ -221,7 +217,8 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
   const vpsPlans = plans.filter((p) => p.category === "VPS" && !p.isDedicated);
   const storagePlans = plans.filter((p) => p.category === "STORAGE" && !p.isDedicated);
   const dedicatedVps = plans.filter((p) => p.category === "VPS" && p.isDedicated);
-  const dedicatedStorage = plans.filter((p) => p.category === "STORAGE" && p.isDedicated);
+  // Object storage hidden for now, like its tab: there's no provisioning for it yet.
+  const dedicatedStorage: PublicPlan[] = [];
   const shown = tab === "VPS" ? vpsPlans : tab === "STORAGE" ? storagePlans : [];
   const shownCycle = tab === "VPS" ? cycle : STORAGE_CYCLE;
   const cheapestRenewal = Math.min(
@@ -291,7 +288,7 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
       </div>
 
       <div id="pricing-panel" role="tabpanel" aria-labelledby={`tab-${TABS.find((t) => t.key === tab)!.query}`}>
-        {/* ── Billing cycle (VPS and Dedicated) ── */}
+        {/* ── Billing cycle (VPS and Flat-rate) ── */}
         <div className="flex flex-col items-center gap-2 px-4 mt-6 min-h-16">
           {tab === "VPS" ? (
             <CyclePicker plans={vpsPlans} cycle={cycle} onChange={setCycle} />
@@ -304,15 +301,14 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
 
         {/* ── Plans ── */}
         {tab === "DEDICATED" ? (
-          <section className="py-10" aria-label="Dedicated plans">
+          <section className="py-10" aria-label="Flat-rate plans">
             <div
               className={`mx-auto px-4 sm:px-6 lg:px-8 flex flex-col gap-14 ${
                 Math.max(dedicatedVps.length, dedicatedStorage.length) >= 4 ? "max-w-7xl" : "max-w-6xl"
               }`}
             >
               {[
-                { id: "dedicated-vps", title: "Dedicated VPS", sub: "Guaranteed vCPU, RAM and NVMe — not shared with anyone.", list: dedicatedVps },
-                { id: "dedicated-s4", title: "Dedicated S4 Storage", sub: "Your own bucket with guaranteed throughput and priority egress.", list: dedicatedStorage },
+                { id: "dedicated-vps", title: "Flat-rate VPS", sub: "Fixed vCPU, RAM and NVMe limits on a shared server.", list: dedicatedVps },
               ]
                 .filter((section) => section.list.length > 0)
                 .map((section) => (
@@ -327,21 +323,21 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
 
               {dedicatedVps.length + dedicatedStorage.length === 0 && (
                 <p className="text-center text-fg-muted py-20 rounded-xl border border-line bg-surface">
-                  No dedicated plans available right now.
+                  No flat-rate plans available right now.
                 </p>
               )}
 
-              {/* Standard vs Dedicated */}
+              {/* Standard vs Flat-rate */}
               <div className="rounded-xl border border-line bg-surface p-6">
-                <h2 className="text-base font-semibold text-fg">Dedicated plans vs Standard</h2>
+                <h2 className="text-base font-semibold text-fg">Flat-rate plans vs Standard</h2>
                 <dl className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
                   <div className="rounded-lg bg-canvas p-4">
                     <dt className="font-medium text-fg">Standard</dt>
-                    <dd className="text-fg-muted mt-1">Shared resources · intro price for your first term, then a monthly renewal price</dd>
+                    <dd className="text-fg-muted mt-1">Intro price for your first term, then a monthly renewal price</dd>
                   </div>
                   <div className="rounded-lg bg-canvas p-4 border border-premium/30">
-                    <dt className="font-medium text-premium">Dedicated</dt>
-                    <dd className="text-fg-muted mt-1">Guaranteed resources · flat monthly price, or save with a 1 or 2 year term</dd>
+                    <dt className="font-medium text-premium">Flat-rate</dt>
+                    <dd className="text-fg-muted mt-1">Flat monthly price, or save with a 1 or 2 year term</dd>
                   </div>
                 </dl>
               </div>
@@ -395,8 +391,13 @@ export default function PricingClient({ plans, initialTab }: { plans: PublicPlan
                     Intro price for your first term, then renews from {formatINR(cheapestRenewal)}/mo. Cancel anytime.
                   </p>
                 )}
-                {tab === "VPS" && dedicatedVps.length > 0 && crossLink("Need more power? See Dedicated plans")}
-                {tab === "STORAGE" && dedicatedStorage.length > 0 && crossLink("Need dedicated storage? See Dedicated plans")}
+                {tab === "VPS" && (
+                  <p className="text-center text-xs text-fg-muted mt-2">
+                    Bandwidth: we don&apos;t cap or meter traffic today. The TB figure is what each plan is sized for.
+                  </p>
+                )}
+                {tab === "VPS" && dedicatedVps.length > 0 && crossLink("Prefer one flat price? See Flat-rate plans")}
+                {tab === "STORAGE" && dedicatedStorage.length > 0 && crossLink("See Flat-rate plans")}
               </>
             )}
           </div>

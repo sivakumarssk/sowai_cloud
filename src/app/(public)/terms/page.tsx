@@ -36,7 +36,7 @@ export default function TermsPage() {
       <Section title="2. The service">
         <p>
           We provide virtual servers (VPS) and related hosting with the resources listed for your plan at the time of
-          purchase. You get full (root) access to your server, which means you&apos;re responsible for what runs on
+          purchase. You get SSH access as a user with sudo, which means you&apos;re responsible for what runs on
           it — including its software, updates, security and the content you host.
         </p>
         <p>
@@ -126,16 +126,15 @@ export default function TermsPage() {
       <Section title="8. Your data and backups">
         <p>
           You own the data on your server. We work hard to keep it safe, but hardware and software can fail, so
-          please keep your own up-to-date backups of anything important. Where a plan includes backups, they are
-          provided on a best-effort basis and don&apos;t replace your own.
+          please keep your own up-to-date backups of anything important. We don&apos;t back up your server.
         </p>
       </Section>
 
       <Section title="9. Availability and support">
         <p>
           We aim for 99.9% monthly availability, not counting scheduled maintenance (which we&apos;ll announce in
-          advance where possible) or problems outside our control. Support is available by ticket from your dashboard
-          or at {SUPPORT_EMAIL}.
+          advance where possible) or problems outside our control. This is a target, not a guarantee, and no service credits apply. Support is available by ticket from your dashboard
+          or at {SUPPORT_EMAIL}. We don&apos;t offer 24/7 support.
         </p>
       </Section>
 

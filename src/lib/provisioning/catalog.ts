@@ -14,13 +14,8 @@ export type OsImage = {
   label: string;
 };
 
-export const OS_IMAGES: OsImage[] = [
-  { value: "ubuntu-22.04", label: "Ubuntu 22.04 LTS (Recommended)" },
-  { value: "ubuntu-24.04", label: "Ubuntu 24.04 LTS" },
-  { value: "debian-12", label: "Debian 12" },
-  { value: "almalinux-9", label: "AlmaLinux 9" },
-  { value: "rocky-9", label: "Rocky Linux 9" },
-];
+/** Only what every node is sure to have: an OS without its template on the node would fail a paid order. */
+export const OS_IMAGES: OsImage[] = [{ value: "ubuntu-22.04", label: "Ubuntu 22.04 LTS" }];
 
 export const DEFAULT_OS = "ubuntu-22.04";
 
@@ -40,34 +35,6 @@ export const STACK_PRESETS: StackPreset[] = [
     description: "A clean server with just the base OS — install anything you like.",
     lockedOs: null,
     categories: ["VPS", "DEDICATED", "SHARED", "STORAGE"],
-  },
-  {
-    value: "wordpress",
-    label: "WordPress (LEMP stack)",
-    description: "Nginx + MySQL + PHP + WordPress, pre-installed and ready to configure.",
-    lockedOs: "ubuntu-22.04",
-    categories: ["WORDPRESS"],
-  },
-  {
-    value: "nodejs",
-    label: "Node.js Runtime",
-    description: "Node.js LTS + PM2 + Nginx reverse proxy, ready for your app.",
-    lockedOs: "ubuntu-22.04",
-    categories: ["VPS", "DEDICATED"],
-  },
-  {
-    value: "python",
-    label: "Python Runtime",
-    description: "Python 3 + pip + Gunicorn + Nginx reverse proxy.",
-    lockedOs: "ubuntu-22.04",
-    categories: ["VPS", "DEDICATED"],
-  },
-  {
-    value: "ai-automation",
-    label: "AI & Automation (Ollama, n8n, Flowise)",
-    description: "Ollama, Open WebUI, n8n, and Flowise pre-installed via Docker.",
-    lockedOs: "ubuntu-22.04",
-    categories: ["VPS", "DEDICATED"],
   },
 ];
 

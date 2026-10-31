@@ -206,8 +206,8 @@ export default function SignupPage() {
       <div className="mt-5 flex items-center justify-center gap-6">
         {[
           { icon: "🧾", label: "GST Invoice" },
-          { icon: "🇮🇳", label: "Indian Servers" },
-          { icon: "⚡", label: "Instant Setup" },
+          { icon: "🇩🇪", label: "Servers in Germany" },
+          { icon: "⚡", label: "Usually Ready in Minutes" },
         ].map((b) => (
           <div key={b.label} className="flex items-center gap-1.5 text-gray-600 text-xs">
             <span>{b.icon}</span>

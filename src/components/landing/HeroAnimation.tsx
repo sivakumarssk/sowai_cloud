@@ -133,16 +133,6 @@ export default function HeroAnimation() {
         </div>
       </div>
 
-      {/* Floating badge — top right */}
-      <div ref={orb1} className="absolute top-6 right-4 sm:right-0"
-        style={{ filter: "drop-shadow(0 8px 20px rgba(34,197,94,0.3))" }}>
-        <div className="rounded-xl px-3 py-2 flex items-center gap-2"
-          style={{ background: "rgba(15,23,42,0.9)", border: "1px solid rgba(34,197,94,0.3)", backdropFilter: "blur(12px)" }}>
-          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#22C55E", boxShadow: "0 0 8px #22C55E" }} />
-          <span style={{ fontSize: 11, color: "#86EFAC", fontWeight: 600 }}>99.9% Uptime</span>
-        </div>
-      </div>
-
       {/* Floating badge — bottom left */}
       <div ref={orb2} className="absolute bottom-10 left-0 sm:-left-4"
         style={{ filter: "drop-shadow(0 8px 20px rgba(27,79,232,0.3))" }}>
@@ -151,18 +141,8 @@ export default function HeroAnimation() {
           <span style={{ fontSize: 16 }}>⚡</span>
           <div>
             <div style={{ fontSize: 11, color: "#93C5FD", fontWeight: 600 }}>NVMe SSD</div>
-            <div style={{ fontSize: 9, color: "#64748B" }}>10x faster</div>
+            <div style={{ fontSize: 9, color: "#64748B" }}>Local storage</div>
           </div>
-        </div>
-      </div>
-
-      {/* Floating badge — middle left */}
-      <div className="absolute top-1/2 -translate-y-1/2 left-0 sm:-left-6"
-        style={{ animation: "floatBadge 3s ease-in-out infinite", filter: "drop-shadow(0 8px 20px rgba(168,85,247,0.25))" }}>
-        <div className="rounded-xl px-3 py-2"
-          style={{ background: "rgba(15,23,42,0.9)", border: "1px solid rgba(168,85,247,0.3)", backdropFilter: "blur(12px)" }}>
-          <div style={{ fontSize: 11, color: "#D8B4FE", fontWeight: 600 }}>₹99/mo</div>
-          <div style={{ fontSize: 9, color: "#64748B" }}>Starting price</div>
         </div>
       </div>
 

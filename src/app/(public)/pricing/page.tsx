@@ -6,7 +6,7 @@ import type { Metadata } from "next";
 export const metadata: Metadata = {
   title: "VPS Pricing — Sowsi Cloud",
   description:
-    "Linux VPS plans with full root access, NVMe SSD and a dedicated IPv4. Prices in INR, pay by UPI, card or netbanking.",
+    "Linux VPS plans with sudo SSH access, NVMe SSD and a dedicated IPv4. Prices in INR, pay by UPI, card or netbanking.",
 };
 
 export const dynamic = "force-dynamic";

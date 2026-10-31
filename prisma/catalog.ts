@@ -44,11 +44,10 @@ export const PLANS: SeedPlan[] = [
       "2 GB RAM",
       "40 GB NVMe SSD",
       "3 TB Bandwidth",
-      "1 Dedicated IP",
-      "Full Root SSH Access",
-      "Choice of OS",
-      "Email Support",
-      "Free SSL Certificate",
+      "1 IPv4 address",
+      "SSH access with a sudo user",
+      "Ubuntu 22.04",
+      "Support by ticket and email",
     ],
   },
   {
@@ -70,13 +69,11 @@ export const PLANS: SeedPlan[] = [
       "4 GB RAM",
       "80 GB NVMe SSD",
       "6 TB Bandwidth",
-      "2 Dedicated IPs",
-      "Full Root SSH Access",
-      "Choice of OS",
+      "1 IPv4 address",
+      "SSH access with a sudo user",
+      "Ubuntu 22.04",
       "Coolify Panel Included",
-      "Priority Support",
-      "Free SSL Certificate",
-      "Weekly Snapshots",
+      "Support by ticket and email",
     ],
   },
   {
@@ -97,14 +94,11 @@ export const PLANS: SeedPlan[] = [
       "8 GB RAM",
       "160 GB NVMe SSD",
       "12 TB Bandwidth",
-      "3 Dedicated IPs",
-      "Full Root SSH Access",
-      "Choice of OS",
+      "1 IPv4 address",
+      "SSH access with a sudo user",
+      "Ubuntu 22.04",
       "Coolify Panel Included",
-      "24/7 Priority Support",
-      "Free SSL Certificate",
-      "Daily Snapshots",
-      "Advanced Monitoring",
+      "Support by ticket and email",
     ],
   },
   {
@@ -177,11 +171,11 @@ export const PLANS: SeedPlan[] = [
       "SLA Support",
     ],
   },
-  // ── Dedicated VPS — guaranteed resources, flat monthly price ──
+  // ── Flat-rate VPS — flat monthly price. Slugs and isDedicated keep their old name; see planId. ──
   // TODO(confirm): Starter and Pro specs are placeholders (2/4/80 and 8/16/320).
   {
     slug: "DEDICATED_STARTER",
-    name: "Dedicated Starter",
+    name: "Flat Starter",
     category: "VPS",
     isDedicated: true,
     sortOrder: 11,
@@ -194,19 +188,16 @@ export const PLANS: SeedPlan[] = [
     storageGB: 80,
     bandwidthTB: 4,
     features: [
-      "2 vCPU (Guaranteed)",
+      "2 shared vCPU",
       "4 GB RAM",
       "80 GB NVMe SSD",
-      "Daily Backups Included",
       "Coolify Panel Included",
-      "24/7 Priority Support",
-      "99.9% SLA Uptime",
-      "Managed Setup",
+      "Support by ticket and email",
     ],
   },
   {
     slug: "DEDICATED_BUSINESS",
-    name: "Dedicated Business",
+    name: "Flat Business",
     category: "VPS",
     isDedicated: true,
     isPopular: true,
@@ -220,19 +211,16 @@ export const PLANS: SeedPlan[] = [
     storageGB: 160,
     bandwidthTB: 8,
     features: [
-      "4 vCPU (Guaranteed)",
+      "4 shared vCPU",
       "8 GB RAM",
       "160 GB NVMe SSD",
-      "Daily Backups Included",
       "Coolify Panel Included",
-      "24/7 Priority Support",
-      "99.9% SLA Uptime",
-      "Managed Setup",
+      "Support by ticket and email",
     ],
   },
   {
     slug: "DEDICATED_PRO",
-    name: "Dedicated Pro",
+    name: "Flat Pro",
     category: "VPS",
     isDedicated: true,
     sortOrder: 13,
@@ -245,14 +233,11 @@ export const PLANS: SeedPlan[] = [
     storageGB: 320,
     bandwidthTB: 16,
     features: [
-      "8 vCPU (Guaranteed)",
+      "8 shared vCPU",
       "16 GB RAM",
       "320 GB NVMe SSD",
-      "Daily Backups Included",
       "Coolify Panel Included",
-      "24/7 Priority Support",
-      "99.9% SLA Uptime",
-      "Managed Setup",
+      "Support by ticket and email",
     ],
   },
 
@@ -348,7 +333,7 @@ export const PLANS: SeedPlan[] = [
   },
 ];
 
-// ── Addons — monthly prices in PAISE ──
+// ── Addons — monthly prices in PAISE. isActive: false = nothing delivers it yet, so it isn't sold. ──
 export const ADDONS = [
   {
     slug: "dailyBackup",
@@ -358,6 +343,7 @@ export const ADDONS = [
     categories: ["VPS" as const],
     exclusiveGroup: "backup",
     sortOrder: 1,
+    isActive: false,
   },
   {
     slug: "weeklyBackup",
@@ -367,6 +353,7 @@ export const ADDONS = [
     categories: ["VPS" as const],
     exclusiveGroup: "backup",
     sortOrder: 2,
+    isActive: false,
   },
   {
     slug: "coolify",
@@ -385,6 +372,7 @@ export const ADDONS = [
     categories: ["VPS" as const],
     exclusiveGroup: null,
     sortOrder: 4,
+    isActive: false,
   },
   {
     slug: "s4Versioning",
@@ -397,11 +385,15 @@ export const ADDONS = [
   },
 ];
 
-/** The id a plan has always had: "<CATEGORY>_<NAME>", e.g. "VPS_VPS_BASIC". Orders and services point at it. */
-export const planId = (plan: SeedPlan) => `${plan.category}_${plan.name.replace(/\s+/g, "_").toUpperCase()}`;
+/** The id a plan has always had, e.g. "VPS_VPS_BASIC". Orders and services point at it, so it comes from the slug: a plan can be renamed. */
+export const planId = (plan: SeedPlan) => `${plan.category}_${plan.slug}`;
 
-/** Creates or updates every catalog plan. Returns their ids. */
-export async function upsertPlans(prisma: PrismaClient): Promise<string[]> {
+/**
+ * Creates every catalog plan, and brings existing ones up to date. With textOnly an existing plan
+ * gets its name and features and nothing else: its prices and whether it's active stay as they are.
+ * Returns their ids.
+ */
+export async function upsertPlans(prisma: PrismaClient, { textOnly = false } = {}): Promise<string[]> {
   const ids: string[] = [];
   for (const plan of PLANS) {
     const id = planId(plan);
@@ -420,7 +412,8 @@ export async function upsertPlans(prisma: PrismaClient): Promise<string[]> {
       // Legacy column, kept in sync with the headline rate.
       price: plan.priceIntro1Year ?? plan.priceMonthly,
     };
-    await prisma.plan.upsert({ where: { id }, update: data, create: { id, ...data } });
+    const update = textOnly ? { name: plan.name, features: plan.features } : data;
+    await prisma.plan.upsert({ where: { id }, update, create: { id, ...data } });
   }
   return ids;
 }

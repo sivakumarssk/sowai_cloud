@@ -1,7 +1,7 @@
 import Link from "next/link";
 import Navbar from "@/components/landing/Navbar";
 
-export const LEGAL_UPDATED = "28 October 2026";
+export const LEGAL_UPDATED = "31 October 2026";
 export const SUPPORT_EMAIL = "support@sowsicloud.com";
 
 const LEGAL_LINKS = [

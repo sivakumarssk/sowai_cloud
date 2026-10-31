@@ -172,7 +172,7 @@ export default function CheckoutClient({
           <div className="lg:col-span-2 flex flex-col gap-6">
             <div>
               <h1 className="text-2xl font-semibold text-fg">Review and pay</h1>
-              <p className="text-fg-muted text-sm mt-1">Setup starts as soon as you pay.</p>
+              <p className="text-fg-muted text-sm mt-1">Setup usually starts right after you pay.</p>
             </div>
 
             <section aria-labelledby="review-heading" className="rounded-xl bg-surface border border-line">
