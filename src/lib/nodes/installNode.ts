@@ -113,6 +113,8 @@ export type InstallDeps = {
   hostSetupScript(): string;
   /** `routes` through the host's sowsi-host dispatcher (provisioning key). */
   syncRoutes(host: string): Promise<string>;
+  /** `authorized-keys` through the same dispatcher: fingerprints, never keys. */
+  authorizedKeys(host: string): Promise<string>;
   proxmox(node: { name: string; ip: string }, token: { tokenId: string; secret: string }): ContainerApi;
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
@@ -162,7 +164,7 @@ export type InstallSettings = {
 export const INSTALL_LABEL = "sowsi-node-install";
 // The firewall comes before the Proxmox install, so port 8006 is never open to the
 // internet: ufw is already denying it when pveproxy first starts listening.
-export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "dns", "ipv6", "host-setup", "api-token", "lockdown", "verify", "register"] as const;
+export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "dns", "ipv6", "host-setup", "api-token", "lockdown", "keys", "verify", "register"] as const;
 export type StepId = (typeof STEPS)[number];
 
 export const STEP_TITLES: Record<StepId, string> = {
@@ -179,6 +181,7 @@ export const STEP_TITLES: Record<StepId, string> = {
   "host-setup": "3g proxmox-host-setup.sh (vmbr1, routes, sowsi-host, storage, template)",
   "api-token": "3h Proxmox API token, stored encrypted; check :8006 from sowsi-mgmt-01",
   lockdown: "3i provisioning key in (restricted), install key out",
+  keys: "3j list authorized_keys by fingerprint; fail on any key that isn't allowed",
   verify: "4  test container: SSH, outbound, delete with verified cleanup",
   register: "5  register the ProxmoxNode (closed, PROVISIONING)",
 };
@@ -705,6 +708,9 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     await shell.exec("add provisioning key", S.addProvisioningKeyScript(deps.keys.provisioningPublicKey));
     const routes = await deps.syncRoutes(ctx.rec.ipv4!);
     if (!S.parseRoutes(routes)) fail("lockdown", [`the provisioning key doesn't reach sowsi-host (${routes.trim().slice(0, 120)}) — install key kept`]);
+    // Before the install key goes: a key that shouldn't be here stops the install while it can still log in.
+    const audit = S.checkAuthorizedKeys(S.parseAuthorizedKeys(await deps.authorizedKeys(ctx.rec.ipv4!)), { admin: deps.keys.adminPublicKey, provisioning: deps.keys.provisioningPublicKey, install: installKey });
+    if (audit.problems.length) fail("lockdown", [...audit.problems, "install key kept"]);
 
     const removed = S.parseFacts(await shell.exec("remove install key", S.removeInstallKeyScript(installKey, deps.keys.adminPublicKey)));
     if (removed.install_lines !== "0" || removed.admin_lines === "0") fail("lockdown", [`authorized_keys: install key lines ${removed.install_lines}, admin key lines ${removed.admin_lines}`]);
@@ -717,6 +723,14 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       if (!(err instanceof SshAuthError)) throw err;
     }
     return "provisioning key forced to sowsi-host; install key refused; admin key kept";
+  },
+
+  async keys(ctx) {
+    const { deps } = ctx;
+    if (!deps.keys.provisioningPublicKey || !deps.keys.adminPublicKey) throw new Error("provisioning or admin public key missing");
+    const { problems, listing } = S.checkAuthorizedKeys(S.parseAuthorizedKeys(await deps.authorizedKeys(ctx.rec.ipv4!)), { admin: deps.keys.adminPublicKey, provisioning: deps.keys.provisioningPublicKey });
+    if (problems.length) fail("authorized keys", [...problems, ...listing]);
+    return `${listing.length} keys, all allowed:\n        ${listing.join("\n        ")}`;
   },
 
   async verify(ctx) {

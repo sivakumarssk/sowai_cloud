@@ -431,6 +431,68 @@ curl() { echo curl >> calls; return 6; }
 const want = { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c18:1f8d" };
 const whenBash = (name: string, fn: () => void) => test(name, (t) => (spawnSync("bash", ["--version"]).error ? t.skip("no bash") : fn()));
 
+/** The dispatcher exactly as proxmox-host-setup.sh writes it, pointed at a temporary home. */
+function dispatcher(home: string, command: string) {
+  const setup = readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n");
+  const script = /cat > \/usr\/local\/sbin\/sowsi-host <<'SCRIPT'\n([\s\S]*?)\nSCRIPT\n/.exec(setup)![1].replaceAll("/root/.ssh", home.replaceAll("\\", "/"));
+  return spawnSync("bash", ["-s"], { input: script, encoding: "utf8", env: { ...process.env, SSH_ORIGINAL_COMMAND: command } });
+}
+
+const hasKeygen = () => !spawnSync("bash", ["-c", "command -v ssh-keygen"]).status;
+
+test("the fingerprint is the one ssh-keygen prints, and the dispatcher lists only fingerprints", (t) => {
+  if (spawnSync("bash", ["--version"]).error || !hasKeygen()) return t.skip("no bash or ssh-keygen");
+  const home = mkdtempSync(path.join(tmpdir(), "sowsi-keys-"));
+  const bash = (cmd: string) => {
+    const r = spawnSync("bash", ["-c", cmd], { encoding: "utf8", cwd: home });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  try {
+    bash("ssh-keygen -q -t ed25519 -N '' -C me@laptop -f admin; ssh-keygen -q -t ed25519 -N '' -C prov -f prov; ssh-keygen -q -t rsa -b 2048 -N '' -C root@node -f id_rsa");
+    const pub = (f: string) => readFileSync(path.join(home, `${f}.pub`), "utf8").trim();
+    writeFileSync(path.join(home, "authorized_keys"), `# a comment\n\n${pub("admin")}\n${pub("id_rsa")}\nrestrict,command="/usr/local/sbin/sowsi-host" ${pub("prov")}\n`);
+    assert.equal(S.keyFingerprint(pub("admin")), bash("ssh-keygen -lf admin.pub").split(" ")[1]);
+
+    const r = dispatcher(home, "authorized-keys");
+    assert.equal(r.status, 0, r.stderr);
+    for (const f of ["admin", "prov", "id_rsa"]) assert.ok(!r.stdout.includes(pub(f).split(" ")[1]), `${f}: no key body`);
+
+    const found = S.parseAuthorizedKeys(r.stdout);
+    assert.equal(found.lines, 3);
+    assert.equal(found.keys.length, 3, "the restricted line counts too");
+    assert.equal(found.nodeKey, S.keyFingerprint(pub("id_rsa")), "from the private half");
+    const audit = S.checkAuthorizedKeys(found, { admin: pub("admin"), provisioning: pub("prov") });
+    assert.deepEqual(audit.problems, []);
+    assert.deepEqual(audit.listing.map((l) => l.split(":")[0]), ["admin", "Proxmox's own key for this node", "provisioning"]);
+
+    // sshd reads this one as well, and a line ssh-keygen can't read still counts.
+    writeFileSync(path.join(home, "authorized_keys2"), "ssh-ed25519 not-a-real-key\n");
+    const worse = S.checkAuthorizedKeys(S.parseAuthorizedKeys(dispatcher(home, "authorized-keys").stdout), { admin: pub("admin"), provisioning: pub("prov") });
+    assert.match(worse.problems.join(), /has 4 lines, but 3 readable keys/);
+
+    assert.equal(dispatcher(home, "authorized-keys extra").status, 2, "it takes no argument");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the audit: an unknown key, a missing key, and the install key once it should be gone", () => {
+  const k = (s: string) => `ssh-ed25519 ${s.padEnd(60, "x")} c`;
+  const [admin, provisioning, install, stranger, node] = ["admin", "prov", "install", "stranger", "node"].map(k);
+  const row = (key: string) => ({ fingerprint: S.keyFingerprint(key), shown: `256 ${S.keyFingerprint(key)} c (ED25519)` });
+  const all = (keys: string[], nodeKey = S.keyFingerprint(node)) => ({ lines: keys.length, keys: keys.map(row), nodeKey });
+
+  assert.deepEqual(S.checkAuthorizedKeys(all([admin, provisioning, node]), { admin, provisioning }).problems, []);
+  assert.deepEqual(S.checkAuthorizedKeys(all([admin, provisioning, install, node]), { admin, provisioning, install }).problems, [], "before it's removed");
+  assert.match(S.checkAuthorizedKeys(all([admin, provisioning, install, node]), { admin, provisioning }).problems.join(), /key not allowed/, "after");
+  assert.match(S.checkAuthorizedKeys(all([admin, provisioning, stranger, node]), { admin, provisioning }).problems.join(), /key not allowed: 256 SHA256:/);
+  assert.match(S.checkAuthorizedKeys(all([admin, provisioning, node], ""), { admin, provisioning }).problems.join(), /key not allowed/, "no private half, no exception");
+  assert.match(S.checkAuthorizedKeys(all([provisioning, node]), { admin, provisioning }).problems.join(), /the admin key isn't on the node/);
+  assert.match(S.checkAuthorizedKeys(all([admin, node]), { admin, provisioning }).problems.join(), /the provisioning key isn't on the node/);
+  assert.match(S.checkAuthorizedKeys({ ...all([admin, provisioning]), lines: -1 }, { admin, provisioning }).problems.join(), /lines/, "no answer isn't a pass");
+});
+
 whenBash("3e+ waits for tentative to clear, then warms the gateway, then tries outbound", () => {
   const r = ipv6Run({ tentativePolls: 3 });
   assert.equal(r.status, 0, r.stderr);

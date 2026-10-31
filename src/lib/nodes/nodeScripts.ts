@@ -747,6 +747,58 @@ echo "install_lines=$(grep -cF "$INSTALL" "$AUTH" || true)"
 echo "admin_lines=$(grep -cF "$ADMIN" "$AUTH")"`;
 }
 
+/** A public key's fingerprint, exactly as ssh-keygen -l prints it. */
+export function keyFingerprint(publicKey: string): string {
+  const hash = createHash("sha256").update(Buffer.from(keyBody(publicKey), "base64")).digest("base64");
+  return `SHA256:${hash.replace(/=+$/, "")}`;
+}
+
+export type AuthorizedKeys = {
+  /** Lines in the files that aren't blank or comments. */
+  lines: number;
+  /** ssh-keygen -l lines, e.g. "256 SHA256:abc me@laptop (ED25519)". */
+  keys: { fingerprint: string; shown: string }[];
+  /** Fingerprint of the key Proxmox made for this node; empty if the node has none. */
+  nodeKey: string;
+};
+
+/** Output of `sowsi-host authorized-keys`: fingerprints only. */
+export function parseAuthorizedKeys(output: string): AuthorizedKeys {
+  const keys: AuthorizedKeys["keys"] = [];
+  for (const line of output.split("\n")) {
+    const m = /^key=(\S+ (SHA256:\S+).*)$/.exec(line.trim());
+    if (m) keys.push({ fingerprint: m[2], shown: m[1] });
+  }
+  const facts = parseFacts(output);
+  return { lines: Number(facts.lines ?? -1), keys, nodeKey: facts.node_key ?? "" };
+}
+
+/**
+ * Every key on the node must be one of ours. `install` is passed only until that key is removed.
+ * The node's own key isn't optional: Proxmox adds it back itself ("always add ourself" in pvecm
+ * updatecerts), so it's allowed, but only as the key whose private half is on this node.
+ */
+export function checkAuthorizedKeys(
+  found: AuthorizedKeys,
+  allowed: { admin: string; provisioning: string; install?: string }
+): { problems: string[]; listing: string[] } {
+  const roles = new Map<string, string>([
+    [keyFingerprint(allowed.admin), "admin"],
+    [keyFingerprint(allowed.provisioning), "provisioning"],
+  ]);
+  if (allowed.install) roles.set(keyFingerprint(allowed.install), "install");
+  if (found.nodeKey) roles.set(found.nodeKey, "Proxmox's own key for this node");
+
+  const problems: string[] = [];
+  const listing = found.keys.map((k) => `${roles.get(k.fingerprint) ?? "NOT ALLOWED"}: ${k.shown}`);
+  for (const k of found.keys) if (!roles.has(k.fingerprint)) problems.push(`key not allowed: ${k.shown}`);
+  if (found.lines !== found.keys.length) problems.push(`authorized_keys has ${found.lines} lines, but ${found.keys.length} readable keys`);
+  for (const role of ["admin", "provisioning"] as const) {
+    if (!found.keys.some((k) => k.fingerprint === keyFingerprint(allowed[role]))) problems.push(`the ${role} key isn't on the node`);
+  }
+  return { problems, listing };
+}
+
 /** "routes: 1 IPv4, 2 IPv6" (sowsi-routes) → counts. */
 export function parseRoutes(output: string): { ipv4: number; ipv6: number } | null {
   const m = /routes: (\d+) IPv4, (\d+) IPv6/.exec(output);

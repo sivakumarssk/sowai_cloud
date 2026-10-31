@@ -161,6 +161,10 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   again after it. The image's link into `/run` is empty after a reboot once
   DHCP is gone. vmbr0 also carries `dns-nameservers` with the same servers: it
   does nothing while the file is plain, and is the fallback if the link returns.
+- **SSH keys:** Hetzner adds the install and admin keys when the server is
+  created, Proxmox adds a root key of its own, and the installer adds the
+  restricted provisioning key and removes the install key. Step 3j lists
+  `authorized_keys` by fingerprint and fails on anything else.
 - **Re-using a name:** a name whose install was destroyed or failed gets a new
   row and a new server, and the plan says so. The old record is kept as
   `<name>#<serverId>`.

@@ -143,11 +143,23 @@ cat > /usr/local/sbin/sowsi-host <<'SCRIPT'
 #   routes | sowsi-routes          re-sync container routes
 #   mount-volume <hetzner-id>      mount an attached Hetzner Volume and register it as Proxmox storage
 #   unmount-volume <hetzner-id>    unregister + unmount it (refused while any disk is on it)
+#   authorized-keys                root's authorized keys as fingerprints, never the keys
 set -euo pipefail
 read -r cmd arg extra <<<"${SSH_ORIGINAL_COMMAND:-routes}"
 if [[ -n "${extra:-}" ]]; then echo "too many arguments" >&2; exit 2; fi
 case "$cmd" in
   routes|sowsi-routes) exec /usr/local/sbin/sowsi-routes ;;
+  authorized-keys)
+    if [[ -n "${arg:-}" ]]; then echo "too many arguments" >&2; exit 2; fi
+    # sshd reads both files. The line count catches anything ssh-keygen can't read.
+    keys=$(mktemp)
+    cat /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 2>/dev/null > "$keys" || true
+    echo "lines=$(grep -cvE '^[[:space:]]*(#|$)' "$keys" || true)"
+    ssh-keygen -lf "$keys" 2>/dev/null | sed 's/^/key=/' || true
+    rm -f "$keys"
+    # Proxmox's own key for this node, derived from the private half that lives here.
+    echo "node_key=$(ssh-keygen -y -f /root/.ssh/id_rsa 2>/dev/null | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
+    exit 0 ;;
   mount-volume|unmount-volume)
     if ! [[ "${arg:-}" =~ ^[0-9]{1,12}$ ]]; then echo "invalid volume id" >&2; exit 2; fi ;;
   *) echo "command not allowed: $cmd" >&2; exit 2 ;;

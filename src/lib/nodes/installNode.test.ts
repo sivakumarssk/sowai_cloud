@@ -31,6 +31,8 @@ const ok = (value: unknown, message = "expected a true value") => assert.ok(valu
 
 const INSTALL_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIInstallKeyBodyInstallKeyBodyInstallKeyBo sowsi-install@sowsi-mgmt-01";
 const ADMIN_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdminKeyBodyAdminKeyBodyAdminKeyBodyAdmin me@laptop";
+const NODE_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQNodeKeyBodyNodeKeyBodyNodeKeyBodyNode root@sowsi-test-01";
+const STRANGER_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQStrangerBodyStrangerBodyStrangerBody who@where";
 const PROV_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL+L152cRvIkX3R0xtdG4toSwTbblpUz6PioDz89wglD sowsi-provisioning";
 const SECRET = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
 
@@ -87,6 +89,12 @@ type WorldCfg = {
     dnsNeverResolves?: boolean;
     /** /etc/resolv.conf is a link again after the reboot. */
     resolvLostOnReboot?: boolean;
+    /** A key nobody put there is in authorized_keys. */
+    strangerKey?: boolean;
+    /** authorized_keys has a line ssh-keygen can't read. */
+    unreadableKeyLine?: boolean;
+    /** The RSA key is on the node, but no private half is there to prove it's the node's own. */
+    nodeKeyMissing?: boolean;
     /** The Proxmox install put the link back, after DNS was written. */
     resolvLostInInstall?: boolean;
 };
@@ -264,6 +272,12 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       if (!w.authorized.some((k) => k.includes(PROV_KEY))) throw new Error("All configured authentication methods failed");
       const ours = w.containers.filter((c) => c.name === S.TEST_CONTAINER_HOSTNAME);
       return `routes: ${ours.filter((c) => (c as { ipv4?: string }).ipv4).length} IPv4, ${ours.length} IPv6`;
+    },
+    authorizedKeys: async () => {
+      // Proxmox adds the node's own key itself; a planted key sits next to the others.
+      const lines = [...w.authorized, NODE_KEY, ...(cfg.strangerKey ? [STRANGER_KEY] : [])];
+      const rows = lines.map((l) => `key=256 ${S.keyFingerprint(/ssh-\S+ \S+/.exec(l)![0])} (ED25519)`);
+      return [`lines=${lines.length + (cfg.unreadableKeyLine ? 1 : 0)}`, ...rows, `node_key=${cfg.nodeKeyMissing ? "" : S.keyFingerprint(NODE_KEY)}`].join("\n");
     },
     hostSetupScript: () => "#!/usr/bin/env bash\n# sowsi-routes …",
     proxmox: () => ({
@@ -1356,6 +1370,73 @@ test("DNS lost across the reboot is repaired once and logged; if that doesn't he
   };
   const r = await executeInstall(dead.deps, opts(), settings);
   assert.match((r as { error: string }).error, /dns: .*is a link/);
+});
+
+test("3j lists every key by fingerprint and never prints a key", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  const c = w.commands;
+  const text = JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "keys"));
+  for (const [role, key] of [["admin", ADMIN_KEY], ["provisioning", PROV_KEY], ["Proxmox's own key for this node", NODE_KEY]]) {
+    ok(text.includes(role) && text.includes(S.keyFingerprint(key)), role);
+    ok(!text.includes(key.split(" ")[1]), `${role}: no key body`);
+  }
+  ok(!text.includes(S.keyFingerprint(INSTALL_KEY)), "the install key is gone by then");
+  ok(c.includes("remove install key"));
+  ok(STEPS.indexOf("keys") === STEPS.indexOf("lockdown") + 1 && STEPS.indexOf("keys") < STEPS.indexOf("verify"), "right after the lockdown");
+});
+
+test("an unknown key stops the install before the install key is removed, and shows its fingerprint", async () => {
+  const w = world({ strangerKey: true });
+  const r = await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  const error = (r as { error: string }).error;
+  assert.match(error, /lockdown: .*key not allowed: 256 SHA256:/);
+  assert.match(error, /install key kept/);
+  ok(!error.includes(STRANGER_KEY.split(" ")[1]), "the fingerprint, not the key");
+  ok(!w.commands.includes("remove install key"), "the installer can still log in");
+  ok(w.authorized.includes(INSTALL_KEY));
+});
+
+test("a key that appears after the lockdown fails 3j, and so does the install key if it's still there", async () => {
+  const w = world();
+  const audit = w.deps.authorizedKeys;
+  w.deps.authorizedKeys = async (host) => {
+    const out = await audit(host);
+    return w.authorized.includes(INSTALL_KEY) ? out : out.replace("lines=3", "lines=4").replace("\nnode_key", `\nkey=4096 ${S.keyFingerprint(STRANGER_KEY)} who@where (RSA)\nnode_key`);
+  };
+  const r = await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  assert.match((r as { error: string }).error, /failed at step 3j[\s\S]*key not allowed: 4096 SHA256:/);
+
+  const again = world();
+  const stale = again.deps.authorizedKeys;
+  again.deps.authorizedKeys = async (host) => {
+    const out = await stale(host);
+    return again.authorized.includes(INSTALL_KEY) ? out : out.replace("lines=3", "lines=4").replace("\nnode_key", `\nkey=256 ${S.keyFingerprint(INSTALL_KEY)} (ED25519)\nnode_key`);
+  };
+  const stayed = await executeInstall(again.deps, opts({ keepOnFailure: true }), settings);
+  assert.match((stayed as { error: string }).error, /key not allowed/);
+});
+
+test("the RSA key is only allowed if the node can prove it's its own, and every line must be readable", async () => {
+  const unproven = await executeInstall(world({ nodeKeyMissing: true }).deps, opts({ keepOnFailure: true }), settings);
+  assert.match((unproven as { error: string }).error, /key not allowed/);
+  const unreadable = await executeInstall(world({ unreadableKeyLine: true }).deps, opts({ keepOnFailure: true }), settings);
+  assert.match((unreadable as { error: string }).error, /authorized_keys has \d+ lines, but \d+ readable keys/);
+});
+
+test("a run that stopped after the lockdown still gets 3j on resume", async () => {
+  const w = world({ ipv6Fails: false });
+  await executeInstall(w.deps, opts(), settings);
+  const rec = w.installs.get(NAME)!;
+  rec.completedSteps = rec.completedSteps.filter((s) => s !== "keys" && s !== "verify" && s !== "register");
+  rec.status = "IN_PROGRESS";
+  w.nodes.length = 0;
+  rec.apiTokenSecret = w.deps.encrypt(SECRET);
+  const before = w.logs.length;
+  const r = await executeInstall(resumeWorld(w).deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  ok(w.logs.slice(before).some((l) => (l.after as { step?: string })?.step === "keys"), "the audit ran");
 });
 
 test("IPv6 still doesn't depend on DNS, which is recorded on its own", async () => {
