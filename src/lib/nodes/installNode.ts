@@ -649,10 +649,10 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
 
     // Written before the reboot, so this shouldn't happen: fixed, and left on the record.
     deps.report(`      DNS isn't right after the reboot: ${missing.join("; ")}. Writing it again`);
-    await deps.log({ action: "NODE_DNS_REPAIRED", toNode: ctx.rec.name, success: false, error: missing.join("; ") });
     await onNode(ctx, "dns write", S.dnsScript());
     const still = await read();
     if (still.length) fail("dns", still);
+    await deps.log({ action: "NODE_DNS_REPAIRED", toNode: ctx.rec.name, after: { found: missing, resolvers: S.RESOLVERS } });
     return `DNS wasn't right after the reboot (${missing.join("; ")}); repaired: ${S.RESOLVERS.join(", ")}`;
   },
 

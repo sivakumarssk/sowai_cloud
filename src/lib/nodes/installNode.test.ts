@@ -1358,7 +1358,10 @@ test("the real server: stopped after 3e with the image's link in place, it's rep
 test("DNS lost across the reboot is repaired once and logged; if that doesn't help, the step fails", async () => {
   const w = world({ resolvLostOnReboot: true });
   assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
-  ok(w.logs.some((l) => l.action === "NODE_DNS_REPAIRED"), "logged");
+  const repaired = w.logs.find((l) => l.action === "NODE_DNS_REPAIRED")!;
+  ok(repaired.success !== false, "the repair worked, so it's logged as a success");
+  assert.equal(repaired.error, undefined);
+  assert.match(JSON.stringify(repaired.after), /is a link/);
 
   const dead = world({ dnsNeverResolves: false, resolvLostOnReboot: true });
   const write = dead.deps.ssh;
@@ -1370,6 +1373,7 @@ test("DNS lost across the reboot is repaired once and logged; if that doesn't he
   };
   const r = await executeInstall(dead.deps, opts(), settings);
   assert.match((r as { error: string }).error, /dns: .*is a link/);
+  ok(!dead.logs.some((l) => l.action === "NODE_DNS_REPAIRED"), "a repair that failed isn't logged as a repair");
 });
 
 test("3j lists every key by fingerprint and never prints a key", async () => {
