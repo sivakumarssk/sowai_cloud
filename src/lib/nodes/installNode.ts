@@ -32,6 +32,8 @@ export type ContainerApi = {
   listLXC(): Promise<{ vmid: number; name?: string; status: string }[]>;
   createLXC(input: { vmid: number; hostname: string; cores: number; memory: number; diskSize: number; osTemplate: string; ipv4?: string; ipv6?: string; start?: boolean }): Promise<unknown>;
   waitForLXC(vmid: number): Promise<void>;
+  /** Shuts it down and starts it again, which recreates its veth. */
+  restartLXC(vmid: number): Promise<void>;
   /** destroyContainerAndDisks: deletes it and proves no disk is left. */
   destroyContainer(vmid: number): Promise<{ leftover: string[]; errors: string[] }>;
 };
@@ -115,6 +117,10 @@ export type InstallDeps = {
   syncRoutes(host: string): Promise<string>;
   /** `authorized-keys` through the same dispatcher: fingerprints, never keys. */
   authorizedKeys(host: string): Promise<string>;
+  /** `isolation-status` through the same dispatcher: rule counters. */
+  isolationStatus(host: string): Promise<string>;
+  /** `isolation-probe on|off`: a dummy interface, to prove nothing leaves by anything but the uplink. */
+  isolationProbe(host: string, on: boolean): Promise<void>;
   proxmox(node: { name: string; ip: string }, token: { tokenId: string; secret: string }): ContainerApi;
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
@@ -146,6 +152,8 @@ export type InstallSettings = {
   mgmtIp: string;
   /** sowsi-mgmt-01 has a global IPv6 address (needed to SSH into an IPv6-only test container). */
   mgmtHasIpv6: boolean;
+  /** MGMT_PRIVATE_IP: sowsi-mgmt-01 on Hetzner's private network, which a test container tries to reach. */
+  mgmtPrivateIp: string | null;
   /** HETZNER_SERVER_ID: node 1, never touched. */
   protectedServerId: string | null;
   usdToInr: number;
@@ -678,11 +686,11 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
 
   async "host-setup"(ctx) {
     const script = ctx.deps.hostSetupScript();
-    const out = await onNode(ctx, "proxmox-host-setup.sh", S.hostSetupCommand(ctx.rec.ipv6Subnet!), { stdin: script, timeoutMs: 20 * 60_000 });
-    const facts = S.parseFacts(await onNode(ctx, "host checks", S.outboundScript()));
+    const out = await onNode(ctx, "proxmox-host-setup.sh", S.hostSetupCommand(ctx.rec.ipv6Subnet!, ctx.s.mgmtIp), { stdin: script, timeoutMs: 20 * 60_000 });
+    const facts = S.parseFacts(await onNode(ctx, "host checks", S.outboundScript(ctx.s.mgmtIp)));
     const problems = S.checkHostSetup(out, facts);
     if (problems.length) fail("host setup", problems);
-    return "vmbr1, sowsi-routes (+ boot service), sowsi-host dispatcher, local: rootdir+images, Ubuntu 22.04 template; host reaches IPv4 and IPv6";
+    return "vmbr1, sowsi-routes (+ boot service and timer), isolation rules, sowsi-host dispatcher, local: rootdir+images, Ubuntu 22.04 template; host reaches IPv4 and IPv6";
   },
 
   async "api-token"(ctx) {
@@ -742,9 +750,11 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const pve = api(ctx);
     const vmid = await pve.getNextVMID();
     const ipv6 = ipv6ForVmid(ctx.rec.ipv6Subnet!, vmid);
+    const host = ctx.rec.ipv4!;
     let ipv4: string | undefined;
     const lines: string[] = [];
-    let created = false;
+    const created: number[] = [];
+    let probing = false;
     let failure: unknown = null;
     try {
       if (o.ipv4Test) {
@@ -753,11 +763,18 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
         await deps.hetzner.assignFloatingIP(fip.id, Number(ctx.rec.hetznerServerId));
         ipv4 = fip.ip;
       }
-      await pve.createLXC({ vmid, hostname: S.TEST_CONTAINER_HOSTNAME, cores: 1, memory: 512, diskSize: 4, osTemplate: "ubuntu-22.04", ipv6, ipv4, start: true });
-      created = true;
+      const size = { hostname: S.TEST_CONTAINER_HOSTNAME, cores: 1, memory: 512, diskSize: 4, osTemplate: "ubuntu-22.04", start: true };
+      await pve.createLXC({ vmid, ...size, ipv6, ipv4: ipv4 ?? S.TEST_IPV4.first });
+      created.push(vmid);
       await pve.waitForLXC(vmid);
-      const routes = S.parseRoutes(await deps.syncRoutes(ctx.rec.ipv4!));
-      if (!routes || routes.ipv6 !== 1 || routes.ipv4 !== (ipv4 ? 1 : 0)) fail("verify", [`host routes after create: ${JSON.stringify(routes)}`]);
+      // A neighbour, because goal one is that the first can't reach it.
+      const neighbour = await pve.getNextVMID();
+      const neighbourIpv6 = ipv6ForVmid(ctx.rec.ipv6Subnet!, neighbour);
+      await pve.createLXC({ vmid: neighbour, ...size, ipv6: neighbourIpv6, ipv4: S.TEST_IPV4.second });
+      created.push(neighbour);
+      await pve.waitForLXC(neighbour);
+      const routes = S.parseRoutes(await deps.syncRoutes(host));
+      if (!routes || routes.ipv6 !== 2 || routes.ipv4 !== 2) fail("verify", [`host routes after create: ${JSON.stringify(routes)}`]);
 
       const shell = await deps.containerShell(ipv4 ?? ipv6, 3 * 60_000);
       try {
@@ -765,6 +782,33 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
         if (out.out6 !== "ok") fail("verify", ["the container can't reach the internet over IPv6"]);
         if (ipv4 && out.out4 !== "ok") fail("verify", ["the container can't reach the internet over IPv4"]);
         lines.push(`container ${vmid} at ${ipv4 ? `${ipv4} + ` : ""}${ipv6}: SSH (provisioning key) ok, outbound IPv6 ok${ipv4 ? ", IPv4 ok" : ", IPv4 not tested (add --ipv4)"}`);
+
+        // Reachable from here, so when the first can't reach it, that's the rules and not a dead neighbour.
+        const peer = await deps.containerShell(neighbourIpv6, 3 * 60_000);
+        peer.close();
+
+        await deps.isolationProbe(host, true);
+        probing = true;
+        const before = S.parseIsolationStatus(await deps.isolationStatus(host));
+        const attempts = S.parseFacts(
+          await shell.exec("isolation proof", S.isolationProbeScript({ neighbourIpv4: S.TEST_IPV4.second, neighbourIpv6, nodeIpv4: host, nodeIpv6: `${ctx.rec.ipv6Subnet}::1`, mgmtPrivateIp: s.mgmtPrivateIp }), { timeoutMs: 3 * 60_000 })
+        );
+        const mac = S.parseFacts(await shell.exec("isolation mac", S.isolationMacScript(), { timeoutMs: 60_000 }));
+        if (mac.mac_restored !== "yes") fail("verify", ["the test container didn't come back after the MAC test"]);
+        const problems = S.checkIsolationProof(before, S.parseIsolationStatus(await deps.isolationStatus(host)), attempts);
+        if (problems.length) fail("isolation", problems);
+
+        // A restart recreates the veth: the rules must still apply, with no sync in between.
+        await pve.restartLXC(neighbour);
+        const rising = S.parseIsolationStatus(await deps.isolationStatus(host)).spoof_ip4 ?? 0;
+        const restarted = await deps.containerShell(neighbourIpv6, 3 * 60_000);
+        try {
+          await restarted.exec("isolation after restart", S.isolationAfterRestartScript(), { timeoutMs: 60_000 });
+        } finally {
+          restarted.close();
+        }
+        if (!((S.parseIsolationStatus(await deps.isolationStatus(host)).spoof_ip4 ?? 0) > rising)) fail("isolation", ["the rules stopped applying after a container restart"]);
+        lines.push("isolation proven: spoofing, neighbours, host, private networks, other interfaces, mail, metadata, and after a restart");
       } finally {
         shell.close();
       }
@@ -773,12 +817,15 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     } finally {
       // Always clean up, verified — even when a check above failed.
       const cleanup: string[] = [];
-      if (created) {
-        const r = await pve.destroyContainer(vmid).catch((e) => ({ leftover: [`(${errMsg(e)})`], errors: [] as string[] }));
+      if (probing) await deps.isolationProbe(host, false).catch((e) => cleanup.push(`probe interface: ${errMsg(e)}`));
+      for (const id of created) {
+        const r = await pve.destroyContainer(id).catch((e) => ({ leftover: [`(${errMsg(e)})`], errors: [] as string[] }));
         if (r.leftover.length) cleanup.push(`leftover disks: ${r.leftover.join(", ")}`);
-        const left = await pve.listLXC().catch(() => [{ vmid, status: "unknown" }]);
-        if (left.some((c) => c.vmid === vmid)) cleanup.push(`container ${vmid} still exists`);
-        const routes = S.parseRoutes(await deps.syncRoutes(ctx.rec.ipv4!).catch(() => ""));
+        const left = await pve.listLXC().catch(() => [{ vmid: id, status: "unknown" }]);
+        if (left.some((c) => c.vmid === id)) cleanup.push(`container ${id} still exists`);
+      }
+      if (created.length) {
+        const routes = S.parseRoutes(await deps.syncRoutes(host).catch(() => ""));
         if (!routes || routes.ipv4 + routes.ipv6 !== 0) cleanup.push(`host routes after delete: ${JSON.stringify(routes)}`);
       }
       if (ctx.rec.testFloatingIpId) {

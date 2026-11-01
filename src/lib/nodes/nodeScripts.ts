@@ -640,14 +640,14 @@ export function checkFirewall(output: string, mgmtIp: string): string[] {
 
 // ── g) proxmox-host-setup.sh, then outbound checks from the host ────
 
-export function hostSetupCommand(ipv6Subnet: string): string {
+export function hostSetupCommand(ipv6Subnet: string, mgmtIp: string): string {
   // The script itself arrives on stdin. No PROVISIONING_PUBKEY: step i installs that key, last.
-  return `IPV6_SUBNET=${q(ipv6Subnet)} CONTAINER_STORAGE=local bash -s`;
+  return `IPV6_SUBNET=${q(ipv6Subnet)} MGMT_IP=${q(mgmtIp)} CONTAINER_STORAGE=local bash -s`;
 }
 
 export const OUTBOUND_URL = "http://deb.debian.org/debian/dists/bookworm/Release";
 
-export function outboundScript(): string {
+export function outboundScript(mgmtIp: string): string {
   return `echo "out4=$(curl -4 -fsS -o /dev/null -m 15 ${OUTBOUND_URL} && echo ok || echo fail)"
 echo "out6=$(curl -6 -fsS -o /dev/null -m 15 ${OUTBOUND_URL} && echo ok || echo fail)"
 echo "template=$(pveam list local 2>/dev/null | grep -c ubuntu-22.04-standard)"
@@ -660,7 +660,19 @@ echo "forward6=$(sysctl -n net.ipv6.conf.all.forwarding)"
 echo "forward_saved=$(grep -c '^net.ip' /etc/sysctl.d/99-sowsi-routing.conf)"
 echo "proxy_ndp=$(sysctl -n net.ipv6.conf.vmbr0.proxy_ndp)"
 echo "proxy_arp=$(sysctl -n net.ipv4.conf.vmbr1.proxy_arp)"
-echo "proxy_saved=$(grep -cE 'post-up sysctl -qw net\\.(ipv6\\.conf\\.vmbr0\\.proxy_ndp|ipv4\\.conf\\.vmbr1\\.proxy_arp)=1' /etc/network/interfaces)"`;
+echo "proxy_saved=$(grep -cE 'post-up sysctl -qw net\\.(ipv6\\.conf\\.vmbr0\\.proxy_ndp|ipv4\\.conf\\.vmbr1\\.proxy_arp)=1' /etc/network/interfaces)"
+echo "iso_tables=$(nft list tables 2>/dev/null | grep -cE '^table (bridge|inet) sowsi$')"
+echo "iso_ports=$(nft list chain bridge sowsi from_ports 2>/dev/null | grep -c unknown_port)"
+echo "iso_between=$(nft list chain bridge sowsi between_ports 2>/dev/null | grep -c to_neighbour_l2)"
+echo "iso_forward=$(nft list chain inet sowsi forwarded 2>/dev/null | grep -cE 'to_neighbour_l3|to_other_iface|to_private|to_mail|to_metadata')"
+echo "iso_mgmt=$(nft list chain inet sowsi host_input 2>/dev/null | grep -cF ${q(`ip saddr != ${mgmtIp} tcp dport 8006`)})"
+echo "iso_timer=$(systemctl is-enabled sowsi-routes.timer 2>/dev/null)"
+echo "iso_before_guests=$(systemctl show -p Before sowsi-routes.service 2>/dev/null | grep -c pve-guests)"
+echo "iso_last_good=$(nft -c -f /etc/sowsi/rules.last-good.nft >/dev/null 2>&1 && echo ok || echo bad)"
+echo "iso_redirects=$(sysctl -n net.ipv4.conf.vmbr1.send_redirects 2>/dev/null)"
+echo "iso_accept_ra=$(sysctl -n net.ipv6.conf.vmbr1.accept_ra 2>/dev/null)"
+echo "nftables_service=$(systemctl is-enabled nftables.service 2>/dev/null)"
+echo "pve_nft_tables=$(nft list tables 2>/dev/null | grep -c proxmox-firewall)"`;
 }
 
 export function checkHostSetup(setupOutput: string, facts: Record<string, string>): string[] {
@@ -682,6 +694,18 @@ export function checkHostSetup(setupOutput: string, facts: Record<string, string
   if (facts.proxy_ndp !== "1") problems.push(`proxy_ndp on vmbr0 is ${facts.proxy_ndp}`);
   if (facts.proxy_arp !== "1") problems.push(`proxy_arp on vmbr1 is ${facts.proxy_arp}`);
   if (facts.proxy_saved !== "2") problems.push("the proxy settings aren't in vmbr1's post-up lines, so they wouldn't survive a reboot");
+  if (facts.iso_tables !== "2") problems.push(`the isolation tables aren't both loaded (${facts.iso_tables || "0"} of 2)`);
+  if (facts.iso_ports !== "2") problems.push("the rule that drops ports without a chain is missing");
+  if (facts.iso_between !== "1") problems.push("the rule between containers on vmbr1 is missing");
+  if (facts.iso_forward !== "6") problems.push(`the forwarding rules are incomplete (${facts.iso_forward || "0"} of 6)`);
+  if (facts.iso_mgmt !== "1") problems.push("8006 isn't limited to sowsi-mgmt-01 in the isolation rules");
+  if (facts.iso_timer !== "enabled") problems.push("sowsi-routes.timer isn't enabled, so removed rules wouldn't come back");
+  if (facts.iso_before_guests !== "1") problems.push("sowsi-routes.service doesn't run before pve-guests, so containers could start without rules");
+  if (facts.iso_last_good !== "ok") problems.push("the last good rules are missing or don't load");
+  if (facts.iso_redirects !== "0") problems.push(`vmbr1 sends ICMP redirects (${facts.iso_redirects})`);
+  if (facts.iso_accept_ra !== "0") problems.push(`vmbr1 accepts router advertisements (${facts.iso_accept_ra})`);
+  if (facts.nftables_service !== "masked") problems.push(`nftables.service is ${facts.nftables_service || "unknown"}, expected masked: it would flush every table`);
+  if (facts.pve_nft_tables !== "0") problems.push("the Proxmox nftables firewall is running: check it leaves the sowsi tables alone before using this node");
   return problems;
 }
 
@@ -806,6 +830,100 @@ export function parseRoutes(output: string): { ipv4: number; ipv6: number } | nu
 }
 
 // ── 4) inside the test container ────────────────────────────────────
+
+// ── 4) proving the isolation rules, from a test container ────────────
+
+/**
+ * Test containers get these instead of a Floating IP, unless --ipv4 gave one. Nothing routes them,
+ * but they're enough to send IPv4 at the host, which is all the proof needs, and they cost nothing.
+ */
+export const TEST_IPV4 = { first: "198.18.254.10", second: "198.18.254.11", spoof: "198.18.254.99" };
+/** Reached through the dummy interface from `isolation-probe on`. Must match sowsi-routes. */
+export const PROBE_TARGET = { ipv4: "198.19.255.2", ipv6: "2001:db8:5053::2" };
+/** A private address in case MGMT_PRIVATE_IP isn't set. */
+export const PRIVATE_TARGET = "10.0.0.2";
+const OUTSIDE_IPV6 = "2606:4700:4700::1111";
+
+export type IsolationTargets = { neighbourIpv4: string; neighbourIpv6: string; nodeIpv4: string; nodeIpv6: string; mgmtPrivateIp: string | null };
+
+/** Every line is an attempt that must fail. Each one also has a counter on the host that must rise. */
+export function isolationProbeScript(t: IsolationTargets): string {
+  const attempts: [string, string, number][] = [
+    ["neighbour_v6", t.neighbourIpv6, 22],
+    ["neighbour_v4", t.neighbourIpv4, 22],
+    ["host_ssh_v4", t.nodeIpv4, 22],
+    ["host_api_v4", t.nodeIpv4, 8006],
+    ["host_ssh_v6", t.nodeIpv6, 22],
+    ["host_gateway_v6", "fe80::1%eth0", 22],
+    ["mail_25_v4", "1.1.1.1", 25],
+    ["mail_465_v4", "1.1.1.1", 465],
+    ["mail_25_v6", OUTSIDE_IPV6, 25],
+    ["mail_465_v6", OUTSIDE_IPV6, 465],
+    ["metadata", "169.254.169.254", 80],
+    ["private_v4", PRIVATE_TARGET, 22],
+    ["private_mgmt", t.mgmtPrivateIp ?? PRIVATE_TARGET, 22],
+    ["private_v6", "fd00::1", 22],
+    ["other_iface_v4", PROBE_TARGET.ipv4, 22],
+    ["other_iface_v6", PROBE_TARGET.ipv6, 22],
+  ];
+  return [
+    `reach() { if timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; then echo yes; else echo no; fi; }`,
+    ...attempts.map(([name, host, port]) => `echo "${name}=$(reach ${q(host)} ${port})"`),
+    // The /64 looks on-link to a container, so these go by the gateway to reach the host's rules at all.
+    `ip -6 route replace ${q(`${t.neighbourIpv6}/128`)} via fe80::1 dev eth0`,
+    `ip -6 route replace ${q(`${t.nodeIpv6}/128`)} via fe80::1 dev eth0`,
+    `echo "neighbour_v6_routed=$(reach ${q(t.neighbourIpv6)} 22)"`,
+    `echo "host_ssh_v6_routed=$(reach ${q(t.nodeIpv6)} 22)"`,
+    `echo "host_api_v6_routed=$(reach ${q(t.nodeIpv6)} 8006)"`,
+    `ip -6 route del ${q(`${t.neighbourIpv6}/128`)} via fe80::1 dev eth0`,
+    `ip -6 route del ${q(`${t.nodeIpv6}/128`)} via fe80::1 dev eth0`,
+    `ip addr add ${TEST_IPV4.spoof}/32 dev eth0`,
+    `ping -c 1 -W 1 -I ${TEST_IPV4.spoof} 1.1.1.1 >/dev/null 2>&1 || true`,
+    `ip addr del ${TEST_IPV4.spoof}/32 dev eth0`,
+    `ip -6 addr add ${q(`${t.neighbourIpv6}/128`)} dev eth0 nodad`,
+    `ping -6 -c 1 -W 1 -I ${q(t.neighbourIpv6)} ${OUTSIDE_IPV6} >/dev/null 2>&1 || true`,
+    `ip -6 addr del ${q(`${t.neighbourIpv6}/128`)} dev eth0`,
+  ].join("\n");
+}
+
+/** Sends from a MAC that isn't the container's, then puts its own back. */
+export function isolationMacScript(): string {
+  return `own=$(cat /sys/class/net/eth0/address)
+ip link set dev eth0 address 02:00:00:5e:53:01
+ping -6 -c 2 -W 1 ${OUTSIDE_IPV6} >/dev/null 2>&1 || true
+ip link set dev eth0 address "$own"
+echo "mac_restored=yes"`;
+}
+
+/** After a restart, which recreates the veth: the rules must still apply, with no sync. */
+export function isolationAfterRestartScript(): string {
+  return `ip addr add ${TEST_IPV4.spoof}/32 dev eth0
+ping -c 1 -W 1 -I ${TEST_IPV4.spoof} 1.1.1.1 >/dev/null 2>&1 || true
+ip addr del ${TEST_IPV4.spoof}/32 dev eth0
+echo "spoofed=yes"`;
+}
+
+/** "name=number" lines from isolation-status. */
+export function parseIsolationStatus(output: string): Record<string, number> {
+  const counters: Record<string, number> = {};
+  for (const [, name, value] of output.matchAll(/^([a-z0-9_]+)=(\d+)$/gm)) counters[name] = Number(value);
+  return counters;
+}
+
+const MUST_RISE = ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac"];
+
+/** Each attempt failed, and the rule meant to stop it is the one that did. */
+export function checkIsolationProof(before: Record<string, number>, after: Record<string, number>, attempts: Record<string, string>): string[] {
+  const problems: string[] = [];
+  if (after.tables !== 2) problems.push(`the isolation tables aren't both loaded (${after.tables ?? 0} of 2)`);
+  const names = Object.keys(attempts).filter((k) => k !== "mac_restored");
+  if (names.length === 0) problems.push("no attempts came back from the test container");
+  for (const name of names) if (attempts[name] !== "no") problems.push(`the test container got through: ${name}`);
+  for (const name of MUST_RISE) {
+    if (!((after[name] ?? 0) > (before[name] ?? 0))) problems.push(`rule ${name} stopped nothing`);
+  }
+  return problems;
+}
 
 export function containerOutboundScript(ipv4: boolean): string {
   // Ping first: an IPv6-only container can't reach the node's IPv4 resolvers, so names may not work there.

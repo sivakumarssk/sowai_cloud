@@ -43,6 +43,7 @@ const settings: InstallSettings = {
   image: "debian-12",
   mgmtIp: "2.31.11.105",
   mgmtHasIpv6: true,
+  mgmtPrivateIp: "10.0.0.7",
   protectedServerId: "168392011",
   usdToInr: 100,
   spendCapPaise: 500_000,
@@ -99,6 +100,14 @@ type WorldCfg = {
     nodeKeyMissing?: boolean;
     /** The Proxmox install put the link back, after DNS was written. */
     resolvLostInInstall?: boolean;
+    /** This rule stops nothing. */
+    isolationHole?: string;
+    /** The test container got through on this attempt. */
+    gotThrough?: string;
+    /** The rules stop applying once the container has restarted. */
+    rulesLostOnRestart?: boolean;
+    /** isolation-probe off fails. */
+    probeStuck?: boolean;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -132,6 +141,11 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     /** What the rescue repair wrote. */
     repaired: "",
     servicesStarting: cfg.servicesStartingPolls ?? 0,
+    isolationReads: 0,
+    restarted: false,
+    probes: [] as boolean[],
+    proofScript: "",
+    created: [] as { vmid: number; ipv4?: string; ipv6?: string }[],
   };
 
   const live = () => ({ nic: "eth0", mac: "96:00:03:aa:bb:cc", ipv4: SERVER_IPV4, gateway: "172.31.1.1" });
@@ -232,11 +246,16 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           if (cfg.firewallLostOnReboot && w.kernel.endsWith("-pve")) w.firewall.active = false;
           return runFirewallScript(w.firewall, command);
         case "proxmox-host-setup.sh": assert.match(o!.stdin!, /sowsi-routes/); return "== 1. DNS\n…\n== Done";
-        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2";
+        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2\niso_tables=2\niso_ports=2\niso_between=1\niso_forward=6\niso_mgmt=1\niso_timer=enabled\niso_before_guests=1\niso_last_good=ok\niso_redirects=0\niso_accept_ra=0\nnftables_service=masked\npve_nft_tables=0";
         case "API token": w.tokenMade = true; return JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: "0" }, value: SECRET });
         case "add provisioning key": w.authorized.push(`restrict,command="/usr/local/sbin/sowsi-host" ${PROV_KEY}`); return "1";
         case "remove install key": w.authorized = w.authorized.filter((k) => k !== INSTALL_KEY); return `install_lines=0\nadmin_lines=${w.authorized.includes(ADMIN_KEY) ? 1 : 0}`;
         case "outbound": return `out6=${cfg.outbound6 ?? "ok"}\nout4=${o?.stdin ? "ok" : "ok"}`;
+        case "isolation proof":
+          w.proofScript = command;
+          return `neighbour_v6=${cfg.gotThrough === "neighbour_v6" ? "yes" : "no"}\nmail_25_v4=${cfg.gotThrough === "mail_25_v4" ? "yes" : "no"}\nprivate_mgmt=no`;
+        case "isolation mac": return "mac_restored=yes";
+        case "isolation after restart": return "spoofed=yes";
         default: return "";
       }
     },
@@ -281,15 +300,33 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       const rows = lines.map((l) => `key=256 ${S.keyFingerprint(/ssh-\S+ \S+/.exec(l)![0])} (ED25519)`);
       return [`lines=${lines.length + (cfg.unreadableKeyLine ? 1 : 0)}`, ...rows, `node_key=${cfg.nodeKeyMissing ? "" : S.keyFingerprint(NODE_KEY)}`].join("\n");
     },
+    isolationStatus: async () => {
+      w.isolationReads++;
+      const names = ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac"];
+      const frozen = cfg.rulesLostOnRestart && w.restarted;
+      return ["tables=2", ...names.map((n) => `${n}=${n === cfg.isolationHole || frozen ? 1 : w.isolationReads}`)].join("\n");
+    },
+    isolationProbe: async (_host, on) => {
+      w.probes.push(on);
+      if (!on && cfg.probeStuck) throw new Error("ip link del failed");
+    },
     hostSetupScript: () => "#!/usr/bin/env bash\n# sowsi-routes …",
     proxmox: () => ({
       getVersion: async () => ({ version: "8.3.0" }),
       getNodeStatus: async () => ({ memory: { total: 7_940 * 1024 * 1024 }, cpus: 4 }),
       getStorageStatus: async () => ({ total: 150 * 1024 ** 3 }),
-      getNextVMID: async () => 100,
+      getNextVMID: async () => {
+        let id = 100;
+        while (w.containers.some((c) => c.vmid === id)) id++;
+        return id;
+      },
       listLXC: async () => w.containers.map((c) => ({ ...c, status: "running" })),
-      createLXC: async (i) => void w.containers.push({ vmid: i.vmid, name: i.hostname, ...(i.ipv4 ? { ipv4: i.ipv4 } : {}) }),
+      createLXC: async (i) => {
+        w.created.push({ vmid: i.vmid, ipv4: i.ipv4, ipv6: i.ipv6 });
+        w.containers.push({ vmid: i.vmid, name: i.hostname, ...(i.ipv4 ? { ipv4: i.ipv4 } : {}) });
+      },
       waitForLXC: async () => {},
+      restartLXC: async () => void (w.restarted = true),
       destroyContainer: async (vmid) => {
         w.containers = w.containers.filter((c) => c.vmid !== vmid);
         return { leftover: [], errors: [] };
@@ -469,6 +506,64 @@ test("--ipv4: the test container gets a Floating IP, which is released afterward
   assert.equal((await executeInstall(w.deps, opts({ ipv4Test: true }), settings)).ok, true);
   assert.equal(w.hz.state.floatingIps.size, 0);
   assert.equal(w.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
+  assert.notEqual(w.created[0].ipv4, S.TEST_IPV4.first);
+  assert.equal(w.created[1].ipv4, S.TEST_IPV4.second, "the neighbour doesn't need one");
+});
+
+// ── Proving the isolation rules ──────────────────────────────────────
+
+test("verify proves isolation with two containers, without buying an IP, and leaves nothing behind", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  assert.equal(w.nodes.length, 1);
+  assert.deepEqual(w.created.map((c) => c.vmid), [100, 101]);
+  assert.deepEqual(w.created.map((c) => c.ipv4), [S.TEST_IPV4.first, S.TEST_IPV4.second], "unrouted addresses, so no Floating IP");
+  assert.equal(w.hz.state.floatingIps.size, 0);
+  assert.deepEqual(w.containers, []);
+  assert.deepEqual(w.probes, [true, false], "the dummy interface comes and goes");
+  ok(w.restarted, "the neighbour was restarted");
+  assert.match(w.proofScript, /'10\.0\.0\.7' 22/, "it tries sowsi-mgmt-01's private address");
+  assert.ok(w.proofScript.includes(`${S.TEST_IPV4.second}' 22`), "and the neighbour");
+});
+
+for (const hole of ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac"]) {
+  test(`a node where ${hole} stops nothing never registers`, async () => {
+    const w = world({ isolationHole: hole });
+    const r = await executeInstall(w.deps, opts(), settings);
+    assert.equal(r.ok, false);
+    assert.match((r as { error: string }).error, new RegExp(`rule ${hole} stopped nothing`));
+    assert.equal(w.nodes.length, 0);
+    assert.deepEqual(w.containers, []);
+    assert.deepEqual(w.probes, [true, false], "the dummy interface is removed on failure too");
+  });
+}
+
+test("a container that gets through fails the install, even if every counter rose", async () => {
+  const w = world({ gotThrough: "mail_25_v4" });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /got through: mail_25_v4/);
+  assert.equal(w.nodes.length, 0);
+});
+
+test("rules that stop applying after a container restart fail the install", async () => {
+  const w = world({ rulesLostOnRestart: true });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /after a container restart/);
+  assert.equal(w.nodes.length, 0);
+});
+
+test("a probe interface that won't go away is reported", async () => {
+  const w = world({ probeStuck: true });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match((r as { error: string }).error, /probe interface: ip link del failed/);
+  assert.equal(w.nodes.length, 0);
+});
+
+test("setup gets the management IP, for the rules that limit 8006", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  assert.match(S.hostSetupCommand("2a01:4f8:1c16:abcd", settings.mgmtIp), /MGMT_IP='?2\.31\.11\.105'? /);
+  assert.ok(S.outboundScript(settings.mgmtIp).includes("ip saddr != 2.31.11.105 tcp dport 8006"));
 });
 
 // ── Hetzner refusing the purchase ─────────────────────────────────────

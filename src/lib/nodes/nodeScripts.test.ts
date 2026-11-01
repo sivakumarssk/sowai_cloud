@@ -21,7 +21,7 @@ test("every generated script is valid bash", () => {
     pveStatus: S.pveInstallStatusScript(),
     afterReboot: S.afterRebootFactsScript(),
     firewall: S.firewallScript("2.31.11.105"),
-    outbound: S.outboundScript(),
+    outbound: S.outboundScript("2.31.11.105"),
     token: S.apiTokenScript(),
     addKey: S.addProvisioningKeyScript("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL+L152cRvIkX3R0xtdG4toSwTbblpUz6PioDz89wglD sowsi-provisioning"),
     removeKey: S.removeInstallKeyScript("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIInstallKeyBodyInstallKeyBodyInstallKeyBo sowsi-install", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdminKeyBodyAdminKeyBodyAdminKeyBodyAdmin me"),
@@ -277,15 +277,23 @@ test("3e accepts the address whichever way ip prints it: with a peer, or as a pl
 
 test("3g: a bridge with no ports reports DOWN until its first container, and that's healthy", () => {
   const facts = factsFrom(
-    S.outboundScript(),
+    S.outboundScript("2.31.11.105"),
     `curl() { return 0; }
 pveam() { echo 'local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst   141.00MB'; }
-systemctl() { echo enabled; }
+systemctl() { case "$*" in *nftables*) echo masked ;; *) echo enabled ;; esac; }
+nft() { return 0; }
 pvesh() { echo '{"content":"iso,vztmpl,backup,rootdir,images","digest":"x","type":"dir"}'; }
 ip() { echo 'vmbr1            DOWN           bc:24:11:aa:bb:cc <NO-CARRIER,BROADCAST,MULTICAST,UP>'; }
 test() { return 0; }
-sysctl() { echo 1; }
-grep() { case "$*" in *sysctl*|*proxy*) echo 2 ;; *) echo 1 ;; esac; }`
+sysctl() { case "$*" in *send_redirects*|*accept_ra*) echo 0 ;; *) echo 1 ;; esac; }
+grep() {
+  case "$*" in
+    *to_neighbour_l3*) echo 6 ;;
+    *proxmox-firewall*) echo 0 ;;
+    *sysctl*|*proxy*|*unknown_port*|*"(bridge|inet) sowsi"*) echo 2 ;;
+    *) echo 1 ;;
+  esac
+}`
   );
   if (!facts) return;
   assert.equal(facts.vmbr1, "<NO-CARRIER,BROADCAST,MULTICAST,UP>");
@@ -296,6 +304,22 @@ grep() { case "$*" in *sysctl*|*proxy*) echo 2 ;; *) echo 1 ;; esac; }`
   assert.match(S.checkHostSetup("== Done", { ...facts, forward_saved: "1" }).join(), /aren't both in \/etc\/sysctl\.d/);
   assert.match(S.checkHostSetup("== Done", { ...facts, proxy_ndp: "0" }).join(), /proxy_ndp/);
   assert.match(S.checkHostSetup("== Done", { ...facts, proxy_saved: "1" }).join(), /wouldn't survive a reboot/);
+  const isolation: [Record<string, string>, RegExp][] = [
+    [{ iso_tables: "1" }, /aren't both loaded/],
+    [{ iso_tables: "" }, /aren't both loaded/],
+    [{ iso_ports: "1" }, /ports without a chain/],
+    [{ iso_between: "0" }, /between containers/],
+    [{ iso_forward: "5" }, /forwarding rules are incomplete/],
+    [{ iso_mgmt: "0" }, /8006 isn't limited/],
+    [{ iso_timer: "disabled" }, /wouldn't come back/],
+    [{ iso_before_guests: "0" }, /before pve-guests/],
+    [{ iso_last_good: "bad" }, /last good rules/],
+    [{ iso_redirects: "1" }, /ICMP redirects/],
+    [{ iso_accept_ra: "1" }, /router advertisements/],
+    [{ nftables_service: "enabled" }, /would flush every table/],
+    [{ pve_nft_tables: "1" }, /Proxmox nftables firewall/],
+  ];
+  for (const [change, why] of isolation) assert.match(S.checkHostSetup("== Done", { ...facts, ...change }).join(), why);
 });
 
 test("3f parses real sshd -T output", () => {
@@ -457,6 +481,21 @@ test("the dispatcher refuses anything but its exact commands, and runs nothing i
     "routes ;touch pwned",
     "routes;touch pwned",
     "routes extra",
+    "isolation-status ;touch pwned",
+    "isolation-status;touch pwned",
+    "isolation-status $(touch pwned)",
+    "isolation-status `touch pwned`",
+    "isolation-status extra",
+    "isolation-status\ntouch pwned",
+    // The probe takes on or off, and nothing else.
+    "isolation-probe",
+    "isolation-probe maybe",
+    "isolation-probe on;touch pwned",
+    "isolation-probe ;touch pwned",
+    "isolation-probe $(touch pwned)",
+    "isolation-probe `touch pwned`",
+    "isolation-probe on off",
+    "isolation-probe on\ntouch pwned",
     // Volume commands take one all-digit id.
     "mount-volume",
     "mount-volume ;touch pwned",

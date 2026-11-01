@@ -95,6 +95,8 @@ export function prismaInstallDeps(): InstallDeps {
     },
     syncRoutes: (host) => runOnHost({ name: host, ip: host }, "routes", 60_000),
     authorizedKeys: (host) => runOnHost({ name: host, ip: host }, "authorized-keys", 60_000),
+    isolationStatus: (host) => runOnHost({ name: host, ip: host }, "isolation-status", 60_000),
+    isolationProbe: async (host, on) => void (await runOnHost({ name: host, ip: host }, `isolation-probe ${on ? "on" : "off"}`, 60_000)),
     hostSetupScript: () => readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n"),
 
     proxmox(node, token) {
@@ -107,6 +109,11 @@ export function prismaInstallDeps(): InstallDeps {
         listLXC: () => client.listLXC(),
         createLXC: (input) => client.createLXC(input),
         waitForLXC: (vmid) => client.waitForLXC(vmid),
+        restartLXC: async (vmid) => {
+          await client.shutdownLXC(vmid);
+          await client.startLXC(vmid);
+          await client.waitForLXC(vmid);
+        },
         destroyContainer: async (vmid) => {
           const r = await destroyContainerAndDisks(client, vmid);
           return { leftover: r.leftover, errors: r.errors };
@@ -172,6 +179,8 @@ export function installSettings(env = process.env): InstallSettings {
   const mgmtIp = env.MGMT_PUBLIC_IP?.trim() ?? "";
   if (!mgmtIp) problems.push("MGMT_PUBLIC_IP is not set (sowsi-mgmt-01's public IPv4 — the only address allowed to reach :8006)");
   else if (!addrs.some((a) => a.address === mgmtIp)) problems.push(`MGMT_PUBLIC_IP ${mgmtIp} isn't an address of this machine`);
+  const mgmtPrivateIp = env.MGMT_PRIVATE_IP?.trim() || null;
+  if (mgmtPrivateIp && !/^(\d{1,3}\.){3}\d{1,3}$/.test(mgmtPrivateIp)) problems.push(`MGMT_PRIVATE_IP must be an IPv4 address, got "${mgmtPrivateIp}"`);
   const mgmtHasIpv6 = addrs.some((a) => a.family === "IPv6" && !a.internal && !a.address.startsWith("fe80") && !a.address.startsWith("fd"));
 
   if (!env.HETZNER_API_TOKEN) problems.push("HETZNER_API_TOKEN is not set");
@@ -200,6 +209,7 @@ export function installSettings(env = process.env): InstallSettings {
     image: "debian-12",
     mgmtIp,
     mgmtHasIpv6,
+    mgmtPrivateIp,
     protectedServerId: env.HETZNER_SERVER_ID?.trim() || null,
     wrongHost,
     usdToInr: "rate" in rate ? rate.rate : 0,

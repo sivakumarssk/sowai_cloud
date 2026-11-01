@@ -20,7 +20,7 @@
  * doesn't exist before the reboot; --no-pin and --no-guard leave that protection out.
  *
  * .env: MGMT_PUBLIC_IP, NODE_ADMIN_SSH_PUBLIC_KEY, HETZNER_API_TOKEN, PROVISIONING_SSH_* ;
- * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_USD_TO_INR [96].
+ * optional NODE_INSTALL_KEY_PATH [~/.ssh/sowsi_install_ed25519], HETZNER_USD_TO_INR [96], MGMT_PRIVATE_IP.
  */
 import { config as loadEnv } from "dotenv";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";

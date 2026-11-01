@@ -168,6 +168,18 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
 - **Re-using a name:** a name whose install was destroyed or failed gets a new
   row and a new server, and the plan says so. The old record is kept as
   `<name>#<serverId>`.
+- **Container isolation:** `sowsi-routes` keeps two nftables tables, `bridge
+  sowsi` and `inet sowsi`, generated from each container's `net0` line and kept
+  apart from UFW. A container can send only from its own MAC and IPs, can't
+  reach another container or anything on the host, can leave only by the public
+  uplink, and can't send on ports 25 and 465. A container without valid rules
+  gets no traffic. Step 4 proves this with two test containers before the node
+  registers. Their `198.18.254.x` addresses are never routed: they let the host
+  see IPv4 from them without buying a Floating IP. `isolation-status` on the
+  dispatcher prints the rule counters. `scripts/node/isolation-compare.sh` and
+  `baseline-compare.sh` only read, for comparing a node with a fresh one.
+  `isolation-test.sh` is the full test for a throwaway node, and refuses a node
+  without "test" in its name.
 - **Throwaway tests:** `--simulate-bad-nic` points the bridge at a card that
   doesn't exist before the reboot (the `--name` must contain `test`). Add
   `--no-guard` to prove the rescue repair instead of the guard.
