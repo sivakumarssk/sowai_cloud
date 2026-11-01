@@ -307,4 +307,4 @@ case "$phase" in
   rollback-check) rollback_check ;;
   cleanup) cleanup ;;
   *) echo "usage: bash -s -- main | reboot-check | bad-boot-prep | bad-boot-check | rollback-prep | rollback-check | cleanup" >&2; exit 2 ;;
-esac
+esac </dev/null # pct exec reads stdin, which is where this script arrives
