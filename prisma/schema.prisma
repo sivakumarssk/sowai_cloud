@@ -64,6 +64,15 @@ enum ServerSource {
   MANUAL
 }
 
+/// How a service gets IPv4. Until the dedicated IPv4 add-on is live (Stage G), every new service
+/// is DEDICATED and nobody can untick it.
+enum Ipv4Mode {
+  /// Its own Floating IP, in and out.
+  DEDICATED
+  /// The node's shared IPv4: a private address from 100.64.0.0/10, out by NAT, in through the gateway.
+  SHARED
+}
+
 enum OrderStatus {
   DRAFT
   AWAITING_PAYMENT
@@ -164,6 +173,10 @@ model Service {
   serverIp            String?
   ipv6Address         String?
   hetznerFloatingIpId String?
+  ipv4Mode            Ipv4Mode      @default(DEDICATED)
+  /// Shared-mode private address (100.64.0.0/10), assigned once from a sequence and never reused or
+  /// handed to another service. 100.127.255.0/24 is kept for the installer's test containers.
+  privateIpv4         String?       @unique
   sshUsername         String?
   sshPassword         String?
   panelUrl            String?
@@ -177,8 +190,8 @@ model Service {
   /// Paid but held (status PROVISIONING, 0%) because no node accepts new clients. Cleared when provisioning starts.
   waitingForNodeSince DateTime?
   /// When the client's SSH login was verified on the real server. ACTIVE requires it, plus (PROXMOX)
-  /// proxmoxVmId, nodeId and hetznerFloatingIpId, or (MANUAL) serverIp — enforced by the CHECK
-  /// constraint "Service_active_requires_real_server".
+  /// proxmoxVmId, nodeId and either hetznerFloatingIpId or shared mode with a privateIpv4, or (MANUAL)
+  /// serverIp — enforced by the CHECK constraint "Service_active_requires_real_server".
   sshVerifiedAt       DateTime?
   serverSource        ServerSource  @default(PROXMOX)
   /// Automatic billing actions are off: the billing job and the halted-autopay webhook never suspend

@@ -195,6 +195,15 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   `baseline-compare.sh` only read, for comparing a node with a fresh one.
   `isolation-test.sh` is the full test for a throwaway node, and refuses a node
   without "test" in its name.
+- **Shared IPv4, Stage A (private addresses and NAT):** a service in shared mode gets one private
+  address from `100.64.0.0/10`, assigned once from a database sequence and never reused
+  (`src/lib/provisioning/privateIpv4.ts`). `100.127.255.0/24` is kept for test containers. In the
+  `inet sowsi` table, `shared_out` masquerades that range to the node's IPv4 on the uplink only
+  (counter `nat_out`). New connections from outside to the range are dropped (`shared_in`).
+  Isolation is unchanged: each shared container's chain allows only its own private address. Step 4's
+  neighbour container uses `100.127.255.11`, so every install proves outbound IPv4 through NAT
+  without buying an IP. Nothing uses shared mode yet: until the add-on is live, every new service
+  is `DEDICATED` with its own Floating IP. ROADMAP.md tracks the stages.
 - **Throwaway tests:** `--simulate-bad-nic` points the bridge at a card that
   doesn't exist before the reboot (the `--name` must contain `test`). Add
   `--no-guard` to prove the rescue repair instead of the guard.

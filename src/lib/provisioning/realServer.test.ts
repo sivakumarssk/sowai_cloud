@@ -17,20 +17,31 @@ test("live payments are never routed to the simulator — VPS goes to Proxmox, a
 
 // ── ACTIVE means a real server ───────────────────────────────────────
 
-const real = { status: "ACTIVE", serverSource: "PROXMOX", serverIp: "78.46.1.2", proxmoxVmId: "101", nodeId: "node_1", hetznerFloatingIpId: "555", sshVerifiedAt: new Date() };
+const real = { status: "ACTIVE", serverSource: "PROXMOX", serverIp: "78.46.1.2", proxmoxVmId: "101", nodeId: "node_1", hetznerFloatingIpId: "555", ipv4Mode: "DEDICATED", privateIpv4: null, sshVerifiedAt: new Date() };
 const creds = { serverIp: "78.46.1.2", ipv6Address: "2a01::101", sshUsername: "userab12", sshPassword: "pw", panelUrl: "http://x", panelPassword: "pp" };
 
 test("a real server needs a VM id, a node, a Floating IP and a passed SSH check", () => {
   assert.ok(isRealServer(real));
   assert.ok(isRealServer({ ...real, status: "SUSPENDED" }));
-  assert.deepEqual(missingForActive({ serverSource: "PROXMOX", serverIp: null, proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null }), ["container (VM id)", "node", "Floating IP", "SSH check"]);
+  assert.deepEqual(missingForActive({ serverSource: "PROXMOX", serverIp: null, proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, ipv4Mode: "DEDICATED", privateIpv4: null, sshVerifiedAt: null }), ["container (VM id)", "node", "Floating IP", "SSH check"]);
   for (const field of ["proxmoxVmId", "nodeId", "hetznerFloatingIpId", "sshVerifiedAt"] as const) {
     assert.equal(isRealServer({ ...real, [field]: null }), false, field);
   }
 });
 
+test("shared mode: a private IPv4 stands in for the Floating IP, and only in shared mode", () => {
+  const shared = { ...real, hetznerFloatingIpId: null, ipv4Mode: "SHARED", privateIpv4: "100.64.0.5" };
+  assert.ok(isRealServer(shared));
+  assert.deepEqual(missingForActive({ ...shared, privateIpv4: null }), ["private IPv4"]);
+  assert.equal(isRealServer({ ...shared, privateIpv4: null }), false, "shared with no private address");
+  assert.equal(isRealServer({ ...shared, ipv4Mode: "DEDICATED" }), false, "a private address alone doesn't make a dedicated server real");
+  assert.deepEqual(missingForActive({ ...shared, ipv4Mode: "DEDICATED" }), ["Floating IP"]);
+  assert.ok(isRealServer({ ...shared, hetznerFloatingIpId: "555" }), "shared with a Floating IP too (the add-on) is still real");
+  for (const field of ["proxmoxVmId", "nodeId", "sshVerifiedAt"] as const) assert.equal(isRealServer({ ...shared, [field]: null }), false, field);
+});
+
 test("a manual server needs its IP and a passed SSH check — no container, node or Floating IP", () => {
-  const manual = { status: "ACTIVE", serverSource: "MANUAL", serverIp: "203.0.113.7", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: new Date() };
+  const manual = { status: "ACTIVE", serverSource: "MANUAL", serverIp: "203.0.113.7", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, ipv4Mode: "DEDICATED", privateIpv4: null, sshVerifiedAt: new Date() };
   assert.ok(isRealServer(manual));
   assert.deepEqual(missingForActive({ ...manual, sshVerifiedAt: null }), ["SSH check"]);
   assert.deepEqual(missingForActive({ ...manual, serverIp: null, sshVerifiedAt: null }), ["server IP", "SSH check"]);
@@ -39,7 +50,7 @@ test("a manual server needs its IP and a passed SSH check — no container, node
 });
 
 test("the simulator's ACTIVE row (fake IP, nothing else) is shown as Setting up with no IP or credentials", () => {
-  const fake = { ...creds, serverIp: "19.157.157.231", status: "ACTIVE", serverSource: "PROXMOX", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, sshVerifiedAt: null };
+  const fake = { ...creds, serverIp: "19.157.157.231", status: "ACTIVE", serverSource: "PROXMOX", proxmoxVmId: null, nodeId: null, hetznerFloatingIpId: null, ipv4Mode: "DEDICATED", privateIpv4: null, sshVerifiedAt: null };
   const shown = forCustomer(fake);
   assert.equal(shown.ready, false);
   assert.equal(shown.status, "INSTALLING");

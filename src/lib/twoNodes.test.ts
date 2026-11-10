@@ -99,6 +99,17 @@ test("resuming a node-2 customer starts their container, not the stopped one wit
   assert.deepEqual(writesTo(NODE_1), []);
 });
 
+test("a shared-mode service (private IPv4, no Floating IP) is a real server and resumes; one without its address doesn't", async () => {
+  on("node-2")!.status = "stopped";
+  Object.assign(row("svc_on_2"), { status: "SUSPENDED", suspendReason: BILLING_SUSPEND_REASON, hetznerFloatingIpId: null, ipv4Mode: "SHARED", privateIpv4: "100.64.0.5" });
+  assert.equal(await resumeAfterPayment("svc_on_2"), true);
+  assert.equal(on("node-2")!.status, "running");
+  on("node-2")!.status = "stopped";
+  Object.assign(row("svc_on_2"), { status: "SUSPENDED", privateIpv4: null });
+  assert.equal(await resumeAfterPayment("svc_on_2"), false, "not a real server: left suspended for a person");
+  assert.equal(on("node-2")!.status, "stopped");
+});
+
 test("a service with no node recorded: nothing is suspended on any node, and billing state still moves", async () => {
   Object.assign(row("svc_on_2"), { nodeId: null });
   assert.equal(await suspendForNonPayment("svc_on_2", "test"), true);

@@ -664,7 +664,8 @@ echo "proxy_saved=$(grep -cE 'post-up sysctl -qw net\\.(ipv6\\.conf\\.vmbr0\\.pr
 echo "iso_tables=$(nft list tables 2>/dev/null | grep -cE '^table (bridge|inet) sowsi$')"
 echo "iso_ports=$(nft list chain bridge sowsi from_ports 2>/dev/null | grep -c unknown_port)"
 echo "iso_between=$(nft list chain bridge sowsi between_ports 2>/dev/null | grep -c to_neighbour_l2)"
-echo "iso_forward=$(nft list chain inet sowsi forwarded 2>/dev/null | grep -cE 'to_neighbour_l3|to_other_iface|to_private|to_mail|to_metadata')"
+echo "iso_forward=$(nft list chain inet sowsi forwarded 2>/dev/null | grep -cE 'shared_in|to_neighbour_l3|to_other_iface|to_private|to_mail|to_metadata')"
+echo "iso_nat=$(nft list chain inet sowsi shared_out 2>/dev/null | grep -cE 'ip saddr 100\.64\.0\.0/10 oifname .*nat_out.* masquerade')"
 echo "iso_mgmt=$(nft list chain inet sowsi host_input 2>/dev/null | grep -cF ${q(`ip saddr != ${mgmtIp} tcp dport 8006`)})"
 echo "iso_timer=$(systemctl is-enabled sowsi-routes.timer 2>/dev/null)"
 echo "iso_before_guests=$(systemctl show -p Before sowsi-routes.service 2>/dev/null | grep -c pve-guests)"
@@ -697,7 +698,8 @@ export function checkHostSetup(setupOutput: string, facts: Record<string, string
   if (facts.iso_tables !== "2") problems.push(`the isolation tables aren't both loaded (${facts.iso_tables || "0"} of 2)`);
   if (facts.iso_ports !== "2") problems.push("the rule that drops ports without a chain is missing");
   if (facts.iso_between !== "1") problems.push("the rule between containers on vmbr1 is missing");
-  if (facts.iso_forward !== "6") problems.push(`the forwarding rules are incomplete (${facts.iso_forward || "0"} of 6)`);
+  if (facts.iso_forward !== "7") problems.push(`the forwarding rules are incomplete (${facts.iso_forward || "0"} of 7)`);
+  if (facts.iso_nat !== "1") problems.push("the NAT rule for shared-mode containers is missing");
   if (facts.iso_mgmt !== "1") problems.push("8006 isn't limited to sowsi-mgmt-01 in the isolation rules");
   if (facts.iso_timer !== "enabled") problems.push("sowsi-routes.timer isn't enabled, so removed rules wouldn't come back");
   if (facts.iso_before_guests !== "1") problems.push("sowsi-routes.service doesn't run before pve-guests, so containers could start without rules");
@@ -834,10 +836,29 @@ export function parseRoutes(output: string): { ipv4: number; ipv6: number } | nu
 // ── 4) proving the isolation rules, from a test container ────────────
 
 /**
- * Test containers get these instead of a Floating IP, unless --ipv4 gave one. Nothing routes them,
- * but they're enough to send IPv4 at the host, which is all the proof needs, and they cost nothing.
+ * Test container addresses. The first container gets an unrouted one unless --ipv4 gave it a Floating
+ * IP: enough to send IPv4 at the host, which is all the isolation proof needs. The neighbour gets a
+ * shared-mode address from the block reserved for tests (never given to a service), so every install
+ * also proves outbound IPv4 through NAT, without buying an IP.
  */
-export const TEST_IPV4 = { first: "198.18.254.10", second: "198.18.254.11", spoof: "198.18.254.99" };
+export const TEST_IPV4 = { first: "198.18.254.10", second: "100.127.255.11", spoof: "198.18.254.99" };
+
+/** One container in shared mode reaches the internet over IPv4 through NAT, and resolves names. */
+export function sharedOutboundScript(): string {
+  return `echo "address=$(ip -4 -o addr show dev eth0 | awk '{ print $4 }' | head -1)"
+echo "out4=$( (ping -4 -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 || curl -4 -fsS -o /dev/null -m 15 ${OUTBOUND_URL}) && echo ok || echo fail)"
+echo "dns=$(getent ahostsv4 deb.debian.org >/dev/null 2>&1 && echo ok || echo fail)"`;
+}
+
+/** It left by NAT: its own private address, IPv4 and names work, and the NAT rule counted it. */
+export function checkSharedOutbound(facts: Record<string, string>, natBefore: number, natAfter: number): string[] {
+  const problems: string[] = [];
+  if (facts.address !== `${TEST_IPV4.second}/32`) problems.push(`the shared-mode container has ${facts.address || "no IPv4"}, not ${TEST_IPV4.second}/32`);
+  if (facts.out4 !== "ok") problems.push("the shared-mode container can't reach the internet over IPv4 (NAT)");
+  if (facts.dns !== "ok") problems.push("the shared-mode container can't resolve names");
+  if (!(natAfter > natBefore)) problems.push(`the NAT rule counted nothing (nat_out ${natBefore} → ${natAfter})`);
+  return problems;
+}
 /** Reached through the dummy interface from `isolation-probe on`. Must match sowsi-routes. */
 export const PROBE_TARGET = { ipv4: "198.19.255.2", ipv6: "2001:db8:5053::2" };
 /** A private address in case MGMT_PRIVATE_IP isn't set. */

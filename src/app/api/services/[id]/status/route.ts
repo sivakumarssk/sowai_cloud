@@ -21,6 +21,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       proxmoxVmId: true,
       nodeId: true,
       hetznerFloatingIpId: true,
+      ipv4Mode: true,
+      privateIpv4: true,
       sshVerifiedAt: true,
       serverSource: true,
     },
@@ -29,7 +31,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     return apiError("Service not found", 404);
   }
 
-  // Only a real server (SSH check passed, plus container/node/Floating IP or a manual IP) is shown as running with its IPs.
+  // Only a real server (SSH check passed, plus container/node/Floating IP or shared private IP, or a manual IP) is shown as running with its IPs.
   const active = isRealServer(service) && service.status === "ACTIVE";
   return apiSuccess({
     status: service.status === "ACTIVE" && !active ? "INSTALLING" : service.status,

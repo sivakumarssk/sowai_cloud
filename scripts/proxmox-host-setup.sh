@@ -121,6 +121,8 @@ STATE_DIR=${SOWSI_STATE_DIR:-/etc/sowsi}
 RUN_DIR=${SOWSI_RUN_DIR:-/run/sowsi}
 GOOD=$STATE_DIR/rules.last-good.nft
 PROBE=sowsiprobe0
+# Shared mode: each such container has a private address from here, and leaves by NAT (Stage A).
+SHARED=100.64.0.0/10
 
 have_tables() { nft list table bridge sowsi >/dev/null 2>&1 && nft list table inet sowsi >/dev/null 2>&1; }
 load_last_good() { [[ -f $GOOD ]] && nft -f "$GOOD"; }
@@ -381,13 +383,15 @@ rules=$RUN_DIR/rules.nft
   echo "}"
   echo
   echo "table inet sowsi {"
-  for name in to_host to_neighbour_l3 to_other_iface to_private to_mail to_metadata api_refused ssh_limited; do
+  for name in to_host to_neighbour_l3 to_other_iface to_private to_mail to_metadata api_refused ssh_limited nat_out shared_in; do
     echo "  counter $name { }"
   done
   echo "  set ssh4 { type ipv4_addr; flags dynamic, timeout; timeout 2m; }"
   echo "  set ssh6 { type ipv6_addr; flags dynamic, timeout; timeout 2m; }"
   echo "  chain forwarded {"
   echo "    type filter hook forward priority -10; policy accept;"
+  # A shared address is never reached from outside: only replies to its own connections come back.
+  echo "    iifname != \"$BRIDGE\" ip daddr $SHARED ct state new counter name shared_in drop"
   echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" counter name to_neighbour_l3 drop"
   # Forwarded traffic may leave by the public uplink only, never into a private network.
   echo "    iifname \"$BRIDGE\" oifname != { ${allowed%, } } counter name to_other_iface drop"
@@ -395,8 +399,13 @@ rules=$RUN_DIR/rules.nft
   echo "    iifname \"$BRIDGE\" ip daddr 169.254.0.0/16 counter name to_metadata drop"
   # Hetzner's gateway sits in 172.16.0.0/12, and it's the one private address containers may use.
   echo "    iifname \"$BRIDGE\" ip daddr 172.31.1.1 accept"
-  echo "    iifname \"$BRIDGE\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } counter name to_private drop"
+  echo "    iifname \"$BRIDGE\" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, $SHARED } counter name to_private drop"
   echo "    iifname \"$BRIDGE\" ip6 daddr fc00::/7 counter name to_private drop"
+  echo "  }"
+  # Shared mode: a container's private address leaves as the node's own IPv4, by the uplink only.
+  echo "  chain shared_out {"
+  echo "    type nat hook postrouting priority srcnat; policy accept;"
+  echo "    ip saddr $SHARED oifname { ${allowed%, } } counter name nat_out masquerade"
   echo "  }"
   echo "  chain from_container {"
   echo "    ct state established,related accept"

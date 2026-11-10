@@ -288,7 +288,7 @@ test() { return 0; }
 sysctl() { case "$*" in *send_redirects*|*accept_ra*) echo 0 ;; *) echo 1 ;; esac; }
 grep() {
   case "$*" in
-    *to_neighbour_l3*) echo 6 ;;
+    *to_neighbour_l3*) echo 7 ;;
     *proxmox-firewall*) echo 0 ;;
     *sysctl*|*proxy*|*unknown_port*|*"(bridge|inet) sowsi"*) echo 2 ;;
     *) echo 1 ;;
@@ -309,7 +309,9 @@ grep() {
     [{ iso_tables: "" }, /aren't both loaded/],
     [{ iso_ports: "1" }, /ports without a chain/],
     [{ iso_between: "0" }, /between containers/],
-    [{ iso_forward: "5" }, /forwarding rules are incomplete/],
+    [{ iso_forward: "6" }, /forwarding rules are incomplete \(6 of 7\)/],
+    [{ iso_nat: "0" }, /NAT rule for shared-mode containers is missing/],
+    [{ iso_nat: "" }, /NAT rule for shared-mode containers is missing/],
     [{ iso_mgmt: "0" }, /8006 isn't limited/],
     [{ iso_timer: "disabled" }, /wouldn't come back/],
     [{ iso_before_guests: "0" }, /before pve-guests/],

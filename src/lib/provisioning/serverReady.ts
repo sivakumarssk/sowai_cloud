@@ -1,10 +1,11 @@
 // The one rule for "this service is a real, working server".
 //
 // ACTIVE requires a passed SSH login check plus, for a Proxmox server, the
-// container (vmid), the node it runs on and its Floating IP — or, for a manual
-// server an admin assigned, its IP. The database enforces it with the CHECK
-// constraint "Service_active_requires_real_server" (migration
-// 20261030120000_manual_servers_billing_hold); this file mirrors it for reads.
+// container (vmid), the node it runs on and either its Floating IP or shared mode
+// with its private address — or, for a manual server an admin assigned, its IP.
+// The database enforces it with the CHECK constraint
+// "Service_active_requires_real_server" (migration 20261111090000_private_ipv4);
+// this file mirrors it for reads.
 
 export const ACTIVE_CONSTRAINT = "Service_active_requires_real_server";
 
@@ -15,8 +16,14 @@ export type RealServerFields = {
   proxmoxVmId: string | null;
   nodeId: string | null;
   hetznerFloatingIpId: string | null;
+  ipv4Mode: string;
+  privateIpv4: string | null;
   sshVerifiedAt: Date | string | null;
 };
+
+/** Its IPv4: its own Floating IP, or shared mode with its private address. */
+const hasIpv4 = (s: Pick<RealServerFields, "hetznerFloatingIpId" | "ipv4Mode" | "privateIpv4">) =>
+  Boolean(s.hetznerFloatingIpId) || (s.ipv4Mode === "SHARED" && Boolean(s.privateIpv4));
 
 /** What a service still lacks to be a real server (empty = it is one). */
 export function missingForActive(s: Omit<RealServerFields, "status">): string[] {
@@ -24,7 +31,7 @@ export function missingForActive(s: Omit<RealServerFields, "status">): string[] 
   return [
     !s.proxmoxVmId && "container (VM id)",
     !s.nodeId && "node",
-    !s.hetznerFloatingIpId && "Floating IP",
+    !hasIpv4(s) && (s.ipv4Mode === "SHARED" ? "private IPv4" : "Floating IP"),
     !s.sshVerifiedAt && "SSH check",
   ].filter((x): x is string => Boolean(x));
 }
@@ -38,6 +45,7 @@ export function isRealServer(s: RealServerFields): boolean {
 export const realServerWhere = {
   OR: [
     { serverSource: "PROXMOX" as const, proxmoxVmId: { not: null }, nodeId: { not: null }, hetznerFloatingIpId: { not: null }, sshVerifiedAt: { not: null } },
+    { serverSource: "PROXMOX" as const, proxmoxVmId: { not: null }, nodeId: { not: null }, ipv4Mode: "SHARED" as const, privateIpv4: { not: null }, sshVerifiedAt: { not: null } },
     { serverSource: "MANUAL" as const, serverIp: { not: null }, sshVerifiedAt: { not: null } },
   ],
 };

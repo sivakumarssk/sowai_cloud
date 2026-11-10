@@ -867,7 +867,17 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
 
         // Reachable from here, so when the first can't reach it, that's the rules and not a dead neighbour.
         const peer = await deps.containerShell(neighbourIpv6, 3 * 60_000);
-        peer.close();
+        try {
+          // The neighbour is in shared mode: its private address leaves by NAT.
+          const natBefore = S.parseIsolationStatus(await deps.isolationStatus(host)).nat_out ?? 0;
+          const shared = S.parseFacts(await peer.exec("shared outbound", S.sharedOutboundScript(), { timeoutMs: 2 * 60_000 }));
+          const natAfter = S.parseIsolationStatus(await deps.isolationStatus(host)).nat_out ?? 0;
+          const sharedProblems = S.checkSharedOutbound(shared, natBefore, natAfter);
+          if (sharedProblems.length) fail("verify", sharedProblems);
+          lines.push(`shared mode: container ${neighbour} at ${S.TEST_IPV4.second} reached the internet over IPv4 through NAT (nat_out ${natBefore} → ${natAfter})`);
+        } finally {
+          peer.close();
+        }
 
         await deps.isolationProbe(host, true);
         probing = true;

@@ -118,6 +118,10 @@ type WorldCfg = {
     arpRuleLostOnRestart?: boolean;
     /** isolation-report fails. */
     reportFails?: boolean;
+    /** The NAT rule counts nothing (traffic from the shared range isn't translated). */
+    natCountsNothing?: boolean;
+    /** The shared-mode container's answer, field by field. */
+    shared?: Record<string, string>;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -153,6 +157,8 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     servicesStarting: cfg.servicesStartingPolls ?? 0,
     isolationReads: 0,
     restarted: false,
+    /** Connections the NAT rule has counted. */
+    natOut: 0,
     /** The restarted container knows the gateway's MAC. Until it does, a spoofed packet's ARP is what's sent. */
     gatewayKnown: false,
     /** Packets each rule stopped after the restart. */
@@ -263,7 +269,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           if (cfg.firewallLostOnReboot && w.kernel.endsWith("-pve")) w.firewall.active = false;
           return runFirewallScript(w.firewall, command);
         case "proxmox-host-setup.sh": assert.match(o!.stdin!, /sowsi-routes/); return "== 1. DNS\n…\n== Done";
-        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2\niso_tables=2\niso_ports=2\niso_between=1\niso_forward=6\niso_mgmt=1\niso_timer=enabled\niso_before_guests=1\niso_last_good=ok\niso_redirects=0\niso_accept_ra=0\nnftables_service=masked\npve_nft_tables=0";
+        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2\niso_tables=2\niso_ports=2\niso_between=1\niso_forward=7\niso_nat=1\niso_mgmt=1\niso_timer=enabled\niso_before_guests=1\niso_last_good=ok\niso_redirects=0\niso_accept_ra=0\nnftables_service=masked\npve_nft_tables=0";
         case "API token": w.tokenMade = true; return JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: "0" }, value: SECRET });
         case "add provisioning key": w.authorized.push(`restrict,command="/usr/local/sbin/sowsi-host" ${PROV_KEY}`); return "1";
         case "remove install key": w.authorized = w.authorized.filter((k) => k !== INSTALL_KEY); return `install_lines=0\nadmin_lines=${w.authorized.includes(ADMIN_KEY) ? 1 : 0}`;
@@ -288,6 +294,11 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           w.gatewayKnown = false;
           if (!cfg.rulesLostOnRestart && !cfg.arpRuleLostOnRestart) w.afterRestart.spoof_arp++;
           return `flush_exit=0\nadd_exit=0\ndel_exit=0\n${evidence()}`;
+        case "shared outbound": {
+          w.natOut += cfg.natCountsNothing ? 0 : 1;
+          const facts = { address: `${S.TEST_IPV4.second}/32`, out4: "ok", dns: "ok", ...cfg.shared };
+          return Object.entries(facts).map(([k, v]) => `${k}=${v}`).join("\n");
+        }
         case "container diagnostics": return `--- ip -br addr\neth0 UP ${S.TEST_IPV4.second}/32\n--- ip neigh\n172.31.1.1 dev eth0 INCOMPLETE`;
         default: return "";
       }
@@ -340,7 +351,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       // After the restart the two spoof counters count only what was actually stopped.
       const value = (n: string) =>
         w.restarted && (n === "spoof_ip4" || n === "spoof_arp") ? 1000 + w.afterRestart[n] : n === cfg.isolationHole || frozen ? 1 : w.isolationReads;
-      return ["tables=2", ...names.map((n) => `${n}=${value(n)}`)].join("\n");
+      return ["tables=2", ...names.map((n) => `${n}=${value(n)}`), `nat_out=${w.natOut}`].join("\n");
     },
     isolationReport: async () => {
       w.commands.push("isolation report");
@@ -564,7 +575,10 @@ test("verify proves isolation with two containers, without buying an IP, and lea
   assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
   assert.equal(w.nodes.length, 1);
   assert.deepEqual(w.created.map((c) => c.vmid), [100, 101]);
-  assert.deepEqual(w.created.map((c) => c.ipv4), [S.TEST_IPV4.first, S.TEST_IPV4.second], "unrouted addresses, so no Floating IP");
+  assert.deepEqual(w.created.map((c) => c.ipv4), [S.TEST_IPV4.first, S.TEST_IPV4.second], "an unrouted address and a shared-mode one, so no Floating IP");
+  assert.equal(S.TEST_IPV4.second, "100.127.255.11", "the neighbour is in shared mode, from the block reserved for tests");
+  ok(w.commands.indexOf("shared outbound") > 0 && w.commands.indexOf("shared outbound") < w.commands.indexOf("isolation proof"), "NAT is proven before the isolation proof");
+  assert.equal(w.natOut, 1);
   assert.equal(w.hz.state.floatingIps.size, 0);
   assert.deepEqual(w.containers, []);
   assert.deepEqual(w.probes, [true, false], "the dummy interface comes and goes");
@@ -585,6 +599,29 @@ for (const hole of ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_i
   });
 }
 
+test("shared mode: no NAT, no IPv4, no DNS or the wrong address fails step 4 and leaves nothing behind", async () => {
+  for (const [cfg, why] of [
+    [{ natCountsNothing: true }, /the NAT rule counted nothing \(nat_out 0 → 0\)/],
+    [{ shared: { out4: "fail" } }, /the shared-mode container can't reach the internet over IPv4 \(NAT\)/],
+    [{ shared: { dns: "fail" } }, /the shared-mode container can't resolve names/],
+    [{ shared: { address: "198.18.254.11/32" } }, /the shared-mode container has 198\.18\.254\.11\/32, not 100\.127\.255\.11\/32/],
+    [{ shared: { address: "" } }, /has no IPv4/],
+  ] as const) {
+    const w = world(cfg);
+    const r = await executeInstall(w.deps, opts(), settings);
+    assert.equal(r.ok, false);
+    assert.match((r as { error: string }).error, why);
+    assert.equal(w.nodes.length, 0);
+    assert.deepEqual(w.containers, []);
+    ok(!w.commands.includes("isolation proof"), "stops before the isolation proof");
+  }
+});
+
+test("a node without the NAT rule fails host setup", async () => {
+  assert.match(S.checkHostSetup("== Done", { ...S.parseFacts("iso_nat=0") }).join(), /the NAT rule for shared-mode containers is missing/);
+  assert.match(S.checkHostSetup("== Done", { iso_forward: "6" }).join(), /the forwarding rules are incomplete \(6 of 7\)/);
+});
+
 test("a container that gets through fails the install, even if every counter rose", async () => {
   const w = world({ gotThrough: "mail_25_v4" });
   const r = await executeInstall(w.deps, opts(), settings);
@@ -600,7 +637,7 @@ test("rules that stop applying after a container restart fail the install, with 
   assert.match(error, /after a restart, an ARP request with a spoofed sender wasn't stopped by spoof_arp/);
   assert.match(error, /counters \(before → after the IPv4 spoof → after the ARP spoof\): spoof_ip4 1000 → 1000 → 1000, spoof_arp 1000 → 1000 → 1000, spoof_mac \d+ → \d+ → \d+, spoof_ip6 /);
   assert.match(error, /bad_frame 0 → 0 → 0, unknown_port 0 → 0 → 0/);
-  assert.match(error, /ip addr: lo UNKNOWN 127\.0\.0\.1\/8 \| eth0@if7 UP 198\.18\.254\.11\/32/);
+  assert.match(error, /ip addr: lo UNKNOWN 127\.0\.0\.1\/8 \| eth0@if7 UP 100\.127\.255\.11\/32/);
   assert.match(error, /ip route: default via 172\.31\.1\.1 dev eth0 onlink/);
   assert.match(error, /ip neigh: 172\.31\.1\.1 lladdr fe:ff:ff:ff:ff:ff REACHABLE; /, "the gateway was known when the IPv4 spoof went out");
   assert.match(error, /ip neigh after the ARP spoof: 172\.31\.1\.1 INCOMPLETE/);

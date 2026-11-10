@@ -144,12 +144,36 @@ whenBash("forwarded traffic may leave by the uplink only, and the private ranges
     'iifname "vmbr1" oifname != { "vmbr0" } counter name to_other_iface drop',
     'iifname "vmbr1" tcp dport { 25, 465 } counter name to_mail drop',
     'iifname "vmbr1" ip daddr 169.254.0.0/16 counter name to_metadata drop',
-    'iifname "vmbr1" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } counter name to_private drop',
+    'iifname "vmbr1" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } counter name to_private drop',
     'iifname "vmbr1" ip6 daddr fc00::/7 counter name to_private drop',
   ]) assert.ok(rules.includes(line), `missing: ${line}`);
   before(rules, "name to_other_iface drop", 'ip daddr 172.31.1.1 accept');
   before(rules, "name to_mail drop", 'ip daddr 172.31.1.1 accept');
   before(rules, 'ip daddr 172.31.1.1 accept', "name to_private drop");
+});
+
+const SHARED = "net0: name=eth0,bridge=vmbr1,gw=172.31.1.1,gw6=fe80::1,hwaddr=BC:24:11:AA:BB:03,ip=100.64.0.5/32,ip6=2a01:4f8:1c16:5f1d::102/64,type=veth";
+
+whenBash("shared mode: a private address leaves by NAT on the uplink only, and is never reached from outside", () => {
+  const r = runRoutes({ containers: { 100: FLOATING, 102: SHARED } });
+  assert.equal(r.status, 0, r.stderr);
+  const nat = /  chain shared_out \{\n([\s\S]*?)\n  \}/.exec(r.rules)?.[1] ?? "";
+  assert.deepEqual(nat.split("\n").map((l) => l.trim()), [
+    "type nat hook postrouting priority srcnat; policy accept;",
+    'ip saddr 100.64.0.0/10 oifname { "vmbr0" } counter name nat_out masquerade',
+  ], "one rule: only the shared range, only out of the uplink");
+  assert.ok(runRoutes({ defaultDev: "eth0" }).rules.includes('ip saddr 100.64.0.0/10 oifname { "eth0", "vmbr0" } counter name nat_out masquerade'), "the same uplinks as the forward rules");
+  // New connections to a shared address from anywhere but the containers' bridge are dropped, ahead of everything else.
+  const fwd = /  chain forwarded \{\n([\s\S]*?)\n  \}/.exec(r.rules)?.[1] ?? "";
+  assert.equal(fwd.split("\n")[1].trim(), 'iifname != "vmbr1" ip daddr 100.64.0.0/10 ct state new counter name shared_in drop');
+  assert.match(r.rules, /counter nat_out \{ \}\n  counter shared_in \{ \}/);
+  // The shared container is isolated exactly like any other: its own chain, its own address as the only source.
+  const c = chain(r.rules, "102");
+  assert.ok(c.includes("ether type ip ip saddr != 100.64.0.5 counter name spoof_ip4 drop"));
+  assert.ok(c.includes("ether type arp arp saddr ip != { 100.64.0.5, 0.0.0.0 } counter name spoof_arp drop"));
+  assert.match(r.calls, /^ip route replace 100\.64\.0\.5\/32 dev vmbr1 proto 250$/m, "routed to its port like a Floating IP");
+  assert.doesNotMatch(r.rules, /\b(snat|dnat|redirect) to\b/, "no other address translation");
+  assert.equal(r.rules.match(/\bmasquerade\b/g)!.length, 1);
 });
 
 whenBash("the uplink follows the default route if the boot guard has dropped the bridge, and never includes vmbr1 or a bad name", () => {
@@ -415,6 +439,16 @@ test("the compare scripts only read", () => {
   }
 });
 
+test("isolation-test.sh puts the neighbour in shared mode and proves NAT (test 27)", () => {
+  const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8");
+  assert.ok(script.includes(`IP4_B=${S.TEST_IPV4.second}`), "the same shared test address as the installer");
+  assert.match(script, /rises "27 [^"]*" nat_out in_ct "\$B" "ping -4/);
+  assert.match(script, /blocked "27 [^"]*" to_private "\$B" 100\.64\.9\.9 22/);
+  assert.match(script, /same_counter "27 [^"]*" nat_out in_ct "\$A" /, "a Floating IP container is never translated");
+  assert.match(script, /rises "18 [^"]*" nat_out in_ct "\$B" /, "NAT is back after the reboot");
+  assert.doesNotMatch(script, /ipify|ifconfig\.me|icanhazip/, "no third party is asked for the node's address");
+});
+
 whenBash("the isolation test script is valid bash and refuses any node that isn't a throwaway", () => {
   const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8").replace(/\r\n/g, "\n");
   assert.equal(spawnSync("bash", ["-n"], { input: script, encoding: "utf8" }).status, 0);
@@ -474,7 +508,7 @@ whenBash("isolation-test.sh tests 17 and 18 learn the gateway first, then check 
   const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8");
   assert.match(script, /restart_spoof_check "17 [^"]*" "\$B" "\$IP4_B"/);
   assert.match(script, /restart_spoof_check "18 [^"]*" "\$A" /);
-  assert.doesNotMatch(script, /rises "1[78] /, "no test 17 or 18 left on the old check");
+  assert.doesNotMatch(script, /rises "1[78] [^"]*" spoof_ip4/, "no test 17 or 18 left on the old spoof check");
 
   const good = runRestartCheck();
   assert.equal(good.failed, 0, good.stdout + good.stderr);

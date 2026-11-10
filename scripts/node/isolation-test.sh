@@ -130,7 +130,8 @@ forge() { in_ct "$A" "python3 /root/forge.py $1 $MAC_A $HOST_MAC $IP6_A $IP6_B $
 main() {
   FIP=${FIP:?set FIP to a Floating IP assigned to this server}
   S=$(subnet) NODE4=$(node_ipv4) NODE6=$S::1
-  IP6_A=$S::900 IP6_B=$S::901 IP4_B=198.18.254.11
+  # B is in shared mode: a private address from the block kept for tests, out by NAT (Stage A).
+  IP6_A=$S::900 IP6_B=$S::901 IP4_B=100.127.255.11
   echo "node $name, $NODE4, $S::/64, Floating IP $FIP"
   mk() { pct create "$1" "$TEMPLATE" --hostname "sowsi-iso-$1" --cores 1 --memory 1024 --rootfs local:8 --unprivileged 1 --features nesting=1 --onboot 1 --start 1 --net0 "$2"; }
   mk "$A" "name=eth0,bridge=vmbr1,ip=$FIP/32,gw=172.31.1.1,ip6=$IP6_A/64,gw6=fe80::1"
@@ -147,6 +148,14 @@ main() {
   check "13 outbound IPv4" in_ct "$A" "curl -4 -fsS -m 15 -o /dev/null http://deb.debian.org/debian/dists/bookworm/Release"
   check "13 outbound IPv6" in_ct "$A" "curl -6 -fsS -m 15 -o /dev/null http://deb.debian.org/debian/dists/bookworm/Release"
   check "13 the neighbour's outbound IPv6" in_ct "$B" "ping -6 -c 2 -W 2 $OUTSIDE6"
+
+  echo "== 27 shared mode: a private IPv4 out by NAT"
+  rises "27 the neighbour (100.127.255.11) reaches the internet over IPv4" nat_out in_ct "$B" "ping -4 -c 2 -W 3 1.1.1.1"
+  check "27 the neighbour's IPv4 ping got answers" in_ct "$B" "ping -4 -c 2 -W 3 1.1.1.1"
+  check "27 the neighbour resolves names" in_ct "$B" "getent ahostsv4 deb.debian.org"
+  if [[ $(nft list chain inet sowsi shared_out 2>/dev/null | grep -c 'nat_out') == 1 ]]; then ok "27 one NAT rule, in the sowsi table"; else bad "27 the NAT rule is missing or doubled"; fi
+  same_counter "27 the first container (its own Floating IP) isn't translated" nat_out in_ct "$A" "curl -4 -fsS -m 15 -o /dev/null http://deb.debian.org/debian/dists/bookworm/Release"
+  blocked "27 the neighbour can't send into another node's shared range" to_private "$B" 100.64.9.9 22
 
   echo "== 1-7 spoofing"
   rises "1 another IPv4 as source" spoof_ip4 in_ct "$A" "ip addr add $IP4_B/32 dev eth0; ping -c 1 -W 1 -I $IP4_B 1.1.1.1; ip addr del $IP4_B/32 dev eth0"
@@ -303,6 +312,8 @@ reboot_check() {
   check "18 outbound IPv6 works" in_ct "$A" "ping -6 -c 2 -W 2 $OUTSIDE6"
   blocked "18 the neighbour is still blocked" to_neighbour_l2 "$A" "$S::901" 22
   blocked "18 the host is still blocked" to_host "$A" "$NODE4" 22
+  check "18 the neighbour came back" pct status "$B"
+  rises "18 shared mode still leaves by NAT after the reboot" nat_out in_ct "$B" "ping -4 -c 2 -W 3 1.1.1.1"
   restart_spoof_check "18 after the reboot" "$A" "$(sed -n 's/^net0:.*,ip=\([0-9.]*\)\/32.*/\1/p' "/etc/pve/lxc/$A.conf" | head -1)"
   finish
 }
