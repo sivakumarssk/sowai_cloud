@@ -895,12 +895,105 @@ ip link set dev eth0 address "$own"
 echo "mac_restored=yes"`;
 }
 
-/** After a restart, which recreates the veth: the rules must still apply, with no sync. */
-export function isolationAfterRestartScript(): string {
-  return `ip addr add ${TEST_IPV4.spoof}/32 dev eth0
-ping -c 1 -W 1 -I ${TEST_IPV4.spoof} 1.1.1.1 >/dev/null 2>&1 || true
-ip addr del ${TEST_IPV4.spoof}/32 dev eth0
-echo "spoofed=yes"`;
+// ── After a restart ──────────────────────────────────────────────────
+// A restart recreates the veth and empties the container's neighbour table. A spoofed packet sent
+// then first needs the gateway's MAC, and that ARP request carries the spoofed sender, so spoof_arp
+// stops it before spoof_ip4 ever sees an IPv4 packet. So the gateway is learned from the real
+// address first, and the ARP case is proved on its own.
+
+const RESTART_COUNTERS = ["spoof_ip4", "spoof_arp", "spoof_mac", "spoof_ip6", "bad_frame", "unknown_port"];
+
+/** What the container's network looks like, between markers, so a failure can show it. */
+const networkEvidence = `echo "addr<<"; ip -br addr; echo ">>addr"
+echo "route<<"; ip -4 route; ip -6 route; echo ">>route"
+echo "neigh<<"; ip neigh show dev eth0; echo ">>neigh"`;
+
+/** Waits for the address and default route, then learns the gateway's MAC from the real address. */
+export function restartReadyScript(ownIpv4: string): string {
+  return `ready=no
+for _ in $(seq 1 30); do
+  if ip -4 -o addr show dev eth0 | grep -qF ${q(` ${ownIpv4}/32 `)} && ip -4 route show default | grep -qF ${q(`via ${HETZNER_GATEWAY4}`)}; then ready=yes; break; fi
+  sleep 2
+done
+echo "ipv4_ready=$ready"
+# The gateway can't reply to an unrouted test address, so what counts is that its MAC was learned.
+if ping -c 1 -W 2 -I ${q(ownIpv4)} ${HETZNER_GATEWAY4} >/dev/null 2>&1; then echo "gateway_ping=replied"; else echo "gateway_ping=no-reply"; fi
+learned=no
+for _ in $(seq 1 10); do
+  if ip neigh show ${HETZNER_GATEWAY4} dev eth0 | grep -q lladdr; then learned=yes; break; fi
+  sleep 0.5
+done
+echo "gateway_learned=$learned"
+${networkEvidence}`;
+}
+
+/** A spoofed IPv4 source with the gateway's MAC already known: spoof_ip4 must stop it. */
+export function restartSpoofScript(): string {
+  return `ip addr add ${TEST_IPV4.spoof}/32 dev eth0; echo "add_exit=$?"
+ping -c 1 -W 1 -I ${TEST_IPV4.spoof} 1.1.1.1 >/dev/null 2>&1
+ip addr del ${TEST_IPV4.spoof}/32 dev eth0; echo "del_exit=$?"
+${networkEvidence}`;
+}
+
+/** The gateway forgotten, so the spoofed source has to ask for it by ARP: spoof_arp must stop that. */
+export function restartArpSpoofScript(): string {
+  return `ip neigh flush dev eth0; echo "flush_exit=$?"
+ip addr add ${TEST_IPV4.spoof}/32 dev eth0; echo "add_exit=$?"
+ping -c 1 -W 1 -I ${TEST_IPV4.spoof} ${HETZNER_GATEWAY4} >/dev/null 2>&1
+ip addr del ${TEST_IPV4.spoof}/32 dev eth0; echo "del_exit=$?"
+${networkEvidence}`;
+}
+
+/** The text between name<< and >>name. */
+export function block(output: string, name: string): string {
+  return new RegExp(`${name}<<\\n([\\s\\S]*?)\\n?>>${name}`).exec(output)?.[1].trim() ?? "";
+}
+
+/** Every relevant counter at each read, and the container's addresses, routes and neighbours. */
+export function restartEvidence(reads: [string, Record<string, number>][], output: string): string[] {
+  const counters = RESTART_COUNTERS.map((name) => `${name} ${reads.map(([, r]) => r[name] ?? 0).join(" → ")}`);
+  return [
+    `counters (${reads.map(([when]) => when).join(" → ")}): ${counters.join(", ")}`,
+    `ip addr: ${block(output, "addr").replace(/\s*\n\s*/g, " | ") || "(none)"}`,
+    `ip route: ${block(output, "route").replace(/\s*\n\s*/g, " | ") || "(none)"}`,
+    `ip neigh: ${block(output, "neigh").replace(/\s*\n\s*/g, " | ") || "(none)"}`,
+  ];
+}
+
+/** Before any spoof: the address and route are back, and the gateway was learned from the real address. */
+export function checkRestartReady(ready: Record<string, string>): string[] {
+  const problems: string[] = [];
+  if (ready.ipv4_ready !== "yes") problems.push("after the restart the container never got its IPv4 address and default route back");
+  if (ready.gateway_learned !== "yes") problems.push("after the restart the container never learned the gateway from its own address");
+  return problems;
+}
+
+/** Ready, then each spoof stopped by the rule meant for it. A rule that stopped applying fails here. */
+export function checkRestartProof(
+  ready: Record<string, string>,
+  reads: { before: Record<string, number>; mid: Record<string, number>; after: Record<string, number> },
+  spoof: Record<string, string>,
+  arp: Record<string, string>
+): string[] {
+  const problems = checkRestartReady(ready);
+  if (problems.length) return problems;
+  if (spoof.add_exit !== "0") problems.push(`ip addr add for the spoofed address failed (exit ${spoof.add_exit ?? "unknown"})`);
+  else if (!((reads.mid.spoof_ip4 ?? 0) > (reads.before.spoof_ip4 ?? 0))) problems.push("after a restart, a spoofed IPv4 source wasn't stopped by spoof_ip4");
+  if (arp.add_exit !== "0") problems.push(`ip addr add for the ARP test failed (exit ${arp.add_exit ?? "unknown"})`);
+  else if (!((reads.after.spoof_arp ?? 0) > (reads.mid.spoof_arp ?? 0))) problems.push("after a restart, an ARP request with a spoofed sender wasn't stopped by spoof_arp");
+  return problems;
+}
+
+/** Collected from inside a test container when step 4 fails. Addresses and state, no secrets. */
+export function containerDiagnosticsScript(): string {
+  return `echo "--- ip -br addr"; ip -br addr
+echo "--- ip -br link"; ip -br link
+echo "--- ip -4 route"; ip -4 route
+echo "--- ip -6 route"; ip -6 route
+echo "--- ip neigh"; ip neigh
+echo "--- ip -6 neigh"; ip -6 neigh
+echo "--- system"; systemctl is-system-running 2>&1
+echo "--- systemd-networkd"; journalctl -b -u systemd-networkd -n 40 --no-pager 2>&1`;
 }
 
 /** "name=number" lines from isolation-status. */

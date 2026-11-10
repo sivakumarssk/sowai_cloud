@@ -107,6 +107,7 @@ cat > /usr/local/sbin/sowsi-routes <<'SCRIPT'
 #
 #   sowsi-routes                 sync routes and isolation rules
 #   sowsi-routes --status        rule counters and nothing else
+#   sowsi-routes --report        rules, counters, ports, net0 lines and the rule journal, read only
 #   sowsi-routes --probe on|off  a dummy interface, so the installer can prove traffic can't leave by it
 set -euo pipefail
 
@@ -131,6 +132,25 @@ status() {
   done
 }
 
+# Everything a failed proof needs, and nothing secret: -t leaves out set elements (SSH clients' addresses).
+report() {
+  echo "=== counters"; status
+  echo "=== bridge table"; nft -t list table bridge sowsi 2>&1 || true
+  echo "=== inet table"; nft -t list table inet sowsi 2>&1 || true
+  echo "=== bridge ports"; bridge link show 2>&1 || true
+  echo "=== links"; ip -br link 2>&1 || true
+  echo "=== addresses"; ip -br addr 2>&1 || true
+  echo "=== container routes"; ip -4 route show proto "$PROTO" 2>&1 || true; ip -6 route show proto "$PROTO" 2>&1 || true
+  echo "=== net0 lines"
+  local conf
+  for conf in "$LXC_DIR"/*.conf; do
+    [[ -f $conf ]] || continue
+    echo "${conf##*/}: $(grep -m1 '^net0:' "$conf" || echo none)"
+  done
+  echo "=== last good rules"; sha256sum "$GOOD" 2>&1 || true
+  echo "=== journal"; journalctl -u sowsi-routes.service -u sowsi-routes-sync.service -n 60 --no-pager 2>&1 || true
+}
+
 probe() {
   if [[ $1 == on ]]; then
     ip link show "$PROBE" >/dev/null 2>&1 || ip link add "$PROBE" type dummy
@@ -145,11 +165,12 @@ probe() {
 case "${1:-}" in
   "") ;;
   --status) status; exit 0 ;;
+  --report) report; exit 0 ;;
   --probe)
     if [[ "${2:-}" != on && "${2:-}" != off ]]; then echo "usage: sowsi-routes --probe on|off" >&2; exit 2; fi
     probe "$2"
     exit 0 ;;
-  *) echo "usage: sowsi-routes [--status | --probe on|off]" >&2; exit 2 ;;
+  *) echo "usage: sowsi-routes [--status | --report | --probe on|off]" >&2; exit 2 ;;
 esac
 
 mkdir -p "$RUN_DIR" "$STATE_DIR"
@@ -487,6 +508,7 @@ cat > /usr/local/sbin/sowsi-host <<'SCRIPT'
 # Forced command for the Sowsi provisioning SSH key. Only these are allowed:
 #   routes | sowsi-routes          re-sync container routes and isolation rules
 #   isolation-status               isolation rule counters
+#   isolation-report               isolation rules, counters, ports and their journal, for a failed proof
 #   isolation-probe on|off         a dummy interface, for the installer's proof
 #   mount-volume <hetzner-id>      mount an attached Hetzner Volume and register it as Proxmox storage
 #   unmount-volume <hetzner-id>    unregister + unmount it (refused while any disk is on it)
@@ -499,6 +521,7 @@ no_arguments() { if [[ -n "${arg:-}" ]]; then echo "too many arguments" >&2; exi
 case "$cmd" in
   routes|sowsi-routes) no_arguments; exec /usr/local/sbin/sowsi-routes ;;
   isolation-status) no_arguments; exec /usr/local/sbin/sowsi-routes --status ;;
+  isolation-report) no_arguments; exec /usr/local/sbin/sowsi-routes --report ;;
   isolation-probe)
     if [[ "${arg:-}" != on && "${arg:-}" != off ]]; then echo "invalid probe" >&2; exit 2; fi
     exec /usr/local/sbin/sowsi-routes --probe "$arg" ;;

@@ -176,7 +176,16 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   gets no traffic. Step 4 proves this with two test containers before the node
   registers. Their `198.18.254.x` addresses are never routed: they let the host
   see IPv4 from them without buying a Floating IP. `isolation-status` on the
-  dispatcher prints the rule counters. `scripts/node/isolation-compare.sh` and
+  dispatcher prints the rule counters. `isolation-report` prints the rules,
+  counters, ports, `net0` lines and the rules' journal, and changes nothing.
+  After restarting one test container, step 4 waits for its address and route
+  and learns the gateway from its real address. It then proves `spoof_ip4` and
+  `spoof_arp` separately: with the gateway unknown, a spoofed packet goes out
+  first as an ARP request, which only `spoof_arp` sees. If step 4 fails, the
+  installer saves what the test containers and `isolation-report` show to
+  `/root/node-diagnostics/<server>-<time>-verify.txt` on the machine running it. With `--keep-on-failure` it
+  keeps the test containers and their Floating IP (which is billed) for
+  inspection. A re-run deletes them first. `scripts/node/isolation-compare.sh` and
   `baseline-compare.sh` only read, for comparing a node with a fresh one.
   `isolation-test.sh` is the full test for a throwaway node, and refuses a node
   without "test" in its name.

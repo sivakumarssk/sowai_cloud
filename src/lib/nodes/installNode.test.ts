@@ -108,6 +108,16 @@ type WorldCfg = {
     rulesLostOnRestart?: boolean;
     /** isolation-probe off fails. */
     probeStuck?: boolean;
+    /** After the restart the container never gets its IPv4 address or default route back. */
+    restartNeverReady?: boolean;
+    /** After the restart the gateway never answers ARP. */
+    gatewayNeverLearned?: boolean;
+    /** ip addr add for the spoofed address fails (while something else makes the counter rise). */
+    spoofAddFails?: boolean;
+    /** After the restart the ARP rule stops applying, while the IPv4 rule still does. */
+    arpRuleLostOnRestart?: boolean;
+    /** isolation-report fails. */
+    reportFails?: boolean;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -143,6 +153,10 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     servicesStarting: cfg.servicesStartingPolls ?? 0,
     isolationReads: 0,
     restarted: false,
+    /** The restarted container knows the gateway's MAC. Until it does, a spoofed packet's ARP is what's sent. */
+    gatewayKnown: false,
+    /** Packets each rule stopped after the restart. */
+    afterRestart: { spoof_ip4: 0, spoof_arp: 0 },
     probes: [] as boolean[],
     proofScript: "",
     created: [] as { vmid: number; ipv4?: string; ipv6?: string }[],
@@ -200,6 +214,9 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     close() {},
   });
 
+  const evidence = () =>
+    `addr<<\nlo UNKNOWN 127.0.0.1/8\neth0@if7 UP ${S.TEST_IPV4.second}/32\n>>addr\nroute<<\ndefault via 172.31.1.1 dev eth0 onlink\n>>route\nneigh<<\n${w.gatewayKnown ? "172.31.1.1 lladdr fe:ff:ff:ff:ff:ff REACHABLE" : "172.31.1.1 INCOMPLETE"}\n>>neigh`;
+
   const shellFor = (): Shell => ({
     async exec(label, command, o) {
       w.commands.push(label);
@@ -255,7 +272,23 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           w.proofScript = command;
           return `neighbour_v6=${cfg.gotThrough === "neighbour_v6" ? "yes" : "no"}\nmail_25_v4=${cfg.gotThrough === "mail_25_v4" ? "yes" : "no"}\nprivate_mgmt=no`;
         case "isolation mac": return "mac_restored=yes";
-        case "isolation after restart": return "spoofed=yes";
+        case "restart ready": {
+          ok(command.includes(`-I '${S.TEST_IPV4.second}'`), "the gateway is pinged from the real address");
+          const ready = !cfg.restartNeverReady;
+          w.gatewayKnown = ready && !cfg.gatewayNeverLearned;
+          return `ipv4_ready=${ready ? "yes" : "no"}\ngateway_ping=no-reply\ngateway_learned=${w.gatewayKnown ? "yes" : "no"}\n${evidence()}`;
+        }
+        case "restart spoof": {
+          const lost = cfg.rulesLostOnRestart;
+          // H1: with the gateway unknown, the spoofed ARP request goes first, and spoof_arp stops it.
+          if (!lost || cfg.spoofAddFails) w.afterRestart[w.gatewayKnown || cfg.spoofAddFails ? "spoof_ip4" : "spoof_arp"]++;
+          return `add_exit=${cfg.spoofAddFails ? 2 : 0}\ndel_exit=0\n${evidence()}`;
+        }
+        case "restart arp spoof":
+          w.gatewayKnown = false;
+          if (!cfg.rulesLostOnRestart && !cfg.arpRuleLostOnRestart) w.afterRestart.spoof_arp++;
+          return `flush_exit=0\nadd_exit=0\ndel_exit=0\n${evidence()}`;
+        case "container diagnostics": return `--- ip -br addr\neth0 UP ${S.TEST_IPV4.second}/32\n--- ip neigh\n172.31.1.1 dev eth0 INCOMPLETE`;
         default: return "";
       }
     },
@@ -302,9 +335,17 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     },
     isolationStatus: async () => {
       w.isolationReads++;
-      const names = ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac"];
+      const names = ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac", "spoof_arp"];
       const frozen = cfg.rulesLostOnRestart && w.restarted;
-      return ["tables=2", ...names.map((n) => `${n}=${n === cfg.isolationHole || frozen ? 1 : w.isolationReads}`)].join("\n");
+      // After the restart the two spoof counters count only what was actually stopped.
+      const value = (n: string) =>
+        w.restarted && (n === "spoof_ip4" || n === "spoof_arp") ? 1000 + w.afterRestart[n] : n === cfg.isolationHole || frozen ? 1 : w.isolationReads;
+      return ["tables=2", ...names.map((n) => `${n}=${value(n)}`)].join("\n");
+    },
+    isolationReport: async () => {
+      w.commands.push("isolation report");
+      if (cfg.reportFails) throw new Error("connection reset");
+      return "=== counters\ntables=2\nspoof_ip4=1000\n=== bridge table\ntable bridge sowsi {}";
     },
     isolationProbe: async (_host, on) => {
       w.probes.push(on);
@@ -323,10 +364,16 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       listLXC: async () => w.containers.map((c) => ({ ...c, status: "running" })),
       createLXC: async (i) => {
         w.created.push({ vmid: i.vmid, ipv4: i.ipv4, ipv6: i.ipv6 });
+        // A new test container: nothing has restarted yet.
+        w.restarted = false;
+        w.afterRestart = { spoof_ip4: 0, spoof_arp: 0 };
         w.containers.push({ vmid: i.vmid, name: i.hostname, ...(i.ipv4 ? { ipv4: i.ipv4 } : {}) });
       },
       waitForLXC: async () => {},
-      restartLXC: async () => void (w.restarted = true),
+      restartLXC: async () => {
+        w.restarted = true;
+        w.gatewayKnown = false;
+      },
       destroyContainer: async (vmid) => {
         w.containers = w.containers.filter((c) => c.vmid !== vmid);
         return { leftover: [], errors: [] };
@@ -545,11 +592,165 @@ test("a container that gets through fails the install, even if every counter ros
   assert.equal(w.nodes.length, 0);
 });
 
-test("rules that stop applying after a container restart fail the install", async () => {
+test("rules that stop applying after a container restart fail the install, with every counter and the container's network", async () => {
   const w = world({ rulesLostOnRestart: true });
   const r = await executeInstall(w.deps, opts(), settings);
-  assert.match((r as { error: string }).error, /after a container restart/);
+  const error = (r as { error: string }).error;
+  assert.match(error, /after a restart, a spoofed IPv4 source wasn't stopped by spoof_ip4/);
+  assert.match(error, /after a restart, an ARP request with a spoofed sender wasn't stopped by spoof_arp/);
+  assert.match(error, /counters \(before → after the IPv4 spoof → after the ARP spoof\): spoof_ip4 1000 → 1000 → 1000, spoof_arp 1000 → 1000 → 1000, spoof_mac \d+ → \d+ → \d+, spoof_ip6 /);
+  assert.match(error, /bad_frame 0 → 0 → 0, unknown_port 0 → 0 → 0/);
+  assert.match(error, /ip addr: lo UNKNOWN 127\.0\.0\.1\/8 \| eth0@if7 UP 198\.18\.254\.11\/32/);
+  assert.match(error, /ip route: default via 172\.31\.1\.1 dev eth0 onlink/);
+  assert.match(error, /ip neigh: 172\.31\.1\.1 lladdr fe:ff:ff:ff:ff:ff REACHABLE; /, "the gateway was known when the IPv4 spoof went out");
+  assert.match(error, /ip neigh after the ARP spoof: 172\.31\.1\.1 INCOMPLETE/);
   assert.equal(w.nodes.length, 0);
+  assert.deepEqual(w.containers, []);
+});
+
+test("after a restart the gateway is learned from the real address before the spoof (the sowsi-test-02 failure)", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  const c = w.commands;
+  ok(c.indexOf("restart ready") > 0 && c.indexOf("restart ready") < c.indexOf("restart spoof"), "ready, then the spoof");
+  ok(c.indexOf("restart spoof") < c.indexOf("restart arp spoof"), "the ARP case on its own, after");
+  assert.deepEqual(w.afterRestart, { spoof_ip4: 1, spoof_arp: 1 }, "each rule stopped its own packet");
+});
+
+test("a container that never gets its address back after a restart fails, and no spoof is tried", async () => {
+  const w = world({ restartNeverReady: true });
+  const error = ((await executeInstall(w.deps, opts(), settings)) as { error: string }).error;
+  assert.match(error, /never got its IPv4 address and default route back/);
+  assert.match(error, /ip neigh: 172\.31\.1\.1 INCOMPLETE/);
+  ok(!w.commands.includes("restart spoof"));
+  assert.equal(w.nodes.length, 0);
+});
+
+test("a gateway that's never learned after a restart fails, rather than counting the ARP drop as proof", async () => {
+  const w = world({ gatewayNeverLearned: true });
+  const error = ((await executeInstall(w.deps, opts(), settings)) as { error: string }).error;
+  assert.match(error, /never learned the gateway from its own address/);
+  ok(!w.commands.includes("restart spoof"));
+});
+
+test("an ip addr add that failed fails the restart check, even when spoof_ip4 rose", async () => {
+  const w = world({ spoofAddFails: true });
+  const error = ((await executeInstall(w.deps, opts(), settings)) as { error: string }).error;
+  assert.match(error, /ip addr add for the spoofed address failed \(exit 2\)/);
+  assert.equal(w.afterRestart.spoof_ip4, 1, "the counter did rise");
+});
+
+test("an ARP rule lost after a restart fails, even though the IPv4 rule still works", async () => {
+  const w = world({ arpRuleLostOnRestart: true });
+  const error = ((await executeInstall(w.deps, opts(), settings)) as { error: string }).error;
+  assert.match(error, /an ARP request with a spoofed sender wasn't stopped by spoof_arp/);
+  assert.doesNotMatch(error, /spoofed IPv4 source wasn't stopped/);
+  assert.match(error, /spoof_arp 1000 → 1000 → 1000/);
+});
+
+// ── Diagnostics and --keep-on-failure at step 4 ──────────────────────
+
+test("a step 4 failure saves what the test containers and isolation-report show, before cleanup", async () => {
+  const w = world({ rulesLostOnRestart: true });
+  const error = ((await executeInstall(w.deps, opts(), settings)) as { error: string }).error;
+  assert.deepEqual(w.saved.map((d) => d.suffix), ["-verify"], "saved once, and not again by the generic node diagnostics");
+  const text = w.saved[0].text;
+  assert.match(text, /=== test container 100 \(2a01:4f8:1c1c:abcd:[0-9a-f:]+\)\n--- ip -br addr/);
+  assert.match(text, /=== test container 101 \(2a01:4f8:1c1c:abcd:[0-9a-f:]+\)\n--- ip -br addr/);
+  assert.match(text, /=== isolation-report on the node\n=== counters/);
+  assert.match(error, /\(diagnostics: /);
+  const c = w.commands;
+  ok(c.indexOf("container diagnostics") > c.indexOf("restart arp spoof"), "after the failed check");
+  ok(c.indexOf("isolation report") > 0 && c.indexOf("isolation report") < c.indexOf("saved diagnostics-verify"), "report read, then saved");
+  assert.deepEqual(w.containers, [], "then cleaned up as before");
+  assert.deepEqual(w.probes, [true, false]);
+  assert.doesNotMatch(text, new RegExp(`${SECRET}|${PROV_KEY.split(" ")[1]}|${INSTALL_KEY.split(" ")[1]}`), "no secrets or keys");
+  ok(!c.includes("node diagnostics"), "the install-key diagnostics isn't tried: that key is gone");
+  assert.doesNotMatch(w.alerts[0].detail, /no diagnostics: the server can't be reached/);
+});
+
+test("--keep-on-failure keeps nothing when step 4 passes", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts({ ipv4Test: true, keepOnFailure: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.deepEqual(w.containers, []);
+  assert.equal(w.hz.state.floatingIps.size, 0);
+  assert.equal(w.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
+  assert.deepEqual(w.saved, []);
+});
+
+test("diagnostics are still saved when isolation-report fails", async () => {
+  const w = world({ rulesLostOnRestart: true, reportFails: true });
+  await executeInstall(w.deps, opts(), settings);
+  assert.match(w.saved[0].text, /=== isolation-report on the node\nnot available: connection reset/);
+  assert.match(w.saved[0].text, /=== test container 101/);
+});
+
+test("an early step 4 failure (no outbound IPv6) saves diagnostics too", async () => {
+  const w = world({ outbound6: "fail" });
+  await executeInstall(w.deps, opts(), settings);
+  assert.deepEqual(w.saved.map((d) => d.suffix), ["-verify"]);
+  assert.match(w.saved[0].text, /=== test container 100/);
+  assert.match(w.saved[0].text, /=== isolation-report on the node/);
+});
+
+test("--keep-on-failure at step 4 keeps the test containers and their Floating IP, and turns the probe off", async () => {
+  const w = world({ rulesLostOnRestart: true });
+  const r = await executeInstall(w.deps, opts({ ipv4Test: true, keepOnFailure: true }), settings);
+  const error = (r as { error: string }).error;
+  const rec = w.installs.get("sowsi-proxmox-02")!;
+  assert.deepEqual(w.containers.map((c) => c.vmid), [100, 101], "both kept");
+  assert.equal(w.hz.state.floatingIps.size, 1, "the Floating IP A holds is kept");
+  assert.notEqual(rec.testFloatingIpId, null, "and still on the record, so a re-run or --destroy can release it");
+  assert.match(error, new RegExp(`kept for inspection: test containers 100, 101 and Floating IP ${rec.testFloatingIpId}; a re-run deletes them first`));
+  assert.deepEqual(w.probes, [true, false], "the probe interface is still removed");
+  assert.equal(servers(w).size, 1);
+  assert.deepEqual(w.saved.map((d) => d.suffix), ["-verify"]);
+});
+
+test("a re-run deletes what --keep-on-failure kept before making its own, and leaves nothing behind", async () => {
+  const other = { vmid: 104, name: "sowsi-cmabc123" };
+  const w = world({ rulesLostOnRestart: true });
+  await executeInstall(w.deps, opts({ ipv4Test: true, keepOnFailure: true }), settings);
+  const keptIp = w.installs.get("sowsi-proxmox-02")!.testFloatingIpId;
+  w.containers.push(other);
+  const resumed = resumeWorld(w);
+  const destroyed: number[] = [];
+  const pve = resumed.deps.proxmox;
+  resumed.deps.proxmox = (...a) => {
+    const api = pve(...a);
+    return { ...api, destroyContainer: async (id) => (destroyed.push(id), api.destroyContainer(id)) };
+  };
+  const r = await executeInstall(resumed.deps, opts({ ipv4Test: true }), settings);
+  assert.equal(r.ok, true, (r as { error?: string }).error);
+  assert.deepEqual(destroyed.slice(0, 2), [100, 101], "the kept ones go first");
+  ok(!destroyed.includes(104), "a customer's container is never touched");
+  assert.deepEqual(resumed.containers, [other]);
+  assert.equal(resumed.hz.state.floatingIps.size, 0, "kept and new Floating IPs both released");
+  ok(![...resumed.hz.state.floatingIps.keys()].map(String).includes(String(keptIp)));
+  assert.equal(resumed.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
+  assert.equal(resumed.nodes.length, 1);
+});
+
+test("a kept test container that won't delete stops the re-run before it makes new ones", async () => {
+  const w = world({ rulesLostOnRestart: true });
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  const resumed = resumeWorld(w);
+  const pve = resumed.deps.proxmox;
+  resumed.deps.proxmox = (...a) => ({ ...pve(...a), destroyContainer: async () => ({ leftover: ["local:vm-100-disk-0"], errors: [] }) });
+  const r = await executeInstall(resumed.deps, opts({ keepOnFailure: true }), settings);
+  assert.match((r as { error: string }).error, /kept test container 100: leftover disks local:vm-100-disk-0/);
+  assert.equal(resumed.created.length, 0, "nothing new made");
+  assert.equal(resumed.nodes.length, 0);
+});
+
+test("without --keep-on-failure a step 4 failure releases the Floating IP and deletes everything", async () => {
+  const w = world({ rulesLostOnRestart: true });
+  await executeInstall(w.deps, opts({ ipv4Test: true }), settings);
+  assert.deepEqual(w.containers, []);
+  assert.equal(w.hz.state.floatingIps.size, 0);
+  assert.equal(servers(w).size, 0);
 });
 
 test("a probe interface that won't go away is reported", async () => {

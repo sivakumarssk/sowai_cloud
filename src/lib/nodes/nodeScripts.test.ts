@@ -487,6 +487,15 @@ test("the dispatcher refuses anything but its exact commands, and runs nothing i
     "isolation-status `touch pwned`",
     "isolation-status extra",
     "isolation-status\ntouch pwned",
+    "isolation-report ;touch pwned",
+    "isolation-report;touch pwned",
+    "isolation-report $(touch pwned)",
+    "isolation-report `touch pwned`",
+    "isolation-report extra",
+    "isolation-report --probe on",
+    "isolation-report\ttouch pwned",
+    "isolation-report\ntouch pwned",
+    "isolation-reports",
     // The probe takes on or off, and nothing else.
     "isolation-probe",
     "isolation-probe maybe",
@@ -519,6 +528,30 @@ test("the dispatcher refuses anything but its exact commands, and runs nothing i
       assert.equal(r.status, 2, `${JSON.stringify(command)}: ${r.stderr}`);
       assert.equal(r.stdout, "", `${JSON.stringify(command)} printed something`);
       assert.ok(!existsSync(path.join(home, "pwned")), `${JSON.stringify(command)} ran`);
+    }
+    // Accepted exactly as written: it goes on to run sowsi-routes --report, which isn't installed here.
+    const report = dispatcher(home, "isolation-report");
+    assert.notEqual(report.status, 2, report.stderr);
+    assert.match(report.stderr, /sowsi-routes/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("every command the installer sends to the node is one the dispatcher accepts", (t) => {
+  if (spawnSync("bash", ["--version"]).error) return t.skip("no bash");
+  const deps = readFileSync(path.join(process.cwd(), "src", "lib", "nodes", "installNodeDeps.ts"), "utf8");
+  const sent = [...deps.matchAll(/runOnHost\([^,]+, ip: host \}, (["`])(.*?)\1/g)]
+    .map((m) => m[2])
+    .flatMap((c) => (c.includes("${on ?") ? [c.replace(/\$\{on \? "on" : "off"\}/, "on"), c.replace(/\$\{on \? "on" : "off"\}/, "off")] : [c]));
+  assert.deepEqual([...sent].sort(), ["authorized-keys", "isolation-probe off", "isolation-probe on", "isolation-report", "isolation-status", "routes"]);
+  const home = mkdtempSync(path.join(tmpdir(), "sowsi-sent-"));
+  try {
+    for (const command of sent.filter((c) => c !== "authorized-keys")) {
+      // Accepted: it goes on to run sowsi-routes, which isn't installed here.
+      const r = dispatcher(home, command);
+      assert.notEqual(r.status, 2, `${command}: ${r.stderr}`);
+      assert.match(r.stderr, /sowsi-routes/, command);
     }
   } finally {
     rmSync(home, { recursive: true, force: true });

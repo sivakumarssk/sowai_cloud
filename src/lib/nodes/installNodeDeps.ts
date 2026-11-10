@@ -96,6 +96,7 @@ export function prismaInstallDeps(): InstallDeps {
     syncRoutes: (host) => runOnHost({ name: host, ip: host }, "routes", 60_000),
     authorizedKeys: (host) => runOnHost({ name: host, ip: host }, "authorized-keys", 60_000),
     isolationStatus: (host) => runOnHost({ name: host, ip: host }, "isolation-status", 60_000),
+    isolationReport: (host) => runOnHost({ name: host, ip: host }, "isolation-report", 60_000),
     isolationProbe: async (host, on) => void (await runOnHost({ name: host, ip: host }, `isolation-probe ${on ? "on" : "off"}`, 60_000)),
     hostSetupScript: () => readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n"),
 

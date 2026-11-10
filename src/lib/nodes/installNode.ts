@@ -121,6 +121,8 @@ export type InstallDeps = {
   isolationStatus(host: string): Promise<string>;
   /** `isolation-probe on|off`: a dummy interface, to prove nothing leaves by anything but the uplink. */
   isolationProbe(host: string, on: boolean): Promise<void>;
+  /** `isolation-report`: rules, counters, ports and the rule journal, for a failed step 4. Prints no keys. */
+  isolationReport(host: string): Promise<string>;
   proxmox(node: { name: string; ip: string }, token: { tokenId: string; secret: string }): ContainerApi;
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
@@ -443,6 +445,83 @@ async function diagnoseOnNode(ctx: Ctx, step: StepId, problems: string[]) {
   }
 }
 
+type TestContainer = { vmid: number; address: string };
+
+/** Test containers and their Floating IP kept by an earlier --keep-on-failure run: gone before this run makes its own. */
+async function removeKeptTestContainers(ctx: Ctx, pve: ContainerApi, host: string): Promise<void> {
+  const { deps } = ctx;
+  const kept = (await pve.listLXC()).filter((c) => c.name === S.TEST_CONTAINER_HOSTNAME);
+  const problems: string[] = [];
+  for (const c of kept) {
+    const r = await pve.destroyContainer(c.vmid).catch((e) => ({ leftover: [`(${errMsg(e)})`], errors: [] as string[] }));
+    if (r.leftover.length) problems.push(`kept test container ${c.vmid}: leftover disks ${r.leftover.join(", ")}`);
+  }
+  if (kept.length) {
+    const left = await pve.listLXC();
+    for (const c of kept) if (left.some((l) => l.vmid === c.vmid)) problems.push(`kept test container ${c.vmid} still exists`);
+    const routes = S.parseRoutes(await deps.syncRoutes(host).catch(() => ""));
+    if (!routes || routes.ipv4 + routes.ipv6 !== 0) problems.push(`host routes after removing the kept test containers: ${JSON.stringify(routes)}`);
+  }
+  const ip = ctx.rec.testFloatingIpId;
+  if (ip) {
+    await deps.hetzner.releaseFloatingIP(Number(ip)).catch((e) => problems.push(`kept Floating IP ${ip}: ${errMsg(e)}`));
+    if (await deps.hetzner.floatingIpExists(Number(ip)).catch(() => true)) problems.push(`kept Floating IP ${ip} still exists`);
+    else await save(ctx, { testFloatingIpId: null });
+  }
+  if (problems.length) fail("verify", problems);
+  if (kept.length || ip) deps.report(`      removed what an earlier run kept: ${[...kept.map((c) => `container ${c.vmid}`), ...(ip ? [`Floating IP ${ip}`] : [])].join(", ")}`);
+}
+
+/** After a restart the veth is new and the container has forgotten its neighbours: the rules must still apply. */
+async function proveAfterRestart(ctx: Ctx, pve: ContainerApi, host: string, vmid: number, address: string): Promise<string> {
+  const { deps } = ctx;
+  const status = async () => S.parseIsolationStatus(await deps.isolationStatus(host));
+  await pve.restartLXC(vmid);
+  const shell = await deps.containerShell(address, 3 * 60_000);
+  try {
+    const readyOut = await shell.exec("restart ready", S.restartReadyScript(S.TEST_IPV4.second), { timeoutMs: 120_000 });
+    const ready = S.parseFacts(readyOut);
+    const before = await status();
+    const notReady = S.checkRestartReady(ready);
+    if (notReady.length) fail("isolation", [...notReady, ...S.restartEvidence([["now", before]], readyOut)]);
+    const spoofOut = await shell.exec("restart spoof", S.restartSpoofScript(), { timeoutMs: 60_000 });
+    const mid = await status();
+    const arpOut = await shell.exec("restart arp spoof", S.restartArpSpoofScript(), { timeoutMs: 60_000 });
+    const after = await status();
+    const problems = S.checkRestartProof(ready, { before, mid, after }, S.parseFacts(spoofOut), S.parseFacts(arpOut));
+    if (problems.length) {
+      fail("isolation", [
+        ...problems,
+        ...S.restartEvidence([["before", before], ["after the IPv4 spoof", mid], ["after the ARP spoof", after]], spoofOut),
+        `ip neigh after the ARP spoof: ${S.block(arpOut, "neigh").replace(/\s*\n\s*/g, " | ") || "(none)"}`,
+      ]);
+    }
+    return `after a restart: spoofed IPv4 stopped by spoof_ip4, spoofed ARP by spoof_arp (gateway ${ready.gateway_ping === "replied" ? "replied" : "learned; an unrouted address gets no reply"})`;
+  } finally {
+    shell.close();
+  }
+}
+
+/** Step 4 failed after the install key was removed: what the test containers and the node can still tell us. */
+async function saveVerifyDiagnostics(ctx: Ctx, created: TestContainer[], host: string): Promise<string> {
+  const { deps } = ctx;
+  const parts: string[] = [];
+  for (const c of created) {
+    try {
+      const shell = await deps.containerShell(c.address, 60_000);
+      try {
+        parts.push(`=== test container ${c.vmid} (${c.address})\n${await shell.exec("container diagnostics", S.containerDiagnosticsScript(), { timeoutMs: 60_000 })}`);
+      } finally {
+        shell.close();
+      }
+    } catch (err) {
+      parts.push(`=== test container ${c.vmid} (${c.address}): not reachable: ${errMsg(err)}`);
+    }
+  }
+  parts.push(`=== isolation-report on the node\n${await deps.isolationReport(host).catch((e) => `not available: ${errMsg(e)}`)}`);
+  return deps.saveDiagnostics(ctx.rec.hetznerServerId!, "-verify", parts.join("\n\n"));
+}
+
 function api(ctx: Ctx): ContainerApi {
   const secret = ctx.tokenSecret ?? (ctx.rec.apiTokenSecret ? ctx.deps.decrypt(ctx.rec.apiTokenSecret) : null);
   if (!secret) throw new Error("no Proxmox API token for this node yet");
@@ -753,10 +832,11 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const host = ctx.rec.ipv4!;
     let ipv4: string | undefined;
     const lines: string[] = [];
-    const created: number[] = [];
+    const created: TestContainer[] = [];
     let probing = false;
     let failure: unknown = null;
     try {
+      await removeKeptTestContainers(ctx, pve, host);
       if (o.ipv4Test) {
         const fip = await deps.hetzner.buyFloatingIP(`sowsi-node-test-${ctx.rec.name}`, s.location);
         await save(ctx, { testFloatingIpId: String(fip.id) });
@@ -765,13 +845,13 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       }
       const size = { hostname: S.TEST_CONTAINER_HOSTNAME, cores: 1, memory: 512, diskSize: 4, osTemplate: "ubuntu-22.04", start: true };
       await pve.createLXC({ vmid, ...size, ipv6, ipv4: ipv4 ?? S.TEST_IPV4.first });
-      created.push(vmid);
+      created.push({ vmid, address: ipv4 ?? ipv6 });
       await pve.waitForLXC(vmid);
       // A neighbour, because goal one is that the first can't reach it.
       const neighbour = await pve.getNextVMID();
       const neighbourIpv6 = ipv6ForVmid(ctx.rec.ipv6Subnet!, neighbour);
       await pve.createLXC({ vmid: neighbour, ...size, ipv6: neighbourIpv6, ipv4: S.TEST_IPV4.second });
-      created.push(neighbour);
+      created.push({ vmid: neighbour, address: neighbourIpv6 });
       await pve.waitForLXC(neighbour);
       const routes = S.parseRoutes(await deps.syncRoutes(host));
       if (!routes || routes.ipv6 !== 2 || routes.ipv4 !== 2) fail("verify", [`host routes after create: ${JSON.stringify(routes)}`]);
@@ -798,37 +878,39 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
         const problems = S.checkIsolationProof(before, S.parseIsolationStatus(await deps.isolationStatus(host)), attempts);
         if (problems.length) fail("isolation", problems);
 
+        lines.push("isolation proven: spoofing, neighbours, host, private networks, other interfaces, mail, metadata");
         // A restart recreates the veth: the rules must still apply, with no sync in between.
-        await pve.restartLXC(neighbour);
-        const rising = S.parseIsolationStatus(await deps.isolationStatus(host)).spoof_ip4 ?? 0;
-        const restarted = await deps.containerShell(neighbourIpv6, 3 * 60_000);
-        try {
-          await restarted.exec("isolation after restart", S.isolationAfterRestartScript(), { timeoutMs: 60_000 });
-        } finally {
-          restarted.close();
-        }
-        if (!((S.parseIsolationStatus(await deps.isolationStatus(host)).spoof_ip4 ?? 0) > rising)) fail("isolation", ["the rules stopped applying after a container restart"]);
-        lines.push("isolation proven: spoofing, neighbours, host, private networks, other interfaces, mail, metadata, and after a restart");
+        lines.push(await proveAfterRestart(ctx, pve, host, neighbour, neighbourIpv6));
       } finally {
         shell.close();
       }
     } catch (err) {
       failure = err;
+      // The install key is gone by now, so this is the only look at the node there will be.
+      const saved = await saveVerifyDiagnostics(ctx, created, host).catch((e) => `none (${errMsg(e)})`);
+      deps.report(`      diagnostics saved: ${saved}`);
+      ctx.diagnosed = true;
+      failure = new Error(`${errMsg(err)} (diagnostics: ${saved})`);
     } finally {
-      // Always clean up, verified — even when a check above failed.
+      // Always clean up, verified — even when a check above failed. --keep-on-failure keeps the evidence.
       const cleanup: string[] = [];
+      const keep = failure !== null && o.keepOnFailure && created.length > 0;
       if (probing) await deps.isolationProbe(host, false).catch((e) => cleanup.push(`probe interface: ${errMsg(e)}`));
-      for (const id of created) {
+      if (keep) {
+        const ip = ctx.rec.testFloatingIpId ? ` and Floating IP ${ctx.rec.testFloatingIpId}` : "";
+        failure = new Error(`${errMsg(failure)} — kept for inspection: test containers ${created.map((c) => c.vmid).join(", ")}${ip}; a re-run deletes them first`);
+      }
+      for (const { vmid: id } of keep ? [] : created) {
         const r = await pve.destroyContainer(id).catch((e) => ({ leftover: [`(${errMsg(e)})`], errors: [] as string[] }));
         if (r.leftover.length) cleanup.push(`leftover disks: ${r.leftover.join(", ")}`);
         const left = await pve.listLXC().catch(() => [{ vmid: id, status: "unknown" }]);
         if (left.some((c) => c.vmid === id)) cleanup.push(`container ${id} still exists`);
       }
-      if (created.length) {
+      if (created.length && !keep) {
         const routes = S.parseRoutes(await deps.syncRoutes(host).catch(() => ""));
         if (!routes || routes.ipv4 + routes.ipv6 !== 0) cleanup.push(`host routes after delete: ${JSON.stringify(routes)}`);
       }
-      if (ctx.rec.testFloatingIpId) {
+      if (ctx.rec.testFloatingIpId && !keep) {
         const id = Number(ctx.rec.testFloatingIpId);
         await deps.hetzner.releaseFloatingIP(id).catch((e) => cleanup.push(`Floating IP ${id}: ${errMsg(e)}`));
         if (await deps.hetzner.floatingIpExists(id).catch(() => true)) cleanup.push(`Floating IP ${id} still exists`);
@@ -964,7 +1046,8 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
   const serverId = ctx.rec.hetznerServerId;
   const cleanup: string[] = [];
 
-  if (ctx.rec.testFloatingIpId) {
+  // --keep-on-failure keeps the test container that holds it; a re-run or --destroy releases it.
+  if (ctx.rec.testFloatingIpId && !o.keepOnFailure) {
     const id = Number(ctx.rec.testFloatingIpId);
     await deps.hetzner
       .releaseFloatingIP(id)

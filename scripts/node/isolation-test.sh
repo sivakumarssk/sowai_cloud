@@ -58,6 +58,44 @@ same_counter() {
   if ((after == before)); then ok "$label"; else bad "$label: $counter rose from $before to $after"; fi
 }
 
+# The installer's restart check. A restarted container has forgotten the gateway, and a spoofed
+# packet's ARP request would carry the spoofed sender: spoof_arp would stop that before spoof_ip4
+# sees anything. So learn the gateway from the real address first, then check each rule on its own.
+restart_spoof_check() { # label container real-ipv4
+  local label=$1 id=$2 ip=$3 ready=no learned=no out b4 m4 ba aa all before=$failed
+  for _ in $(seq 1 30); do
+    if in_ct "$id" "ip -4 -o addr show dev eth0 | grep -qF ' $ip/32 ' && ip -4 route show default | grep -qF 'via 172.31.1.1'"; then ready=yes; break; fi
+    sleep 2
+  done
+  if [[ $ready == yes ]]; then ok "$label: IPv4 address and default route are back"; else bad "$label: no IPv4 address or default route after the restart"; fi
+  if in_ct "$id" "ping -c 1 -W 2 -I $ip 172.31.1.1" >/dev/null 2>&1; then echo "  info $label: the gateway replied"; else echo "  info $label: no reply from the gateway (an unrouted address gets none)"; fi
+  for _ in $(seq 1 10); do
+    if in_ct "$id" "ip neigh show 172.31.1.1 dev eth0 | grep -q lladdr"; then learned=yes; break; fi
+    sleep 0.5
+  done
+  if [[ $learned == yes ]]; then ok "$label: gateway learned from its own address"; else bad "$label: the gateway's MAC was never learned"; fi
+  all=$(/usr/local/sbin/sowsi-routes --status | tr '\n' ' ')
+  b4=$(count spoof_ip4); ba=$(count spoof_arp)
+  out=$(in_ct "$id" "ip addr add 198.18.254.99/32 dev eth0; echo add_exit=\$?; ping -c 1 -W 1 -I 198.18.254.99 1.1.1.1 >/dev/null 2>&1; ip addr del 198.18.254.99/32 dev eth0")
+  sleep 0.5
+  m4=$(count spoof_ip4)
+  if [[ $out != *add_exit=0* ]]; then bad "$label: ip addr add failed ($out)"
+  elif ((m4 > b4)); then ok "$label: spoofed IPv4 stopped (spoof_ip4 $b4 -> $m4)"
+  else bad "$label: spoofed IPv4 not stopped (spoof_ip4 $b4 -> $m4, spoof_arp $ba -> $(count spoof_arp))"; fi
+  ba=$(count spoof_arp)
+  out=$(in_ct "$id" "ip neigh flush dev eth0; ip addr add 198.18.254.99/32 dev eth0; echo add_exit=\$?; ping -c 1 -W 1 -I 198.18.254.99 172.31.1.1 >/dev/null 2>&1; ip addr del 198.18.254.99/32 dev eth0")
+  sleep 0.5
+  aa=$(count spoof_arp)
+  if [[ $out != *add_exit=0* ]]; then bad "$label: ip addr add failed for the ARP test ($out)"
+  elif ((aa > ba)); then ok "$label: spoofed ARP stopped (spoof_arp $ba -> $aa)"
+  else bad "$label: spoofed ARP not stopped (spoof_arp $ba -> $aa)"; fi
+  if ((failed > before)); then
+    echo "  counters before: $all"
+    echo "  counters after:  $(/usr/local/sbin/sowsi-routes --status | tr '\n' ' ')"
+    echo "  evidence: $(in_ct "$id" "ip -br addr; ip -4 route; ip neigh show dev eth0" | tr '\n' ';')"
+  fi
+}
+
 write_forge() {
   cat > "$FORGE" <<'PY'
 import socket, struct, sys
@@ -179,8 +217,8 @@ main() {
 
   echo "== 17 container restart"
   pct reboot "$B"
-  sleep 12
-  rises "17 rules apply after a restart, with no sync" spoof_ip4 in_ct "$B" "ip addr add 198.18.254.99/32 dev eth0; ping -c 1 -W 1 -I 198.18.254.99 1.1.1.1; ip addr del 198.18.254.99/32 dev eth0"
+  for _ in $(seq 1 120); do [[ $(pct status "$B") == *running* ]] && break; sleep 1; done
+  restart_spoof_check "17 after a restart, with no sync" "$B" "$IP4_B"
   check "17 the neighbour still has outbound IPv6" in_ct "$B" "ping -6 -c 2 -W 2 $OUTSIDE6"
 
   echo "== 19 a bad rule file"
@@ -246,7 +284,7 @@ reboot_check() {
   check "18 outbound IPv6 works" in_ct "$A" "ping -6 -c 2 -W 2 $OUTSIDE6"
   blocked "18 the neighbour is still blocked" to_neighbour_l2 "$A" "$S::901" 22
   blocked "18 the host is still blocked" to_host "$A" "$NODE4" 22
-  rises "18 spoofing is still blocked" spoof_ip4 in_ct "$A" "ip addr add 198.18.254.99/32 dev eth0; ping -c 1 -W 1 -I 198.18.254.99 1.1.1.1; ip addr del 198.18.254.99/32 dev eth0"
+  restart_spoof_check "18 after the reboot" "$A" "$(sed -n 's/^net0:.*,ip=\([0-9.]*\)\/32.*/\1/p' "/etc/pve/lxc/$A.conf" | head -1)"
   finish
 }
 
