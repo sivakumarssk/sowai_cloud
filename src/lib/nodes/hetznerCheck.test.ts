@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import axios from "axios";
 import { formatResults, hasField, runHetznerChecks, type HetznerGet } from "./hetznerCheck";
+import { describeFloatingIpv4, describeIncludedTraffic, describeTrafficPrice, HETZNER_INVOICE } from "./hetznerInvoice";
 import { HetznerService } from "@/lib/hetzner";
 import { CPX22, deprecatedUse, fakeHetzner, type FakeHetznerConfig } from "@/lib/testing/fakeHetzner";
 
@@ -13,6 +14,20 @@ function setup(cfg: FakeHetznerConfig = {}) {
   const get: HetznerGet = async (path, params) => (await client.get(path, { params })).data;
   return { hz, get };
 }
+
+test("the invoice facts: 20 TB a month per CPX server, then $1.20/TB; Floating IPv4 $0.0056/hour up to $3.50", () => {
+  assert.deepEqual(HETZNER_INVOICE, { cpxIncludedTrafficTB: 20, trafficUsdPerTB: 1.2, floatingIpv4UsdHourly: 0.0056, floatingIpv4UsdMonthlyMax: 3.5 });
+  assert.equal(describeIncludedTraffic(20e12), "included traffic: 20000000000000 bytes = 20.00 TB = 18.19 TiB");
+  assert.equal(describeIncludedTraffic(20 * 2 ** 40), "included traffic: 21990232555520 bytes = 21.99 TB = 20.00 TiB", "20 TiB also matches: the API's unit isn't confirmed");
+  assert.match(describeIncludedTraffic(2 * 2 ** 40), /= 2\.00 TiB — DIFFERS from the invoice's 20 TB$/, "the old 2 TiB note is caught");
+  assert.match(describeIncludedTraffic(undefined), /not in the answer \(invoice: 20 TB\)/);
+  assert.equal(describeTrafficPrice("1.20"), "traffic over the allowance: $1.20/TB");
+  assert.match(describeTrafficPrice("1.00"), /\$1\.00\/TB — DIFFERS from the invoice's \$1\.20\/TB/);
+  assert.match(describeTrafficPrice(undefined), /not in the answer \(invoice: \$1\.20\/TB\)/);
+  assert.equal(describeFloatingIpv4(3.5), "$0.0056/hour, at most $3.50/month (invoice); the API lists $3.50/month");
+  assert.match(describeFloatingIpv4(3.57), /the API lists \$3\.57\/month — DIFFERS from the invoice's \$3\.50/);
+  assert.match(describeFloatingIpv4(null), /the API lists no monthly price/);
+});
 
 test("hasField: nested paths, lists, and null counts as present", () => {
   const row = { a: { b: 1 }, list: [{ c: null }], empty: [] };
@@ -54,6 +69,10 @@ test("every endpoint answers, every field we read is there, and only GETs are se
   assert.match(text, /nbg1 is in eu-central/);
   assert.match(text, /currency USD\n/);
   assert.match(text, /Primary IPv4 in nbg1: \$0\.50\/month/);
+  assert.match(text, /included traffic: 20000000000000 bytes = 20\.00 TB = 18\.19 TiB\n/, "the API's bytes, as TB and TiB, matching the invoice");
+  assert.match(text, /traffic over the allowance: \$1\.20\/TB\n/);
+  assert.match(text, /Floating IPv4 in nbg1: \$0\.0056\/hour, at most \$3\.50\/month \(invoice\); the API lists \$3\.50\/month\n/);
+  assert.doesNotMatch(text, /DIFFERS/);
   assert.doesNotMatch(text, /€/);
   assert.match(text, /no unattached Primary IPs/);
   assert.match(text, /All 10 checks passed/);

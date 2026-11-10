@@ -208,10 +208,29 @@ main() {
 
   echo "== 16 Docker inside the container"
   spoofs=$(count spoof_ip4)
-  if in_ct "$A" "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io >/dev/null 2>&1; docker run -d --name t -p 8080:80 nginx:alpine >/dev/null 2>&1; sleep 6; curl -fsS -m 5 -o /dev/null http://localhost:8080; rc=\$?; docker rm -f t >/dev/null 2>&1; exit \$rc"; then
-    ok "16 Docker pulled and served a published port"
+  # nginx can take longer than a fixed sleep to listen (sowsi-test-03), so each step waits up to 30 s.
+  docker_check='export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -qq docker.io >/dev/null 2>&1 || { echo "step=install"; exit 1; }
+deadline=$((SECONDS + 30))
+until docker info >/dev/null 2>&1; do
+  if ((SECONDS >= deadline)); then echo "step=daemon"; exit 1; fi
+  sleep 1
+done
+docker rm -f t >/dev/null 2>&1
+if ! docker run -d --name t -p 8080:80 nginx:alpine >/dev/null 2>&1; then echo "step=run"; docker ps -a 2>&1 | tail -3; exit 1; fi
+start=$SECONDS deadline=$((SECONDS + 30)) rc=1
+while ((SECONDS < deadline)); do
+  if curl -fsS -m 2 -o /dev/null http://localhost:8080; then rc=0; echo "served_after=$((SECONDS - start))s"; break; fi
+  sleep 1
+done
+if ((rc != 0)); then echo "step=port"; docker ps -a 2>&1 | tail -3; docker logs t 2>&1 | tail -5; fi
+docker rm -f t >/dev/null 2>&1
+exit $rc'
+  if docker_out=$(in_ct "$A" "$docker_check" 2>&1); then
+    ok "16 Docker pulled and served a published port (${docker_out#served_after=})"
   else
-    bad "16 Docker failed: check whether the rules or Docker in LXC are the cause"
+    bad "16 Docker failed at $(sed -n 's/^step=//p' <<<"$docker_out" | head -1): check whether the rules or Docker in LXC are the cause"
+    sed 's/^/       /' <<<"$docker_out"
   fi
   if [[ $(count spoof_ip4) == "$spoofs" ]]; then ok "16 no spoof counter rose"; else bad "16 Docker's traffic hit a spoof rule"; fi
 

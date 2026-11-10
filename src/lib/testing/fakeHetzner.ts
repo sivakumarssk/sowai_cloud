@@ -28,7 +28,11 @@ export const LOCATIONS = {
   fsn1: { id: 1, name: "fsn1", city: "Falkenstein", country: "DE", description: "Falkenstein DC Park 1", latitude: 50.47612, longitude: 12.370071, network_zone: "eu-central" },
 };
 
-/** The live answer for cpx22; `locations` is what availability is read from. */
+/**
+ * cpx22 as the live API answered it; `locations` is what availability is read from. The price and
+ * fields are from the live answer. The traffic values are the invoice's (20 TB, then $1.20/TB):
+ * whether the API's byte count means TB or TiB hasn't been read, and hetzner-check prints both.
+ */
 export const CPX22 = {
   id: 109,
   name: "cpx22",
@@ -41,8 +45,8 @@ export const CPX22 = {
   cpu_type: "shared",
   storage_type: "local",
   prices: [
-    { location: "nbg1", ...price("0.0368", "22.99"), included_traffic: 2199023255552, price_per_tb_traffic: { gross: "1.00", net: "1.00" } },
-    { location: "fsn1", ...price("0.0368", "22.99"), included_traffic: 2199023255552, price_per_tb_traffic: { gross: "1.00", net: "1.00" } },
+    { location: "nbg1", ...price("0.0368", "22.99"), included_traffic: 20_000_000_000_000, price_per_tb_traffic: { gross: "1.20", net: "1.20" } },
+    { location: "fsn1", ...price("0.0368", "22.99"), included_traffic: 20_000_000_000_000, price_per_tb_traffic: { gross: "1.20", net: "1.20" } },
   ],
   locations: [
     { id: 2, name: "nbg1", available: true, recommended: true, deprecation: null as { announced: string; unavailable_after: string } | null },
@@ -138,8 +142,9 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
             { type: "ipv4", prices: [{ location: "nbg1", ...price("0.0008", "0.50") }] },
             { type: "ipv6", prices: [{ location: "nbg1", ...price("0.0000", "0.00") }] },
           ],
-          floating_ips: [{ type: "ipv4", prices: [{ location: "nbg1", price_monthly: { gross: "3.57", net: "3.57" } }] }],
-          floating_ip: { price_monthly: { gross: "3.57", net: "3.57" } },
+          // The invoice's monthly maximum; the live /pricing value hasn't been read.
+          floating_ips: [{ type: "ipv4", prices: [{ location: "nbg1", price_monthly: { gross: "3.50", net: "3.50" } }] }],
+          floating_ip: { price_monthly: { gross: "3.50", net: "3.50" } },
           volume: { price_per_gb_month: { gross: "0.05", net: "0.05" } },
           server_types: [{ id: CPX22.id, name: CPX22.name, prices: CPX22.prices }],
         },

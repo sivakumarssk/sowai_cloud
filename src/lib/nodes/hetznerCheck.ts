@@ -2,6 +2,7 @@
 // on and report whether it answers and whether the fields we read are there.
 // Takes a GET function, so nothing here can create, change or delete anything.
 import { serverTypeOffer, toServer, type ApiServerType } from "@/lib/hetzner";
+import { describeFloatingIpv4, describeIncludedTraffic, describeTrafficPrice } from "./hetznerInvoice";
 
 const INSTALL_LABEL = "sowsi-node-install";
 
@@ -77,9 +78,12 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
   await add(`GET /server_types?name=${serverType}`, "/server_types", { name: serverType }, "server_types", ["id", "name", "architecture", "cores", "memory", "disk", "prices[].location", "prices[].price_hourly.gross", "prices[].price_monthly.gross", "locations[].name", "locations[].available", "locations[].deprecation"], (rows) => {
     if (rows.length === 0) return [`${serverType} is not a Hetzner server type`];
     const offer = serverTypeOffer(rows[0] as unknown as ApiServerType, location);
+    const here = (rows[0].prices as { location?: string; included_traffic?: unknown; price_per_tb_traffic?: { gross?: unknown } }[] | undefined)?.find((p) => p.location === location);
     return [
       offer.buyable ? `${serverType} is buyable in ${location}: $${offer.price!.monthly}/month, $${offer.price!.hourly}/hour (gross)` : `NOT buyable: ${offer.reason}`,
       `architecture ${String(rows[0].architecture)}${rows[0].architecture === "x86" ? "" : " — Proxmox needs x86"}`,
+      describeIncludedTraffic(here?.included_traffic),
+      describeTrafficPrice(here?.price_per_tb_traffic?.gross),
     ];
   });
 
@@ -91,7 +95,7 @@ export async function runHetznerChecks(get: HetznerGet, opts: { serverType: stri
   await add("GET /pricing", "/pricing", undefined, "pricing", ["currency", "primary_ips[].type", "primary_ips[].prices[].location", "primary_ips[].prices[].price_hourly.gross", "primary_ips[].prices[].price_monthly.gross", "floating_ips[].type", "floating_ips[].prices[].location", "floating_ips[].prices[].price_monthly.gross"], (rows) => {
     const p = rows[0] as { currency?: string; primary_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[]; floating_ips?: { type: string; prices: { location: string; price_monthly: { gross: string } }[] }[] };
     const monthly = (list: typeof p.primary_ips) => list?.find((t) => t.type === "ipv4")?.prices.find((x) => x.location === location)?.price_monthly.gross;
-    return [`currency ${String(p.currency)}${p.currency === "USD" ? "" : " — costs here are worked out from USD"}`, `Primary IPv4 in ${location}: $${monthly(p.primary_ips) ?? "?"}/month`, `Floating IPv4 in ${location}: $${monthly(p.floating_ips) ?? "?"}/month`];
+    return [`currency ${String(p.currency)}${p.currency === "USD" ? "" : " — costs here are worked out from USD"}`, `Primary IPv4 in ${location}: $${monthly(p.primary_ips) ?? "?"}/month`, `Floating IPv4 in ${location}: ${describeFloatingIpv4(monthly(p.floating_ips) === undefined ? null : Number(monthly(p.floating_ips)))}`];
   });
 
   await add("GET /ssh_keys", "/ssh_keys", { per_page: 50 }, "ssh_keys", ["id", "name", "fingerprint", "public_key"], (rows) =>

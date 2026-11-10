@@ -501,6 +501,50 @@ whenBash("isolation-test.sh tests 17 and 18 learn the gateway first, then check 
   assert.match(runRestartCheck({ noAddr: true }).stdout, /FAIL 17 after a restart: no IPv4 address or default route after the restart/);
 });
 
+/** isolation-test.sh test 16's in-container script, with apt, docker and curl faked. sleep moves bash's clock. */
+function runDockerCheck(o: { daemonAfter?: number; portAfter?: number; runFails?: boolean; installFails?: boolean } = {}) {
+  const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8").replace(/\r\n/g, "\n");
+  const check = /\n {2}docker_check='([\s\S]*?)'\n/.exec(script)![1];
+  const fakes = `
+sleep() { SECONDS=$((SECONDS + 1)); }
+apt-get() { return ${o.installFails ? 1 : 0}; }
+docker() {
+  case "$1" in
+    info) [ "$SECONDS" -ge ${o.daemonAfter ?? 0} ] ;;
+    run) echo "docker run $*" >> calls; return ${o.runFails ? 125 : 0} ;;
+    rm) echo "docker rm" >> calls ;;
+    ps) echo "CONTAINER ID   IMAGE          STATUS" ;;
+    logs) echo "nginx: starting" ;;
+  esac
+}
+curl() { echo "curl at $SECONDS" >> calls; [ "$SECONDS" -ge ${o.portAfter ?? 0} ]; }
+`;
+  const dir = mkdtempSync(path.join(tmpdir(), "sowsi-docker-"));
+  const r = spawnSync("bash", ["-c", `${fakes}\n${check}`], { encoding: "utf8", cwd: dir });
+  const calls = existsSync(path.join(dir, "calls")) ? readFileSync(path.join(dir, "calls"), "utf8") : "";
+  rmSync(dir, { recursive: true, force: true });
+  return { ...r, calls };
+}
+
+whenBash("test 16 waits up to 30 seconds for Docker's port, and says which step failed", () => {
+  const slow = runDockerCheck({ daemonAfter: 4, portAfter: 20 });
+  assert.equal(slow.status, 0, slow.stdout + slow.stderr);
+  assert.match(slow.stdout, /^served_after=1[0-9]s$/m, "nginx answering 20 s in still passes");
+  assert.match(slow.calls, /docker rm\n$/, "the test container is removed afterwards");
+
+  const never = runDockerCheck({ portAfter: 999 });
+  assert.notEqual(never.status, 0);
+  assert.match(never.stdout, /^step=port$/m);
+  assert.match(never.stdout, /nginx: starting/, "with docker's own view of it");
+  const tries = never.calls.match(/^curl at (\d+)$/gm)!.map((l) => Number(l.split(" ").pop()));
+  assert.ok(tries.length >= 20 && tries.at(-1)! < 31, `retried for 30 seconds, then stopped (${tries.length} tries, last at ${tries.at(-1)})`);
+
+  assert.match(runDockerCheck({ daemonAfter: 999 }).stdout, /^step=daemon$/m);
+  assert.match(runDockerCheck({ runFails: true }).stdout, /^step=run$/m);
+  assert.match(runDockerCheck({ installFails: true }).stdout, /^step=install$/m);
+  assert.doesNotMatch(runDockerCheck({ runFails: true }).calls, /curl/, "no waiting on a port that can't come");
+});
+
 test("the proof fails on any attempt that got through and any rule that stopped nothing", () => {
   const names = ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_iface", "to_private", "to_mail", "to_metadata", "spoof_ip4", "spoof_ip6", "spoof_mac"];
   const zero = Object.fromEntries(names.map((n) => [n, 0]));

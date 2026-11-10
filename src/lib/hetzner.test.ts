@@ -121,7 +121,7 @@ test("reads the server type and IP prices", async () => {
   const { h, hz } = client();
   assert.equal((await h.getServerType("cpx22"))!.id, 109);
   assert.equal(await h.getServerType("cpx99"), null);
-  assert.deepEqual(await h.ipPrices("nbg1"), { currency: "USD", vatRate: "0.00", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.57 });
+  assert.deepEqual(await h.ipPrices("nbg1"), { currency: "USD", vatRate: "0.00", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.5 });
   assert.deepEqual(await h.ipPrices("ash"), { currency: "USD", vatRate: "0.00", primaryIpv4: null, floatingIpv4Monthly: null });
   assert.deepEqual(hz.requests.flatMap(deprecatedUse), []);
 });

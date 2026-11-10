@@ -1750,13 +1750,18 @@ test("IPv6 still doesn't depend on DNS, which is recorded on its own", async () 
 
 test("the cost follows the dollar rate, and a default rate is said out loud", () => {
   const price = { hourly: 0.0368, monthly: 22.99 };
-  const ips = { currency: "USD", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.57 };
+  const ips = { currency: "USD", primaryIpv4: { hourly: 0.0008, monthly: 0.5 }, floatingIpv4Monthly: 3.5 };
   const at = (usdToInr: number, rateWarning?: string) => serverCost("cpx22", price, ips, { location: "nbg1", usdToInr, rateWarning }, false);
   const set = at(96) as Cost;
   assert.equal(set.monthlyPaise, Math.ceil(23.49 * 96 * 100));
   assert.equal(set.hourlyPaise, Math.ceil(0.0376 * 96 * 100));
   assert.ok(!set.lines.some((l) => l.includes("WARNING")));
   assert.equal((at(96, "WARNING: a default") as Cost).lines.at(-1), "WARNING: a default");
+  assert.ok(set.lines.includes("traffic: 20 TB a month included with a CPX server, then $1.20/TB (invoice; not in the total)"));
+  assert.equal(set.monthlyPaise, Math.ceil(23.49 * 96 * 100), "the traffic line changes no total");
+  const test4 = serverCost("cpx22", price, ips, { location: "nbg1", usdToInr: 96 }, true) as Cost;
+  assert.ok(test4.lines.includes("--ipv4 test: one Floating IPv4, $0.0056/hour, at most $3.50/month (invoice); the API lists $3.50/month; released right after the test"));
+  assert.equal(test4.monthlyPaise, set.monthlyPaise, "nor does the Floating IP line");
 });
 
 test("prices in another currency are refused, not converted at the dollar rate", async () => {

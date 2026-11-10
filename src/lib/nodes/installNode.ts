@@ -9,6 +9,7 @@
 // Not wired to the engine or approvals: only scripts/node/install-node.ts calls this.
 import { serverTypeOffer, type ApiServerType, type HetznerPrice, type HetznerServer, type ServerDeleted } from "@/lib/hetzner";
 import { ipv6ForVmid } from "@/lib/provisioning/nodeTarget";
+import { describeFloatingIpv4, HETZNER_INVOICE } from "./hetznerInvoice";
 import * as S from "./nodeScripts";
 import { rescueDiagnoseAgain, rescueRefusal, rescueRepair, type RescueArgs } from "./rescueRepair";
 import { diagnosticsScript } from "./rescueScripts";
@@ -256,8 +257,9 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { curre
     `primary IPv4: $${ip.monthly.toFixed(2)}/month, $${ip.hourly.toFixed(4)}/hour`,
     `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.usdToInr}/$, HETZNER_USD_TO_INR). Billed hourly until deleted.`,
     `against the spend cap: ${inr(monthlyPaise)} if it stays as a node; if it's destroyed, only ${inr(hourlyPaise)} per started hour it lived`,
+    `traffic: ${HETZNER_INVOICE.cpxIncludedTrafficTB} TB a month included with a CPX server, then $${HETZNER_INVOICE.trafficUsdPerTB.toFixed(2)}/TB (invoice; not in the total)`,
   ];
-  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4 ($${(ips.floatingIpv4Monthly ?? 0).toFixed(2)}/month list price), released right after the test`);
+  if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4, ${describeFloatingIpv4(ips.floatingIpv4Monthly)}; released right after the test`);
   if (s.rateWarning) lines.push(s.rateWarning);
   return { monthlyPaise, hourlyPaise, lines };
 }
