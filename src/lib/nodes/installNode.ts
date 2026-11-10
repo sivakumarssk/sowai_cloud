@@ -157,7 +157,7 @@ export type InstallSettings = {
   mgmtHasIpv6: boolean;
   /** MGMT_PRIVATE_IP: sowsi-mgmt-01 on Hetzner's private network, which a test container tries to reach. */
   mgmtPrivateIp: string | null;
-  /** HETZNER_SERVER_ID: node 1, never touched. */
+  /** HETZNER_SERVER_ID: a hand-built server, never touched. Empty once node 1 is retired. */
   protectedServerId: string | null;
   usdToInr: number;
   /** Set when usdToInr is a default, not HETZNER_USD_TO_INR. */
@@ -1114,7 +1114,7 @@ export async function planDestroy(deps: InstallDeps, serverId: string, s: Instal
   const problems: string[] = s.wrongHost ? [s.wrongHost] : [];
   const lines: string[] = [];
   if (!/^\d+$/.test(serverId)) return { ok: false, problems: [`--destroy needs a numeric Hetzner server id, got "${serverId}"`], lines, server: null, install: null, nodeId: null };
-  if (s.protectedServerId && serverId === s.protectedServerId) problems.push(`server ${serverId} is HETZNER_SERVER_ID (node 1) — never destroyed by this script`);
+  if (s.protectedServerId && serverId === s.protectedServerId) problems.push(`server ${serverId} is HETZNER_SERVER_ID (a hand-built server) — never destroyed by this script`);
 
   const [server, install, node] = await Promise.all([deps.hetzner.getServer(Number(serverId)), deps.db.findInstallByServer(serverId), deps.db.nodeByServerId(serverId)]);
   if (server && server.labels[INSTALL_LABEL] !== "1") problems.push(`server ${serverId} (${server.name}) wasn't created by install-node — not touching it`);

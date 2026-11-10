@@ -209,12 +209,6 @@ export class HetznerService {
     }
   }
 
-  get serverId(): number {
-    const id = process.env.HETZNER_SERVER_ID;
-    if (!id) throw new HetznerError("HETZNER_SERVER_ID is not set");
-    return Number(id);
-  }
-
   /**
    * Creates a new IPv4 Floating IP. It must be in the same location as the
    * Proxmox server (nbg1) or it can't be assigned to it.
@@ -232,7 +226,7 @@ export class HetznerService {
   }
 
   /** Routes the Floating IP to a server and waits until Hetzner has applied it. */
-  async assignFloatingIP(floatingIpId: number, serverId: number = this.serverId): Promise<void> {
+  async assignFloatingIP(floatingIpId: number, serverId: number): Promise<void> {
     const { action } = await this.request<{ action: HetznerAction }>(
       "post",
       `/floating_ips/${floatingIpId}/actions/assign`,
@@ -287,7 +281,7 @@ export class HetznerService {
     }
   }
 
-  async attachVolume(volumeId: number, serverId: number = this.serverId): Promise<void> {
+  async attachVolume(volumeId: number, serverId: number): Promise<void> {
     const { action } = await this.request<{ action: HetznerAction }>("post", `/volumes/${volumeId}/actions/attach`, {
       data: { assignee: { id: serverId, type: "server" }, automount: false },
     });

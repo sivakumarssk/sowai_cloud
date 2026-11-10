@@ -97,8 +97,8 @@ export class VMSetupService {
    * this connection can only ever run /usr/local/sbin/sowsi-routes — see
    * scripts/proxmox-host-setup.sh.
    */
-  async syncHostRoutes(host: string | undefined = process.env.PROXMOX_HOST): Promise<string> {
-    if (!host) throw new Error("no Proxmox host given and PROXMOX_HOST is not set");
+  async syncHostRoutes(host: string): Promise<string> {
+    if (!host) throw new Error("no Proxmox host given: each node's own address comes from its ProxmoxNode row");
     const ssh = await connectWithRetry({ host, username: "root", ...provisioningKey() }, 3);
     try {
       return (await run(ssh, "sync host routes", "sowsi-routes", { timeoutMs: 60_000 })).trim();

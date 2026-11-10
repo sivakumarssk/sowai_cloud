@@ -32,9 +32,9 @@ export type EngineConfig = {
   diskPoolReserveGB: number;
   /** Default size of one disk expansion. */
   diskExpandChunkGB: number;
-  /** Hetzner Volume cost, paise per GB per month (₹5.30 = 530). */
+  /** Hetzner Volume cost, paise per GB per month (₹5.30 = 530). The default is your brief's estimate, not an invoice or API price. */
   volumeCostPerGbPaise: number;
-  /** Size of a Hetzner Volume the engine proposes buying (₹530/month at 100 GB). */
+  /** Size of a Hetzner Volume the engine proposes buying (₹530/month at 100 GB, at that estimate). */
   volumeSizeGB: number;
 
   /** Default size of one RAM increase. */

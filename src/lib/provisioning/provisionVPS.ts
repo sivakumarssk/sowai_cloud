@@ -14,7 +14,7 @@ import { alertAdmins } from "@/lib/adminAlert";
 import { cancelAutopayForService } from "@/lib/billing/subscriptions";
 import { placeOrder } from "@/lib/provisioning/placement";
 import { prismaPlacementDeps } from "@/lib/provisioning/placementDeps";
-import { containerNode, ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
+import { containerNode, inService, ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
 
 export type PlanResources = { cores: number; memory: number; disk: number };
 
@@ -237,9 +237,13 @@ async function releaseResources(
       ];
     }
     // A leftover route to a deleted container is harmless, so this doesn't block the IP release.
-    await vmSetup
-      .syncHostRoutes(ctx.routesHost)
-      .catch((err) => console.error(`[provisioning] route sync after deleting ${vmid} failed:`, err));
+    if (ctx.routesHost) {
+      await vmSetup
+        .syncHostRoutes(ctx.routesHost)
+        .catch((err) => console.error(`[provisioning] route sync after deleting ${vmid} failed:`, err));
+    } else {
+      console.error(`[provisioning] route sync after deleting ${vmid} skipped: no node address known`);
+    }
   }
   if (floatingIpId !== null) {
     try {
@@ -254,9 +258,10 @@ async function releaseResources(
 /** Proxmox client and route-sync host for the node a service's container is on, or why that can't be told. */
 async function clientForService(serviceId: string): Promise<{ client?: ProxmoxService; noNode?: string; nodeName?: string; routesHost?: string }> {
   const service = await prisma.service.findUnique({ where: { id: serviceId }, select: { node: { select: { name: true, ip: true } } } });
-  const nodes = service?.node ? [] : await prisma.proxmoxNode.findMany({ select: { name: true, ip: true } });
+  // A retired node's server may be gone: it's never guessed as the home of a container.
+  const nodes = service?.node ? [] : inService(await prisma.proxmoxNode.findMany({ select: { name: true, ip: true, status: true } }));
   const node = containerNode(service?.node, nodes);
-  if (!node) return { noNode: `service ${serviceId} has no node recorded and ${nodes.length} nodes are registered, so this VM id can't be matched to a container` };
+  if (!node) return { noNode: `service ${serviceId} has no node recorded and ${nodes.length} nodes are in service, so this VM id can't be matched to a container` };
   return { client: proxmoxForNode(node), nodeName: node.name, routesHost: node.ip };
 }
 

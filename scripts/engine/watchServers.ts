@@ -47,9 +47,9 @@ const MB = 1024 ** 2;
     const sim = new SimulatedServers([
       {
         id: "sim_node",
-        name: "sowsi-proxmox-01 (simulated)",
+        name: "sim-node (simulated)",
         ip: "203.0.113.10",
-        hetznerServerId: "168392011",
+        hetznerServerId: "100000001",
         volumes: [],
         ramTotalMB: 8192,
         diskTotalGB: 150,
@@ -74,7 +74,7 @@ const MB = 1024 ** 2;
     const stats = monitor.stats();
     console.log(`\n── poll #${stats.polls} · ${new Date().toLocaleTimeString("en-IN")} · ${stats.lastPollMs} ms`);
     for (const [node, error] of Object.entries(stats.nodeErrors)) console.log(`  ✗ ${node}: ${error}`);
-    if (samples.length === 0) return console.log("  (no nodes — run npm run db:seed to register sowsi-proxmox-01)");
+    if (samples.length === 0) return console.log("  (no nodes in service — register one with scripts/node/install-node.ts)");
     console.table(
       samples.map((s) => ({
         node: s.nodeName,

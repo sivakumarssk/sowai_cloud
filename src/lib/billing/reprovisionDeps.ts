@@ -3,7 +3,7 @@ import { razorpay } from "@/lib/razorpay";
 import { hetzner } from "@/lib/hetzner";
 import { proxmoxForNode, ProxmoxError } from "@/lib/proxmox";
 import { provisionVPS } from "@/lib/provisioning/provisionVPS";
-import { containerNode } from "@/lib/provisioning/nodeTarget";
+import { containerNode, inService } from "@/lib/provisioning/nodeTarget";
 import { chooseNode } from "@/lib/provisioning/placement";
 import { nodeLoads, placementConfig } from "@/lib/provisioning/placementDeps";
 import { prismaEngineLog } from "@/engine/data/engineLog";
@@ -49,12 +49,13 @@ export function prismaReprovisionDeps(): ReprovisionDeps {
 
     async findContainers(s) {
       const found: string[] = [];
-      const nodes = await prisma.proxmoxNode.findMany({ select: { name: true, ip: true } });
+      // A retired node's server may be gone: it's never guessed as the home of a container.
+      const nodes = inService(await prisma.proxmoxNode.findMany({ select: { name: true, ip: true, status: true } }));
       // 1. Its recorded vmid on its recorded node. VM ids repeat across nodes, so never on another one.
       if (s.proxmoxVmId) {
         const node = containerNode(nodes.find((n) => n.name === s.nodeName), nodes);
         if (!node) {
-          found.push(`vmid ${s.proxmoxVmId} with no node recorded and ${nodes.length} nodes registered — can't tell which container that is`);
+          found.push(`vmid ${s.proxmoxVmId} with no node recorded and ${nodes.length} nodes in service — can't tell which container that is`);
         } else {
           try {
             const st = await proxmoxForNode(node).getLXCStatus(Number(s.proxmoxVmId));

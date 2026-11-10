@@ -434,8 +434,9 @@ export async function upsertNode(prisma: PrismaClient, env: Record<string, strin
     location: env.HETZNER_LOCATION || "nbg1",
     ipv6Subnet: env.PROXMOX_IPV6_SUBNET || null,
   };
-  // Hetzner CPX32: 4 vCPU, 8 GB RAM, 160 GB disk, ~₹3,300/month.
-  // The cost is only a starting value too: scripts/node/recompute-node-costs.ts keeps it right.
+  // Starting values only, not facts about the server: the specs are Hetzner's web page for a CPX32
+  // (ServerMonitor measures the real ones), and ₹3,300 is the estimate from your brief
+  // (scripts/node/recompute-node-costs.ts replaces it with the live price).
   const specs = { physicalRamMB: 8192, physicalDiskGB: 160, physicalCpu: 4, monthlyCost: Number(env.PROXMOX_NODE_MONTHLY_COST_PAISE || 330000) };
   return prisma.proxmoxNode.upsert({ where: { name }, update: settings, create: { name, ...settings, ...specs } });
 }

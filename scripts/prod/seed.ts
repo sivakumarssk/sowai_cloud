@@ -1,5 +1,6 @@
 /**
- * Production seed: creates the plans and the ProxmoxNode from .env. Nothing else —
+ * Production seed: creates the plans. Nothing else — no node (nodes are registered by
+ * scripts/node/install-node.ts, each with its own API token),
  * no users (create your account on the site, then scripts/prod/make-admin.ts), no
  * addons, no orders. Safe to run again: on a plan that exists it only updates the
  * name and features, never a price, and it switches off any addon nothing delivers.
@@ -15,7 +16,7 @@ exitUnlessEnvironment();
 
 (async () => {
   const { prisma } = await import("../../src/lib/prisma");
-  const { ADDONS, PLANS, upsertNode, upsertPlans } = await import("../../prisma/catalog");
+  const { ADDONS, PLANS, upsertPlans } = await import("../../prisma/catalog");
   try {
     const ids = await upsertPlans(prisma, { textOnly: true });
     console.log(`Plans: ${ids.length} upserted (${PLANS.map((p) => p.slug).join(", ")})`);
@@ -24,9 +25,7 @@ exitUnlessEnvironment();
     const hidden = await prisma.addon.updateMany({ where: { slug: { in: undelivered }, isActive: true }, data: { isActive: false } });
     console.log(`Addons: ${hidden.count} switched off (${undelivered.join(", ")} aren't delivered)`);
 
-    const node = await upsertNode(prisma);
-    if (node) console.log(`Node: ${node.name} (${node.ip}, Hetzner server ${node.hetznerServerId}, ${node.location}) upserted`);
-    else console.log("Node: skipped — set PROXMOX_NODE, PROXMOX_HOST and HETZNER_SERVER_ID in .env, then run this again");
+    console.log("Nodes: none from the seed. Register one with scripts/node/install-node.ts");
 
     const users = await prisma.user.count();
     console.log(`Users in this database: ${users} (the seed never creates any)`);

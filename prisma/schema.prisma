@@ -399,17 +399,20 @@ model Notification {
 // ═══════════════════════════════════════════════════════════════════
 
 enum NodeStatus {
+  /// Installed by install-node.ts, not opened yet (scripts/node/node-state.ts --open).
   PROVISIONING
   READY
   WARNING
   CRITICAL
+  /// Retired (scripts/node/node-state.ts --retire): out of service, its server may be deleted.
+  /// The row stays for its history; nothing places on it, acts on it or guesses it.
   DECOMMISSIONING
 }
 
 /// A Proxmox host (one Hetzner Cloud server).
 model ProxmoxNode {
   id              String     @id @default(cuid())
-  /// Proxmox node name, e.g. "sowsi-proxmox-01".
+  /// Proxmox node name, e.g. "sowsi-proxmox-02".
   name            String     @unique
   ip              String
   /// Hetzner private-network IP; null until the node joins the private network.
@@ -447,7 +450,7 @@ model ProxmoxNode {
   monthlyCost Int
 
   /// This node's own Proxmox API token, e.g. "root@pam!sowsi" (set by scripts/node/install-node.ts).
-  /// Null = PROXMOX_USER / PROXMOX_TOKEN_ID / PROXMOX_TOKEN_SECRET from .env (node 1).
+  /// Null = no token: the node can't be reached (there's no fallback to .env).
   apiTokenId     String?
   /// AES-256-GCM encrypted (src/lib/crypto.ts).
   apiTokenSecret String?

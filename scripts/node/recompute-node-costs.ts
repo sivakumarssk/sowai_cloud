@@ -1,5 +1,6 @@
 /**
- * Recomputes monthlyCost on every registered node from Hetzner's price and HETZNER_USD_TO_INR.
+ * Recomputes monthlyCost on every node in service from Hetzner's price and HETZNER_USD_TO_INR.
+ * A retired node keeps its saved cost, as history: its server may be gone.
  *
  *   npx tsx scripts/node/recompute-node-costs.ts            # prints old and new, saves nothing
  *   npx tsx scripts/node/recompute-node-costs.ts --apply    # saves them
@@ -22,6 +23,7 @@ const rupees = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { 
   const { nodeCost } = await import("../../src/lib/nodes/nodeCosts");
   const { inrRate } = await import("../../src/lib/provisioning/capacityReport");
   const { prismaEngineLog } = await import("../../src/engine/data/engineLog");
+  const { isRetired } = await import("../../src/lib/provisioning/nodeTarget");
   const { prisma } = await import("../../src/lib/prisma");
   try {
     const rate = inrRate("USD", process.env);
@@ -31,9 +33,13 @@ const rupees = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { 
       console.log(rate.warning);
       if (apply) throw new Error("Set HETZNER_USD_TO_INR before saving costs");
     }
-    const nodes = await prisma.proxmoxNode.findMany({ select: { id: true, name: true, hetznerServerId: true, location: true, monthlyCost: true }, orderBy: { name: "asc" } });
+    const nodes = await prisma.proxmoxNode.findMany({ select: { id: true, name: true, hetznerServerId: true, location: true, monthlyCost: true, status: true }, orderBy: { name: "asc" } });
     if (nodes.length === 0) console.log("No nodes are registered.");
     for (const n of nodes) {
+      if (isRetired(n)) {
+        console.log(`${n.name}: retired, not priced. Still ${rupees(n.monthlyCost)}`);
+        continue;
+      }
       const cost = await nodeCost(n, hetzner, rate.rate);
       if ("skipped" in cost) {
         console.log(`${n.name}: skipped, ${cost.skipped}. Still ${rupees(n.monthlyCost)}`);

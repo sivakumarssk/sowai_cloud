@@ -34,8 +34,8 @@ export const PURCHASES: ReadonlySet<ActionKind> = new Set(["VOLUME_PURCHASE", "S
 export const DEFAULT_ACTION_MODES: Record<ActionKind, ActionMode> = {
   RAM_SCALE: "AUTO", // instant, no cost
   DISK_EXPAND: "ASSISTED", // low cost
-  VOLUME_PURCHASE: "MANUAL", // ₹530/month
-  SERVER_PURCHASE: "MANUAL", // ₹3,300/month
+  VOLUME_PURCHASE: "MANUAL", // ~₹530/month: the estimate from your brief, not an invoice or API price
+  SERVER_PURCHASE: "MANUAL", // ~₹3,300/month: the estimate from your brief; install-node.ts reads the live price
   MIGRATION: "ASSISTED", // causes downtime
   OVERAGE_BILLING: "OFF", // client must opt in
   NOTIFY_CLIENT: "ASSISTED", // clients aren't emailed without an admin's OK

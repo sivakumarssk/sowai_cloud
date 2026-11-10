@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { inService, isRetired } from "@/lib/provisioning/nodeTarget";
 import { proxmoxForNode } from "@/lib/proxmox";
 import type { EngineConfig } from "../config";
 import type { ContainerTarget } from "../actions/types";
@@ -34,11 +35,14 @@ export async function targetForContainer(opts: {
   planRamMB: number;
   planDiskGB: number;
 }): Promise<ContainerTarget> {
-  const nodes = await prisma.proxmoxNode.findMany({ orderBy: { name: "asc" } });
+  const all = await prisma.proxmoxNode.findMany({ orderBy: { name: "asc" } });
+  const nodes = inService(all);
   // VM ids repeat across nodes: with several nodes, one has to be named.
   if (!opts.nodeName && nodes.length > 1) throw new Error(`container ${opts.vmid} could be on any of ${nodes.map((n) => n.name).join(", ")} — pass --node <name>`);
-  const node = opts.nodeName ? nodes.find((n) => n.name === opts.nodeName) : nodes[0];
-  if (!node) throw new Error(`node ${opts.nodeName ?? "(any)"} is not registered — run npm run db:seed`);
+  const named = opts.nodeName ? all.find((n) => n.name === opts.nodeName) : undefined;
+  if (named && isRetired(named)) throw new Error(`node ${named.name} is retired (${named.status}) — nothing acts on it`);
+  const node = opts.nodeName ? named : nodes[0];
+  if (!node) throw new Error(`node ${opts.nodeName ?? "(any)"} is not registered${opts.nodeName ? "" : " in service"} — register one with scripts/node/install-node.ts`);
   const service = await prisma.service.findFirst({
     where: { nodeId: node.id, proxmoxVmId: String(opts.vmid), status: { notIn: ["DELETED", "CANCELLED"] } },
     select: { id: true },

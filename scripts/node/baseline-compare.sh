@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Read-only: what a hand-built node lacks compared with one from install-node.ts.
-# Changes nothing on the node and prints no keys. Run it on node 1 and on a fresh node, then diff.
+# Changes nothing on the node and prints no keys. Run it on a hand-built node and on a fresh one, then diff.
 set -u
 has() { printf '%-30s %s\n' "$1" "$2"; }
 yes_no() { if "$@" >/dev/null 2>&1; then echo yes; else echo NO; fi; }

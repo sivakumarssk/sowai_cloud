@@ -2,10 +2,11 @@
 # One-time Proxmox host setup for Sowsi Cloud container networking. Works on
 # any node: the node's IPv6 /64 and the provisioning key come from the
 # environment. scripts/node/install-node.ts runs it on new nodes (without
-# PROVISIONING_PUBKEY: it installs that key itself, last). By hand, e.g. node 1:
+# PROVISIONING_PUBKEY: it installs that key itself, last). By hand, on a node install-node.ts
+# didn't build:
 #
-#   ssh root@128.140.70.53 \
-#     'IPV6_SUBNET=2a01:4f8:1c16:5f1d MGMT_IP=2.31.11.105 PROVISIONING_PUBKEY="ssh-ed25519 AAAA… sowsi-provisioning" bash -s' \
+#   ssh root@<node ip> \
+#     'IPV6_SUBNET=<the node's /64> MGMT_IP=2.31.11.105 PROVISIONING_PUBKEY="ssh-ed25519 AAAA… sowsi-provisioning" bash -s' \
 #     < scripts/proxmox-host-setup.sh
 #
 # ISOLATION_ONLY=1 MGMT_IP=… bash -s  touches only the isolation pieces, for a node set up by

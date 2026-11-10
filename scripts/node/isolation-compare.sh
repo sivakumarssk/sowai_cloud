@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Read-only: prints what the container isolation rules depend on. Changes nothing
-# on the node and prints no keys. Run it on node 1 and on a fresh node, then diff.
+# on the node and prints no keys. Run it on a hand-built node and on a fresh one, then diff.
 set -u
 sec() { echo; echo "=== $1"; }
 

@@ -110,37 +110,37 @@ export function diskVolumes(items: ContentItem[]): StorageVolume[] {
 /** A Proxmox API token: "user@realm!name" and its secret. */
 export type ProxmoxToken = { tokenId: string; secret: string };
 
-/** The token from .env (node 1): PROXMOX_USER!PROXMOX_TOKEN_ID = PROXMOX_TOKEN_SECRET. */
-export function envToken(): ProxmoxToken {
-  return { tokenId: `${requireEnv("PROXMOX_USER")}!${requireEnv("PROXMOX_TOKEN_ID")}`, secret: requireEnv("PROXMOX_TOKEN_SECRET") };
-}
-
-/** A node's own token (each node generates its own secret), else the .env token (node 1). */
-export function nodeToken(row: { apiTokenId: string | null; apiTokenSecret: string | null } | null, decrypt: (value: string) => string): ProxmoxToken {
-  return row?.apiTokenId && row.apiTokenSecret ? { tokenId: row.apiTokenId, secret: decrypt(row.apiTokenSecret) } : envToken();
+/**
+ * A node's own token: install-node.ts gives every node its own secret and stores it on the row.
+ * There is no fallback to a token in .env, so a node without one is refused, never reached
+ * with another node's credentials.
+ */
+export function nodeToken(nodeName: string, row: { apiTokenId: string | null; apiTokenSecret: string | null } | null, decrypt: (value: string) => string): ProxmoxToken {
+  if (!row) throw new ProxmoxError(`node ${nodeName} is not registered`);
+  if (!row.apiTokenId || !row.apiTokenSecret) throw new ProxmoxError(`node ${nodeName} has no API token of its own — nodes are registered by scripts/node/install-node.ts, which stores one`);
+  return { tokenId: row.apiTokenId, secret: decrypt(row.apiTokenSecret) };
 }
 
 /** Loaded lazily so this module doesn't pull Prisma into everything that imports it. */
 async function registeredToken(nodeName: string): Promise<ProxmoxToken> {
   const { prisma } = await import("@/lib/prisma");
   const { decrypt } = await import("@/lib/crypto");
-  return nodeToken(await prisma.proxmoxNode.findUnique({ where: { name: nodeName }, select: { apiTokenId: true, apiTokenSecret: true } }), decrypt);
+  return nodeToken(nodeName, await prisma.proxmoxNode.findUnique({ where: { name: nodeName }, select: { apiTokenId: true, apiTokenSecret: true } }), decrypt);
 }
 
 export class ProxmoxService {
   private client: Promise<AxiosInstance> | null = null;
 
   /**
-   * Without a target, talks to the node in PROXMOX_NODE / PROXMOX_HOST with the .env token.
-   * With one, talks to that node's API directly (nodes aren't clustered, so each has its own
-   * API) with the node's own token, or `token` when given (a node being installed).
+   * Talks to one node's API directly (nodes aren't clustered, so each has its own API), with
+   * the node's own token from its row, or `token` when given (a node being installed).
    */
-  constructor(private readonly target: { node?: string; host?: string; token?: ProxmoxToken } = {}) {}
+  constructor(private readonly target: { node: string; host: string; token?: ProxmoxToken }) {}
 
   // Config is read on first use rather than at import time so a missing env
   // var doesn't break `next build` for every route that imports this module.
   private get node(): string {
-    return this.target.node ?? requireEnv("PROXMOX_NODE");
+    return this.target.node;
   }
 
   /** Where container root disks live. */
@@ -167,9 +167,9 @@ export class ProxmoxService {
   }
 
   private async createClient(): Promise<AxiosInstance> {
-    const host = this.target.host ?? requireEnv("PROXMOX_HOST");
+    const host = this.target.host;
     const port = process.env.PROXMOX_PORT || "8006";
-    const { tokenId, secret } = this.target.token ?? (this.target.node && this.target.host ? await registeredToken(this.target.node) : envToken());
+    const { tokenId, secret } = this.target.token ?? (await registeredToken(this.target.node));
 
     return axios.create({
       baseURL: `https://${host}:${port}/api2/json`,
@@ -522,8 +522,6 @@ function toProxmoxError(err: unknown, context: string): ProxmoxError {
   }
   return new ProxmoxError(`${context} failed: ${err instanceof Error ? err.message : String(err)}`);
 }
-
-export const proxmox = new ProxmoxService();
 
 const nodeClients = new Map<string, ProxmoxService>();
 

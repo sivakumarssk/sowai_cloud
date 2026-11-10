@@ -25,7 +25,7 @@ export async function rescueRefusal({ deps, rec, s, allowDowntime, customerProbl
   const serverId = rec.hetznerServerId;
   if (rec.repairedAt) return `a rescue repair was already tried on ${rec.repairedAt.toISOString()}; it runs only once`;
   if (!serverId) return "no server recorded";
-  if (serverId === s.protectedServerId) return `server ${serverId} is HETZNER_SERVER_ID (node 1): never power-cycled by the installer`;
+  if (serverId === s.protectedServerId) return `server ${serverId} is HETZNER_SERVER_ID (a hand-built server): never power-cycled by the installer`;
   const server = await deps.hetzner.getServer(Number(serverId));
   if (!server) return `server ${serverId} no longer exists at Hetzner`;
   if (server.labels[installLabel] !== "1") return `server ${serverId} wasn't created by install-node`;

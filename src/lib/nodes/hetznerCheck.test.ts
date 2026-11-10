@@ -140,3 +140,108 @@ test("says so if Hetzner reports anything but dollars", async () => {
   const eur = setup({ currency: "EUR" });
   assert.match(formatResults(await runHetznerChecks(eur.get, { serverType: "cpx22", location: "nbg1" })), /currency EUR — costs here are worked out from USD/);
 });
+
+// ── Floating IPs that bill for nothing, and --expect-gone ────────────
+
+const NODE = { name: "sowsi-proxmox-02", status: "READY" };
+
+test("a Floating IP that's unassigned, or on a server that isn't a node in service, is flagged", async () => {
+  const { hz, get } = setup();
+  const h = new HetznerService({ adapter: hz.adapter, token: "t", pollMs: 1 });
+  const node = await h.createServer({ name: "sowsi-proxmox-02", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const mgmt = await h.createServer({ name: "sowsi-mgmt-01", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const old = await h.createServer({ name: "sowsi-proxmox-01", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const onNode = await h.buyFloatingIP("customer", "nbg1");
+  await h.assignFloatingIP(onNode.id, node.id);
+  const loose = await h.buyFloatingIP("forgotten", "nbg1");
+  const onMgmt = await h.buyFloatingIP("misplaced", "nbg1");
+  await h.assignFloatingIP(onMgmt.id, mgmt.id);
+  const onRetired = await h.buyFloatingIP("left behind", "nbg1");
+  await h.assignFloatingIP(onRetired.id, old.id);
+  const nodes = [
+    { ...NODE, hetznerServerId: String(node.id) },
+    { name: "sowsi-proxmox-01", hetznerServerId: String(old.id), status: "DECOMMISSIONING" },
+  ];
+  hz.requests.length = 0;
+  const results = await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", nodes });
+  const text = formatResults(results);
+  assert.match(text, new RegExp(`Floating IP ${onNode.id} \\(198\\.51\\.100\\.7, "customer"\\) on node sowsi-proxmox-02\\n`));
+  assert.doesNotMatch(text, new RegExp(`FLAG Floating IP ${onNode.id} `));
+  assert.match(text, new RegExp(`FLAG Floating IP ${loose.id} \\(198\\.51\\.100\\.7, "forgotten"\\) is unassigned: billed \\$0\\.0056/hour, up to \\$3\\.50/month`));
+  assert.match(text, new RegExp(`FLAG Floating IP ${onMgmt.id} .* is on server ${mgmt.id}, which isn't a registered node`));
+  assert.match(text, new RegExp(`FLAG Floating IP ${onRetired.id} .* is on sowsi-proxmox-01, a retired node`));
+  assert.match(text, /3 flag\(s\): see the FLAG lines above\./);
+  assert.ok(results.every((r) => r.ok), "flags warn; they don't fail an endpoint");
+  assert.ok(hz.requests.every((r) => r.method === "GET"), "GET only");
+
+  const blind = formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", nodes: { problem: "the database couldn't be read: refused" } }));
+  assert.match(blind, /registered nodes unknown \(the database couldn't be read: refused\): only unassigned Floating IPs can be flagged/);
+  assert.match(blind, new RegExp(`FLAG Floating IP ${loose.id} `), "an unassigned one is still flagged");
+  assert.doesNotMatch(blind, new RegExp(`FLAG Floating IP ${onMgmt.id} `), "nothing is claimed about servers it can't place");
+});
+
+test("--expect-gone fails while the server or anything it held is still there, and passes once it's all gone", async () => {
+  const { hz, get } = setup({ primaryIpsSurviveDelete: true });
+  const h = new HetznerService({ adapter: hz.adapter, token: "t", pollMs: 1 });
+  const keep = await h.createServer({ name: "sowsi-mgmt-01", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const old = await h.createServer({ name: "sowsi-proxmox-01", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const id = String(old.id);
+  const run = async () => {
+    const results = await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", nodes: [], expectGone: [id] });
+    return { gone: results.find((r) => r.endpoint === `EXPECT GONE: server ${id}`)!, text: formatResults(results) };
+  };
+
+  const before = await run();
+  assert.equal(before.gone.ok, false);
+  assert.match(before.text, new RegExp(`FAIL EXPECT GONE: server ${id}: NOT gone`));
+  assert.match(before.text, new RegExp(`LEFT server ${id} still exists \\(sowsi-proxmox-01\\)`));
+  assert.match(before.text, new RegExp(`LEFT server ${id} is still in the server list`));
+  assert.match(before.text, new RegExp(`LEFT Primary IP \\d+ \\(203\\.0\\.113\\.\\d+\\) is still on server ${id}`));
+
+  // Deleted by hand in the console, keeping its Primary IPs (they then sit unassigned).
+  hz.state.servers.delete(old.id);
+  for (const ip of hz.state.primaryIps.values()) if (ip.assignee_id === old.id) Object.assign(ip, { assignee_id: null, assignee_type: "unassigned" });
+  const leftovers = await run();
+  assert.equal(leftovers.gone.ok, false, "its Primary IPs survived the delete");
+  assert.match(leftovers.text, new RegExp(`GET /servers/${id}: 404, the server is gone`));
+  assert.match(leftovers.text, /LEFT Primary IP \d+ \(.*\) is unattached and bills hourly: if it was this server's, remove it in the console/);
+
+  for (const ip of [...hz.state.primaryIps.values()]) if (ip.assignee_id === null) hz.state.primaryIps.delete(ip.id);
+  hz.state.images.set(9001, { id: 9001, type: "snapshot", description: "node 1 before retiring", created_from: { id: old.id, name: "sowsi-proxmox-01" } });
+  hz.requests.length = 0;
+  const clean = await run();
+  assert.equal(clean.gone.ok, true, clean.text);
+  assert.match(clean.text, new RegExp(`OK   EXPECT GONE: server ${id}: gone, and nothing it held is left`));
+  assert.match(clean.text, new RegExp(`no Primary IP, Floating IP or Volume left on server ${id}, and no unattached Primary IPs`));
+  assert.match(clean.text, new RegExp(`snapshot 9001 \\(node 1 before retiring\\) of server ${id} still exists: billed until removed`), "a snapshot is shown, and left to you");
+  assert.match(clean.text, /All 11 checks passed/);
+  assert.ok(hz.requests.every((r) => r.method === "GET"), "the check only reads");
+  assert.ok(hz.requests.some((r) => r.path === `/servers/${id}`) && hz.requests.some((r) => r.path === "/images" && r.params.type === "snapshot"));
+  void keep;
+});
+
+test("--expect-gone also fails on a Floating IP or Volume still pointing at the server, and on a bad id", async () => {
+  const { hz, get } = setup();
+  const h = new HetznerService({ adapter: hz.adapter, token: "t", pollMs: 1 });
+  const old = await h.createServer({ name: "sowsi-proxmox-01", serverType: "cpx22", location: "nbg1", image: "debian-12", sshKeyIds: [], labels: {} });
+  const fip = await h.buyFloatingIP("node 1", "nbg1");
+  await h.assignFloatingIP(fip.id, old.id);
+  const vol = await h.createVolume({ name: "data", sizeGB: 10, location: "nbg1" });
+  await h.attachVolume(vol.id, old.id);
+  await h.deleteServer(old.id).catch(() => undefined);
+  hz.state.servers.delete(old.id);
+  const text = formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", nodes: [], expectGone: [String(old.id)] }));
+  assert.match(text, new RegExp(`LEFT Floating IP ${fip.id} \\(198\\.51\\.100\\.7\\) is still on server ${old.id}`));
+  assert.match(text, new RegExp(`LEFT Volume ${vol.id} \\(data\\) is still attached to server ${old.id}`));
+  // Hetzner failing isn't proof that the server is gone.
+  const flaky: typeof get = async (p, params) => {
+    if (p === "/servers/424242") throw Object.assign(new Error("Request failed with status code 503"), { response: { status: 503 } });
+    return get(p, params);
+  };
+  const down = (await runHetznerChecks(flaky, { serverType: "cpx22", location: "nbg1", nodes: [], expectGone: ["424242"] })).at(-1)!;
+  assert.equal(down.ok, false);
+  assert.ok(down.notes.some((n) => /^LEFT GET \/servers\/424242 couldn't tell: /.test(n)), down.notes.join("\n"));
+  const bad = await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", expectGone: ["abc"] });
+  assert.equal(bad.at(-1)!.ok, false);
+  assert.match(bad.at(-1)!.detail, /"abc" isn't a server id/);
+});

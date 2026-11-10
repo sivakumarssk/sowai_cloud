@@ -21,7 +21,7 @@ Every process (the web app, `next build`, the engine and every script) reads
 | Hetzner / Proxmox tokens | refused unless `ALLOW_REAL_INFRA=1` | required |
 | Billing cron (`/api/cron/billing`) | refuses (503) | runs |
 | Engine (`decide.ts --live`) | refuses | off for now: `sowsi-engine` isn't running, and no deploy step starts it |
-| Seed | `npm run db:seed` (demo admin with a known password) | `npx tsx scripts/prod/seed.ts` (plans and node only, no users) |
+| Seed | `npm run db:seed` (demo admin with a known password) | `npx tsx scripts/prod/seed.ts` (plans only: no node, no users) |
 | Database | the **old** database | a **new**, empty database |
 
 ### Layout
@@ -35,7 +35,8 @@ your machine (development)            sowsi-mgmt-01 2.31.11.105 (production)
                                         cron: POST /api/cron/billing every 5–15 min
                                         reaches Proxmox :8006 (closed to everything else)
 
-sowsi-proxmox-01 128.140.70.53 (Hetzner CPX32, nbg1): LXC containers, one Floating IP each
+sowsi-proxmox-NN (Hetzner, nbg1, installed by scripts/node/install-node.ts): LXC containers, one Floating IP each
+sowsi-proxmox-01 128.140.70.53: the hand-built first node, retired (row kept as DECOMMISSIONING, server deleted)
 ```
 
 **The old database holds one real client** with a live Razorpay subscription.
@@ -156,7 +157,12 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
      repairs the network once if the evidence supports it, then resumes. Rescue
      is downtime, so a node holding customers is refused unless you pass
      `--allow-downtime`.
-- **First boot is IPv4 only,** as on node 1. IPv6 is added once SSH is back.
+- **First boot is IPv4 only,** as on the hand-built first node. IPv6 is added once SSH is back.
+- **Opening and retiring:** a new node registers closed. `scripts/node/node-state.ts --name <node> --open`
+  opens it for orders; `--retire` takes one out of service (status DECOMMISSIONING) and keeps its row
+  and history. Both are dry runs unless `--apply --approved-by <name>`. Retiring refuses while the node
+  has a live service, a volume, an open migration or an open approval. Nodes never come from `.env`:
+  each has its own address and API token on its row, and a node without a token is refused.
 - **DNS is a plain `/etc/resolv.conf`,** written before the reboot and checked
   again after it. The image's link into `/run` is empty after a reboot once
   DHCP is gone. vmbr0 also carries `dns-nameservers` with the same servers: it

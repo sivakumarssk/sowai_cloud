@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { inService, isRetired } from "@/lib/provisioning/nodeTarget";
 import { hetzner } from "@/lib/hetzner";
 import { proxmoxForNode } from "@/lib/proxmox";
 import type { VolumeManagerDeps, VolumeNode } from "../actions/VolumeManager";
@@ -15,10 +16,14 @@ export function parseMountOutput(output: string): { storage: string; path: strin
   return { storage, path };
 }
 
+/** The named node, or the only one in service. Never a retired node, and never a guess among several. */
 export async function volumeNode(nodeName?: string): Promise<VolumeNode> {
-  const name = nodeName ?? process.env.PROXMOX_NODE;
-  const node = await prisma.proxmoxNode.findFirst({ where: name ? { name } : {}, orderBy: { name: "asc" } });
-  if (!node) throw new Error(`node ${name ?? "(any)"} is not registered — run npm run db:seed`);
+  const all = await prisma.proxmoxNode.findMany({ orderBy: { name: "asc" } });
+  const live = inService(all);
+  if (!nodeName && live.length > 1) throw new Error(`${live.length} nodes are in service (${live.map((n) => n.name).join(", ")}) — pass --node <name>`);
+  const node = nodeName ? all.find((n) => n.name === nodeName) : live[0];
+  if (!node) throw new Error(nodeName ? `node ${nodeName} is not registered` : "no node is in service — register one with scripts/node/install-node.ts");
+  if (isRetired(node)) throw new Error(`node ${node.name} is retired (${node.status}) — no volume is bought for or attached to it`);
   return { id: node.id, name: node.name, ip: node.ip, hetznerServerId: node.hetznerServerId, location: node.location };
 }
 

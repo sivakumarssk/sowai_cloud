@@ -923,7 +923,7 @@ test("--destroy: plan by default; refuses node 1, servers it didn't create, and 
   assert.match(plan.lines.join("\n"), /delete Hetzner server[\s\S]*remove ProxmoxNode sowsi-proxmox-02/);
   assert.equal(servers(w).size, 1, "plan changes nothing");
 
-  assert.match((await planDestroy(w.deps, "168392011", settings)).problems.join(), /node 1/);
+  assert.match((await planDestroy(w.deps, "168392011", settings)).problems.join(), /HETZNER_SERVER_ID \(a hand-built server\) — never destroyed/);
   servers(w).set(777, { id: 777, name: "someone-else", status: "running", server_type: { name: "cpx22" }, location: { name: "nbg1" }, public_net: { ipv4: { ip: "1.2.3.4" }, ipv6: null }, labels: {} });
   assert.match((await planDestroy(w.deps, "777", settings)).problems.join(), /wasn't created by install-node/);
   w.nodes[0].services = 1;
@@ -1220,7 +1220,7 @@ test("never node 1, and never a server the installer didn't create", async () =>
   const one = await darkServer();
   const id = String([...servers(one).keys()][0]);
   const r = await executeInstall(resumeWorld(one, { renameNic: true }).deps, opts({ keepOnFailure: true }), { ...settings, protectedServerId: id });
-  assert.match((r as { error: string }).error, /HETZNER_SERVER_ID \(node 1\)/);
+  assert.match((r as { error: string }).error, /HETZNER_SERVER_ID \(a hand-built server\)/);
   ok(noRescueTraffic(one));
 
   const other = await darkServer();

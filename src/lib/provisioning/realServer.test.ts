@@ -58,6 +58,7 @@ test("recognises the database refusing a fake ACTIVE", () => {
 // ── Buy is hidden for plans no node can hold ─────────────────────────
 
 const config = { ramOvercommit: 1, diskOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 1536 };
+// Test values, not measurements of a real server.
 const cpx32 = { name: "sowsi-proxmox-01", status: "READY", physicalRamMB: 7940, physicalDiskGB: 150 };
 const cpx42 = { ...cpx32, physicalRamMB: 15995, physicalDiskGB: 314 };
 const plans = {
@@ -71,10 +72,16 @@ const plans = {
 test("plans that fit no registered node (or have no automated provisioning) can't be bought", () => {
   const ok = (p: (typeof plans)[keyof typeof plans], nodes = [cpx32]) => planAvailability(p, nodes, config).orderable;
   assert.deepEqual([ok(plans.basic), ok(plans.pro), ok(plans.elite), ok(plans.dedicatedPro), ok(plans.s4)], [true, true, false, false, false]);
-  // After rescaling the node to a CPX42: 8 GB / 160 GB fits, 16 GB / 320 GB still doesn't (measured RAM < 16384 MB, 294 GB usable).
+  // A bigger test node: 8 GB / 160 GB fits, 16 GB / 320 GB still doesn't (its RAM is under 16384 MB, 294 GB usable).
   assert.deepEqual([ok(plans.elite, [cpx42]), ok(plans.dedicatedPro, [cpx42])], [true, false]);
   assert.equal(ok(plans.basic, []), false, "no node registered");
   assert.equal(ok(plans.basic, [{ ...cpx32, status: "DECOMMISSIONING" }]), false);
+  // Node 1 retired and nothing else open: every plan is "Currently unavailable", with the true reason.
+  const retired = { ...cpx32, status: "DECOMMISSIONING" };
+  for (const p of Object.values(plans)) assert.equal(ok(p, [retired]), false);
+  const none = planAvailability(plans.basic, [retired, { ...cpx42, name: "sowsi-proxmox-02", status: "PROVISIONING" }], config);
+  assert.ok(!none.orderable && none.reason === "no Proxmox node is in service (registered nodes are retired or not opened yet)", JSON.stringify(none));
+  assert.equal(ok(plans.basic, [retired, { ...cpx42, name: "sowsi-proxmox-02" }]), true, "a new node in service makes plans buyable again");
   const why = planAvailability(plans.elite, [cpx32], config);
   assert.ok(!why.orderable && /even when empty/.test(why.reason));
 });

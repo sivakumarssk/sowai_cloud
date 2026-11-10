@@ -6,7 +6,7 @@
  *   npx tsx scripts/engine/volume.ts --size 10 --execute --approved-by NAME   # buy, attach, mount, register as storage
  *   npx tsx scripts/engine/volume.ts --list                              # Volumes in the database + what's on them
  *   npx tsx scripts/engine/volume.ts --remove <id> --approved-by NAME    # unmount + delete (refused while disks are on it)
- *   add --node <name> for a node other than PROXMOX_NODE
+ *   add --node <name> when more than one node is in service (a retired node is refused)
  *
  * Every purchase is checked against this month's ₹5,000 engine spend cap;
  * going over it needs --allow-over-cap as well.

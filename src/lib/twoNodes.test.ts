@@ -10,6 +10,7 @@ import { prismaReprovisionDeps } from "./billing/reprovisionDeps";
 import type { ReprovisionSnapshot } from "./billing/reprovision";
 import { containerNode } from "./provisioning/nodeTarget";
 import { prismaRamDeps, targetForContainer, targetForService } from "@/engine/data/actionDeps";
+import { volumeNode } from "@/engine/data/volumeDeps";
 import { prismaContainerDeps } from "@/engine/data/containerDeps";
 import { ContainerMonitor } from "@/engine/monitors/ContainerMonitor";
 import { EventBus } from "@/engine/core/EventBus";
@@ -47,8 +48,9 @@ const service = (id: string, nodeId: string | null, over: Record<string, unknown
 beforeEach(() => {
   db.nodes.length = 0;
   db.nodes.push(
-    // Node 1 has no token of its own: .env. Node 2 generated its own secret.
-    { id: "n1", name: "node-1", ip: NODE_1, status: "READY", apiTokenId: null, apiTokenSecret: null },
+    // Each node generated its own secret. node-1's is the one .env used to hold, which is still set
+    // (see testing/twoNodes.ts) to prove nothing reads it from there.
+    { id: "n1", name: "node-1", ip: NODE_1, status: "READY", apiTokenId: "root@pam!first", apiTokenSecret: encrypt("node-1-env-secret") },
     { id: "n2", name: "node-2", ip: NODE_2, status: "READY", apiTokenId: "root@pam!sowsi", apiTokenSecret: encrypt("node-2-secret") }
   );
   db.services.length = 0;
@@ -76,7 +78,7 @@ test("suspending a node-2 customer stops their container and never touches node 
   assert.deepEqual(requestsTo(NODE_1), [], "no request reached node 1");
 });
 
-test("suspending a node-1 customer leaves node 2 alone, with node 1's .env token", async () => {
+test("suspending a node-1 customer leaves node 2 alone, with node 1's own token", async () => {
   await suspendForNonPayment("svc_on_1", "test");
   assert.equal(on("node-1")!.status, "stopped");
   assert.equal(on("node-2")!.status, "running");
@@ -138,7 +140,7 @@ test("cancelling deletes the container on the service's own node", async () => {
 
 test("cancelling a service with no node recorded deletes nothing while several nodes exist; the VM id is kept for a person", async () => {
   Object.assign(row("svc_on_2"), { nodeId: null, hetznerFloatingIpId: "77" });
-  await assert.rejects(deprovisionVPS("svc_on_2"), /has no node recorded and 2 nodes are registered/);
+  await assert.rejects(deprovisionVPS("svc_on_2"), /has no node recorded and 2 nodes are in service/);
   assert.ok(on("node-1"));
   assert.ok(on("node-2"));
   assert.deepEqual(cluster.requests, []);
@@ -182,7 +184,7 @@ test("reprovision: finds it on its own node, and by name on any node", async () 
 test("reprovision: a VM id with no node recorded is reported, not looked up on a guessed node", async () => {
   cluster.requests.length = 0;
   const found = await prismaReprovisionDeps().findContainers(snapshot({ id: "other", proxmoxVmId: "100" }));
-  assert.deepEqual(found, ["vmid 100 with no node recorded and 2 nodes registered — can't tell which container that is"]);
+  assert.deepEqual(found, ["vmid 100 with no node recorded and 2 nodes in service — can't tell which container that is"]);
   assert.ok(!cluster.requests.some((r) => r.path.endsWith("/status/current")));
 });
 
@@ -195,6 +197,57 @@ test("--vmid without --node is refused with several nodes; with --node it's that
   await assert.rejects(targetForContainer({ nodeName: "node-9", vmid: 100, planRamMB: 0, planDiskGB: 0 }), /node-9 is not registered/);
   db.nodes.splice(1, 1);
   assert.equal((await targetForContainer({ vmid: 100, planRamMB: 0, planDiskGB: 0 })).serviceId, "svc_on_1", "one node: nothing to choose");
+});
+
+// ── A node without its own token, and a retired node ─────────────────
+
+test("a node without its own token is refused, never reached with .env's token", async () => {
+  const NODE_3 = "10.0.0.3";
+  db.nodes.push({ id: "n3", name: "node-3", ip: NODE_3, status: "READY", apiTokenId: null, apiTokenSecret: null });
+  cluster.containers.set("node-3", new Map([[100, ct("sowsi-svc_on_3")]]));
+  cluster.tokens.set(NODE_3, "root@pam!first=node-1-env-secret"); // would let .env's token in
+  db.services.push(service("svc_on_3", "n3"));
+  await assert.rejects(deprovisionVPS("svc_on_3"), /node-3 has no API token of its own/);
+  assert.deepEqual(requestsTo(NODE_3), [], "nothing was sent to it");
+  assert.ok(on("node-3"), "its container is untouched");
+});
+
+const retire = (id: string) => Object.assign(db.nodes.find((n) => n.id === id)!, { status: "DECOMMISSIONING" });
+
+test("a retired node is never guessed as a container's home: with one node in service, that node is", async () => {
+  retire("n1");
+  cluster.containers.get("node-1")!.delete(100);
+  Object.assign(row("svc_on_2"), { nodeId: null });
+  await deprovisionVPS("svc_on_2");
+  assert.equal(on("node-2"), undefined, "deleted on the node in service");
+  assert.deepEqual(requestsTo(NODE_1), [], "the retired node was never contacted");
+});
+
+test("reprovision doesn't look on a retired node", async () => {
+  retire("n2");
+  const found = await prismaReprovisionDeps().findContainers(snapshot({ id: "other", proxmoxVmId: "100" }));
+  assert.deepEqual(found, ["vmid 100 on node-1 (running)"], "one node in service: that one");
+  assert.deepEqual(requestsTo(NODE_2), []);
+});
+
+test("engine scripts: a retired node is refused by name and never picked by default", async () => {
+  retire("n1");
+  assert.equal((await targetForContainer({ vmid: 100, planRamMB: 0, planDiskGB: 0 })).serviceId, "svc_on_2", "the only node in service");
+  await assert.rejects(targetForContainer({ nodeName: "node-1", vmid: 100, planRamMB: 0, planDiskGB: 0 }), /node node-1 is retired \(DECOMMISSIONING\)/);
+  retire("n2");
+  await assert.rejects(targetForContainer({ vmid: 100, planRamMB: 0, planDiskGB: 0 }), /not registered in service/);
+  assert.deepEqual(cluster.requests, []);
+});
+
+test("volumes: never for a retired node, and never a guess among several", async () => {
+  await assert.rejects(volumeNode(), /2 nodes are in service \(node-1, node-2\) — pass --node/);
+  assert.equal((await volumeNode("node-2")).name, "node-2");
+  retire("n1");
+  assert.equal((await volumeNode()).name, "node-2", "the only node in service");
+  await assert.rejects(volumeNode("node-1"), /node node-1 is retired \(DECOMMISSIONING\) — no volume is bought for or attached to it/);
+  retire("n2");
+  await assert.rejects(volumeNode(), /no node is in service/);
+  await assert.rejects(volumeNode("node-9"), /node node-9 is not registered/);
 });
 
 test("RAM scaling acts on the service's own node", async () => {

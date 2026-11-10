@@ -50,7 +50,7 @@ const MB = 1024 ** 2;
     const cluster = new SimulatedCluster([
       {
         id: "sim_node",
-        name: "sowsi-proxmox-01 (simulated)",
+        name: "sim-node (simulated)",
         ip: "203.0.113.10",
         containers: [
           { vmid: 101, name: "client-a", serviceId: "svc_aaaa", ramMB: 2048, diskGB: 40, cores: 1, ramPct: steps(40, 60, 78, 88, 96), diskPct: flat(35), cpuPct: flat(12) },

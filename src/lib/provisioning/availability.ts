@@ -2,6 +2,7 @@
 // built for real: a VPS plan that fits on at least one registered node (even
 // an empty one), never a plan with no automated provisioning.
 
+import { isRetired } from "./nodeTarget";
 import { fitsWhenEmpty, type Need, type PlacementConfig } from "./placement";
 
 export type NodeCapacity = { name: string; status: string; physicalRamMB: number; physicalDiskGB: number; monitor?: { hostUsedRamMB: number | null } | null };
@@ -14,9 +15,9 @@ export const UNAVAILABLE_LABEL = "Currently unavailable";
 export function planAvailability(plan: { category: string; ramGB: number | null; storageGB: number | null }, nodes: NodeCapacity[], config: PlacementConfig): Availability {
   if (plan.category !== "VPS") return { orderable: false, reason: `no automated provisioning for ${plan.category} plans yet` };
   const need: Need = { ramMB: (plan.ramGB ?? 0) * 1024, diskGB: plan.storageGB ?? 0 };
-  // A node still PROVISIONING (installed, not opened by hand) takes no orders, so it doesn't make plans buyable.
-  const usable = nodes.filter((n) => n.status !== "DECOMMISSIONING" && n.status !== "PROVISIONING");
-  if (usable.length === 0) return { orderable: false, reason: "no Proxmox node is registered" };
+  // A node still PROVISIONING (installed, not opened yet) or retired takes no orders, so it doesn't make plans buyable.
+  const usable = nodes.filter((n) => !isRetired(n) && n.status !== "PROVISIONING");
+  if (usable.length === 0) return { orderable: false, reason: nodes.length ? "no Proxmox node is in service (registered nodes are retired or not opened yet)" : "no Proxmox node is registered" };
   if (!usable.some((n) => fitsWhenEmpty(n, need, config))) {
     const largest = usable.reduce((a, b) => (b.physicalRamMB > a.physicalRamMB ? b : a));
     return {

@@ -92,6 +92,8 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
     floatingIps: new Map<number, Row>(),
     volumes: new Map<number, Row>(),
     actions: new Map<number, { row: Row; polls: number }>(),
+    /** Snapshots: GET /images?type=snapshot. */
+    images: new Map<number, Row>(),
   };
   const requests: RecordedRequest[] = [];
 
@@ -138,6 +140,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
         pricing: {
           currency: cfg.currency ?? "USD",
           vat_rate: "0.00",
+          // Made up for the tests, not read from Hetzner: Primary IPv4 $0.50/month, Volumes $0.05/GB.
           primary_ips: [
             { type: "ipv4", prices: [{ location: "nbg1", ...price("0.0008", "0.50") }] },
             { type: "ipv6", prices: [{ location: "nbg1", ...price("0.0000", "0.00") }] },
@@ -227,6 +230,8 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
       const rows = [...state.actions.values()].map((a) => a.row);
       return ok(list("actions", rows));
     }
+
+    if (path === "/images" && method === "GET") return ok(list("images", [...state.images.values()].filter((im) => !params.type || im.type === params.type)));
 
     // ── primary IPs ──
     if (path === "/primary_ips" && method === "GET") return ok(list("primary_ips", [...state.primaryIps.values()]));

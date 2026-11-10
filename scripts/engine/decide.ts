@@ -137,7 +137,7 @@ async function simulated(
   type Decision = import("../../src/engine/core/decisions").Decision;
   type ApprovalStore = import("../../src/engine/core/ActionExecutor").ApprovalStore;
 
-  const node = { id: "sim_node", name: "sowsi-proxmox-01 (sim)", ip: "203.0.113.10" };
+  const node = { id: "sim_node", name: "sim-node (simulated)", ip: "203.0.113.10" };
   const nodeRam = steps(55, 72, 78, 86, 93);
   const cluster = new SimulatedCluster([
     {
@@ -152,7 +152,7 @@ async function simulated(
   const servers = new SimulatedServers([
     {
       ...node,
-      hetznerServerId: "168392011",
+      hetznerServerId: "100000001",
       volumes: [],
       ramTotalMB: 8192,
       diskTotalGB: 150,

@@ -7,7 +7,11 @@ export type ReportPlan = { name: string; need: Need };
 /** Monthly rates in paise, as on the Plan row. */
 export type VpsPrices = { intro1Year: number | null; intro2Year: number | null; monthly: number | null; renewal: number | null };
 
-/** Hetzner's documented sizes. A real node measures less: a cpx22 sold as 4 GB / 80 GB reports 3817 MB / 74 GB. */
+/**
+ * Hetzner's sizes as its public price page listed them (read 2026-10, not from the API); the API confirmed
+ * only cpx22 (4 GB / 80 GB). A real node measures less: your cpx22 test node reported 3817 MB / 74 GB.
+ * Printed as ESTIMATE; hetzner-check --type <type> shows what the API says.
+ */
 export const DOCUMENTED_SIZES = [
   { type: "cpx22", ramGB: 4, diskGB: 80 },
   { type: "cpx32", ramGB: 8, diskGB: 160 },

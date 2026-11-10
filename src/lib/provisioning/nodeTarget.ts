@@ -22,6 +22,14 @@ export function nodeTarget(node: { name: string; ip: string; hetznerServerId: st
 }
 
 /**
+ * A retired node: out of service (its server may already be deleted). The row stays for its
+ * history, but nothing places on it, acts on it, or guesses it as the node of a container.
+ */
+export const RETIRED_STATUS = "DECOMMISSIONING";
+export const isRetired = (node: { status: string }) => node.status === RETIRED_STATUS;
+export const inService = <N extends { status: string }>(nodes: N[]): N[] => nodes.filter((n) => !isRetired(n));
+
+/**
  * The node holding a container. VM ids repeat across nodes (each starts at 100), so
  * a row with no node recorded can only be trusted while there is exactly one node.
  * Null = it can't be told which container that VM id means: touch nothing.
