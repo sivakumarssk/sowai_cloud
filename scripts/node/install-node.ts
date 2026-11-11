@@ -6,6 +6,11 @@
  *   npx tsx scripts/node/install-node.ts --name sowsi-proxmox-02 --type cpx22 --execute --approved-by <name> [--ipv4] [--keep-on-failure]
  *   npx tsx scripts/node/install-node.ts --destroy <hetznerServerId>                              # plan
  *   npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> --execute --approved-by <name>
+ *       [--release-floating-ip <id>]... [--keep-floating-ip <id>]...
+ *
+ * --destroy releases the installer's own Floating IPs (the node's gateway, a test IP). Any other
+ * Floating IP on the server stops the plan until you choose: --release-floating-ip <id> releases it,
+ * --keep-floating-ip <id> leaves it (unassigned, still billed). Several: repeat, or 12,34.
  *
  * --execute buys the server (hourly billing starts) and runs every step; a re-run with the same
  * --name resumes at the first step that didn't finish. A failure before registration deletes the
@@ -39,6 +44,9 @@ const value = (name: string) => {
   const v = i >= 0 ? argv[i + 1] : undefined;
   return v && !v.startsWith("--") ? v : undefined;
 };
+/** Every value of a repeatable flag, comma lists split. */
+const values = (name: string) =>
+  argv.flatMap((a, i) => (a === name && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1].split(",") : [])).map((v) => v.trim()).filter(Boolean);
 
 /** One install at a time on this machine (they share the install key). */
 function lock(): () => void {
@@ -79,8 +87,10 @@ function lock(): () => void {
     // ── --destroy ──
     const destroyId = value("--destroy");
     if (flag("--destroy")) {
-      if (!destroyId) throw new Error("usage: --destroy <hetznerServerId> [--execute --approved-by <name>]");
-      const plan = await N.planDestroy(deps, destroyId, settings);
+      if (!destroyId) throw new Error("usage: --destroy <hetznerServerId> [--execute --approved-by <name>] [--release-floating-ip <id>] [--keep-floating-ip <id>]");
+      const choices = { release: values("--release-floating-ip"), keep: values("--keep-floating-ip") };
+      for (const id of [...choices.release, ...choices.keep]) if (!/^\d+$/.test(id)) throw new Error(`a Floating IP id is a number, got "${id}"`);
+      const plan = await N.planDestroy(deps, destroyId, settings, choices);
       console.log(`Destroy Hetzner server ${destroyId}:`);
       for (const l of plan.lines) console.log(`  · ${l}`);
       if (!plan.ok) {
@@ -93,7 +103,7 @@ function lock(): () => void {
         return;
       }
       unlock = lock();
-      const r = await N.executeDestroy(deps, destroyId, approvedBy, settings);
+      const r = await N.executeDestroy(deps, destroyId, approvedBy, settings, choices);
       for (const l of r.lines) console.log(`  ${r.ok ? "✓" : "✗"} ${l}`);
       if (!r.ok) process.exitCode = 1;
       return;
@@ -113,7 +123,8 @@ function lock(): () => void {
     if (plan.cost && plan.resumeFrom === "server") {
       const spent = await deps.db.spentThisMonthPaise();
       const r = (p: number) => `₹${(p / 100).toLocaleString("en-IN")}`;
-      console.log(`  spend this month ${r(spent)} + ${r(plan.cost.monthlyPaise)} = ${r(spent + plan.cost.monthlyPaise)} of the ${r(settings.spendCapPaise)} cap`);
+      const total = plan.cost.monthlyPaise + plan.cost.gatewayMonthlyPaise;
+      console.log(`  spend this month ${r(spent)} + ${r(plan.cost.monthlyPaise)} server + ${r(plan.cost.gatewayMonthlyPaise)} gateway IP = ${r(spent + total)} of the ${r(settings.spendCapPaise)} cap`);
     }
     console.log(`  install key: ${existsSync(`${installKeyPath()}.pub`) ? installKeyPath() : `${installKeyPath()} (created on --execute)`}`);
     console.log(`  test container: IPv6 only${options.ipv4Test ? " + a Floating IPv4 (--ipv4)" : ""}; sowsi-mgmt-01 IPv6: ${settings.mgmtHasIpv6 ? "yes" : "NO"}`);

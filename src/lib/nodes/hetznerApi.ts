@@ -36,7 +36,8 @@ export function installHetznerApi(hetzner: HetznerService): InstallDeps["hetzner
       }
       return { removed, left: (await hetzner.listSshKeys()).filter((k) => isInstallKeyEntry(k.name)).map((k) => `${k.name} (${k.id})`) };
     },
-    buyFloatingIP: (label, location) => hetzner.buyFloatingIP(label, location),
+    buyFloatingIP: (label, location, labels) => hetzner.buyFloatingIP(label, location, labels),
+    listFloatingIps: async () => (await hetzner.listFloatingIPs()).map((f) => ({ id: f.id, ip: f.ip, description: f.description, server: f.server, labels: f.labels })),
     assignFloatingIP: (id, serverId) => hetzner.assignFloatingIP(id, serverId),
     releaseFloatingIP: (id) => hetzner.releaseFloatingIP(id),
     floatingIpExists: async (id) => (await hetzner.getFloatingIP(id)) !== null,

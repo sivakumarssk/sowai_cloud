@@ -10,6 +10,7 @@ export type FloatingIp = {
   server: number | null;
   homeLocation: string;
   blocked: boolean;
+  labels: Record<string, string>;
 };
 
 type ApiFloatingIp = {
@@ -19,6 +20,7 @@ type ApiFloatingIp = {
   server: number | null;
   home_location: { name: string };
   blocked: boolean;
+  labels?: Record<string, string>;
 };
 
 export type HetznerVolume = { id: number; name: string; sizeGB: number; server: number | null; location: string };
@@ -140,6 +142,7 @@ function toFloatingIp(f: ApiFloatingIp): FloatingIp {
     server: f.server,
     homeLocation: f.home_location.name,
     blocked: f.blocked,
+    labels: f.labels ?? {},
   };
 }
 
@@ -214,12 +217,13 @@ export class HetznerService {
    * Proxmox server (nbg1) or it can't be assigned to it.
    */
   /** Buys an IPv4 Floating IP whose home is `location` (it can only be routed to servers there). */
-  async buyFloatingIP(label: string, location: string = process.env.HETZNER_LOCATION || "nbg1"): Promise<{ id: number; ip: string }> {
+  async buyFloatingIP(label: string, location: string = process.env.HETZNER_LOCATION || "nbg1", labels?: Record<string, string>): Promise<{ id: number; ip: string }> {
     const { floating_ip } = await this.request<{ floating_ip: ApiFloatingIp }>("post", "/floating_ips", {
       data: {
         type: "ipv4",
         home_location: location,
         description: label,
+        ...(labels ? { labels } : {}),
       },
     });
     return { id: floating_ip.id, ip: floating_ip.ip };

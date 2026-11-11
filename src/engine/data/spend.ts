@@ -1,7 +1,7 @@
 import { prisma } from "@/lib/prisma";
 
 /** EngineLog actions that commit new monthly infrastructure spend. */
-export const SPEND_ACTIONS = ["VOLUME_CREATED", "SERVER_PURCHASED", "SERVER_COST_SETTLED"] as const;
+export const SPEND_ACTIONS = ["VOLUME_CREATED", "SERVER_PURCHASED", "SERVER_COST_SETTLED", "FLOATING_IP_PURCHASED", "FLOATING_IP_COST_SETTLED"] as const;
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -16,7 +16,8 @@ export function istMonthStart(now: Date = new Date()): Date {
  * successful purchases only. Deleting a Volume later doesn't lower it — the
  * cap is about what the engine signed up for, conservatively. A server the
  * installer deleted counts only the hours it lived: SERVER_COST_SETTLED is a
- * negative correction to its SERVER_PURCHASED row.
+ * negative correction to its SERVER_PURCHASED row. A node's gateway Floating IP
+ * works the same way (FLOATING_IP_PURCHASED, FLOATING_IP_COST_SETTLED).
  */
 export async function spentThisMonthPaise(now: Date = new Date()): Promise<number> {
   const { _sum } = await prisma.engineLog.aggregate({

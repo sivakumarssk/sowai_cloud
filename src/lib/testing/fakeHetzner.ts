@@ -90,6 +90,7 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
     primaryIps: new Map<number, Row>(),
     sshKeys: new Map<number, Row>(),
     floatingIps: new Map<number, Row>(),
+    fipsBought: 0,
     volumes: new Map<number, Row>(),
     actions: new Map<number, { row: Row; polls: number }>(),
     /** Snapshots: GET /images?type=snapshot. */
@@ -201,6 +202,8 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
       if (method === "GET") return ok({ server: { ...server, status: "running" } });
       if (method === "DELETE") {
         state.servers.delete(server.id);
+        // As Hetzner does: a Floating IP on the server is unassigned, not deleted, and goes on billing.
+        for (const fip of state.floatingIps.values()) if (fip.server === server.id) fip.server = null;
         for (const ip of state.primaryIps.values()) {
           if (ip.assignee_id !== server.id) continue;
           if (cfg.primaryIpsSurviveDelete) Object.assign(ip, { assignee_id: null, assignee_type: "unassigned", auto_delete: false });
@@ -267,7 +270,8 @@ export function fakeHetzner(cfg: FakeHetznerConfig = {}) {
     if (path === "/floating_ips" && method === "POST") {
       const loc = LOCATIONS[body.home_location as keyof typeof LOCATIONS];
       if (!loc) throw new Reply(422, "invalid_input", "home_location");
-      const fip: Row = { id: id(), name: `fip-${nextId}`, description: body.description ?? null, ip: "198.51.100.7", type: body.type, server: null, home_location: loc, blocked: false, labels: {}, dns_ptr: [] };
+      // The first one is 198.51.100.7, as it always was; each one after it gets the next address.
+      const fip: Row = { id: id(), name: `fip-${nextId}`, description: body.description ?? null, ip: `198.51.100.${7 + state.fipsBought++}`, type: body.type, server: null, home_location: loc, blocked: false, labels: body.labels ?? {}, dns_ptr: [] };
       state.floatingIps.set(fip.id, fip);
       return ok({ floating_ip: fip }, 201);
     }

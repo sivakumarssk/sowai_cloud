@@ -285,10 +285,12 @@ nft() { return 0; }
 pvesh() { echo '{"content":"iso,vztmpl,backup,rootdir,images","digest":"x","type":"dir"}'; }
 ip() { echo 'vmbr1            DOWN           bc:24:11:aa:bb:cc <NO-CARRIER,BROADCAST,MULTICAST,UP>'; }
 test() { return 0; }
+bash() { return 0; }
 sysctl() { case "$*" in *send_redirects*|*accept_ra*) echo 0 ;; *) echo 1 ;; esac; }
 grep() {
   case "$*" in
     *to_neighbour_l3*) echo 7 ;;
+    *gateway-*) echo 2 ;;
     *proxmox-firewall*) echo 0 ;;
     *sysctl*|*proxy*|*unknown_port*|*"(bridge|inet) sowsi"*) echo 2 ;;
     *) echo 1 ;;
@@ -458,10 +460,12 @@ const want = { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c18:1f8d" };
 const whenBash = (name: string, fn: () => void) => test(name, (t) => (spawnSync("bash", ["--version"]).error ? t.skip("no bash") : fn()));
 
 /** The dispatcher exactly as proxmox-host-setup.sh writes it, pointed at a temporary home. */
-function dispatcher(home: string, command: string) {
+function dispatcher(home: string, command: string, stdin = "") {
   const setup = readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n");
   const script = /cat > \/usr\/local\/sbin\/sowsi-host <<'SCRIPT'\n([\s\S]*?)\nSCRIPT\n/.exec(setup)![1].replaceAll("/root/.ssh", home.replaceAll("\\", "/"));
-  return spawnSync("bash", ["-s"], { input: script, encoding: "utf8", cwd: home, env: { ...process.env, SSH_ORIGINAL_COMMAND: command } });
+  // From a file, so stdin stays free for the data a command reads (the gateway's table).
+  writeFileSync(path.join(home, "sowsi-host"), script);
+  return spawnSync("bash", ["sowsi-host"], { input: stdin, encoding: "utf8", cwd: home, env: { ...process.env, SSH_ORIGINAL_COMMAND: command } });
 }
 
 test("the dispatcher refuses anything but its exact commands, and runs nothing it was handed", (t) => {
@@ -520,6 +524,28 @@ test("the dispatcher refuses anything but its exact commands, and runs nothing i
     "unmount-volume ;touch pwned",
     "unmount-volume 123;touch pwned",
     "unmount-volume 123 456",
+    // The gateway: status takes nothing; sync takes one all-digit version, its table on stdin.
+    "gateway-status ;touch pwned",
+    "gateway-status;touch pwned",
+    "gateway-status $(touch pwned)",
+    "gateway-status `touch pwned`",
+    "gateway-status extra",
+    "gateway-status\ntouch pwned",
+    "gateway-sync",
+    "gateway-sync abc",
+    "gateway-sync 5 6",
+    "gateway-sync -5",
+    "gateway-sync 5;touch pwned",
+    "gateway-sync ;touch pwned",
+    "gateway-sync $(touch pwned)",
+    "gateway-sync `touch pwned`",
+    "gateway-sync 5\ntouch pwned",
+    "gateway-sync 5\ttouch pwned",
+    "gateway-sync 1234567890123456",
+    "gateway-sync ../../etc",
+    // Not exposed: only root on the node installs the gateway.
+    "gateway-install",
+    "gateway-sync-all 5",
     // Anything else.
     "touch pwned",
     "bash -c 'touch pwned'",
@@ -535,6 +561,13 @@ test("the dispatcher refuses anything but its exact commands, and runs nothing i
     const report = dispatcher(home, "isolation-report");
     assert.notEqual(report.status, 2, report.stderr);
     assert.match(report.stderr, /sowsi-routes/);
+    // And the gateway's, which go on to sowsi-gateway. A table on stdin is never read by the dispatcher.
+    for (const command of ["gateway-status", "gateway-sync 5", "gateway-sync 123456789012345"]) {
+      const r = dispatcher(home, command, "$(touch pwned).example.com 3f9ac21e7b104d6a 100.64.0.5 0\n");
+      assert.notEqual(r.status, 2, `${command}: ${r.stderr}`);
+      assert.match(r.stderr, /sowsi-gateway/, command);
+      assert.ok(!existsSync(path.join(home, "pwned")), `${command}: the table ran`);
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -545,15 +578,17 @@ test("every command the installer sends to the node is one the dispatcher accept
   const deps = readFileSync(path.join(process.cwd(), "src", "lib", "nodes", "installNodeDeps.ts"), "utf8");
   const sent = [...deps.matchAll(/runOnHost\([^,]+, ip: host \}, (["`])(.*?)\1/g)]
     .map((m) => m[2])
-    .flatMap((c) => (c.includes("${on ?") ? [c.replace(/\$\{on \? "on" : "off"\}/, "on"), c.replace(/\$\{on \? "on" : "off"\}/, "off")] : [c]));
-  assert.deepEqual([...sent].sort(), ["authorized-keys", "isolation-probe off", "isolation-probe on", "isolation-report", "isolation-status", "routes"]);
+    .flatMap((c) => (c.includes("${on ?") ? [c.replace(/\$\{on \? "on" : "off"\}/, "on"), c.replace(/\$\{on \? "on" : "off"\}/, "off")] : [c]))
+    // The largest version the installer sends: a time in milliseconds, 13 digits.
+    .map((c) => c.replace("${version}", String(Date.now())));
+  assert.deepEqual([...sent].sort().map((c) => c.replace(/\d{13}$/, "<version>")), ["authorized-keys", "gateway-status", "gateway-sync <version>", "isolation-probe off", "isolation-probe on", "isolation-report", "isolation-status", "routes"]);
   const home = mkdtempSync(path.join(tmpdir(), "sowsi-sent-"));
   try {
     for (const command of sent.filter((c) => c !== "authorized-keys")) {
-      // Accepted: it goes on to run sowsi-routes, which isn't installed here.
+      // Accepted: it goes on to run sowsi-routes or sowsi-gateway, which aren't installed here.
       const r = dispatcher(home, command);
       assert.notEqual(r.status, 2, `${command}: ${r.stderr}`);
-      assert.match(r.stderr, /sowsi-routes/, command);
+      assert.match(r.stderr, /sowsi-(routes|gateway)/, command);
     }
   } finally {
     rmSync(home, { recursive: true, force: true });

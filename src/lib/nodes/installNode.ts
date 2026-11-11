@@ -10,6 +10,7 @@
 import { serverTypeOffer, type ApiServerType, type HetznerPrice, type HetznerServer, type ServerDeleted } from "@/lib/hetzner";
 import { ipv6ForVmid } from "@/lib/provisioning/nodeTarget";
 import { describeFloatingIpv4, HETZNER_INVOICE } from "./hetznerInvoice";
+import { GATEWAY_HOSTNAME, GATEWAY_SIZE, GATEWAY_VMID, isGatewayContainer } from "./gateway";
 import * as S from "./nodeScripts";
 import { rescueDiagnoseAgain, rescueRefusal, rescueRepair, type RescueArgs } from "./rescueRepair";
 import { diagnosticsScript } from "./rescueScripts";
@@ -61,6 +62,12 @@ export type InstallRecord = {
   /** Encrypted. */
   apiTokenSecret: string | null;
   testFloatingIpId: string | null;
+  /** The node's gateway Floating IP, from purchase until it's released. */
+  gatewayFloatingIpId: string | null;
+  gatewayIpv4: string | null;
+  gatewayPurchasedAt: Date | null;
+  /** What it counted against the spend cap; the hours it lived are settled on release. */
+  gatewayMonthlyPaise: number | null;
   monthlyCostPaise: number;
   hourlyCostPaise: number;
   approvedBy: string;
@@ -80,7 +87,13 @@ export type NodeRegistration = {
   apiTokenId: string;
   /** Encrypted. */
   apiTokenSecret: string;
+  gatewayIpv4: string;
+  gatewayFloatingIpId: string;
+  gatewayVmId: number;
+  gatewayRoutesVersion: bigint;
 };
+
+export type FloatingIpRow = { id: number; ip: string; description: string | null; server: number | null; labels: Record<string, string> };
 
 export type InstallDeps = {
   hetzner: {
@@ -97,7 +110,8 @@ export type InstallDeps = {
     ensureSshKey(name: string, publicKey: string): Promise<{ id: number; created: boolean }>;
     /** Removes the installer's own key entries, then lists again: `left` is what's still there. Never any other key. */
     removeInstallKeys(): Promise<{ removed: string[]; left: string[] }>;
-    buyFloatingIP(label: string, location: string): Promise<{ id: number; ip: string }>;
+    buyFloatingIP(label: string, location: string, labels?: Record<string, string>): Promise<{ id: number; ip: string }>;
+    listFloatingIps(): Promise<FloatingIpRow[]>;
     assignFloatingIP(id: number, serverId: number): Promise<void>;
     releaseFloatingIP(id: number): Promise<void>;
     floatingIpExists(id: number): Promise<boolean>;
@@ -124,14 +138,20 @@ export type InstallDeps = {
   isolationProbe(host: string, on: boolean): Promise<void>;
   /** `isolation-report`: rules, counters, ports and the rule journal, for a failed step 4. Prints no keys. */
   isolationReport(host: string): Promise<string>;
+  /** `gateway-status` through the dispatcher: facts about container 9000 and HAProxy. */
+  gatewayStatus(host: string): Promise<string>;
+  /** `gateway-sync <version>`, the table on stdin. Throws when the node refuses it. */
+  gatewaySync(host: string, version: number, table: string): Promise<string>;
+  /** curl on sowsi-mgmt-01, run without a shell: the gateway as the internet sees it. Never throws on curl's own exit code. */
+  curl(args: string[]): Promise<S.CurlResult>;
   proxmox(node: { name: string; ip: string }, token: { tokenId: string; secret: string }): ContainerApi;
   db: {
     findInstall(name: string): Promise<InstallRecord | null>;
     findInstallByServer(serverId: string): Promise<InstallRecord | null>;
-    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "repairedAt" | "purchasedAt" | "costSettledPaise" | "createdAt" | "updatedAt" | "apiTokenSecret" | "testFloatingIpId">): Promise<InstallRecord>;
+    createInstall(data: Omit<InstallRecord, "id" | "status" | "completedSteps" | "error" | "hetznerServerId" | "ipv4" | "ipv6Subnet" | "hostKeySha256" | "bootIdBeforeReboot" | "repairedAt" | "purchasedAt" | "costSettledPaise" | "createdAt" | "updatedAt" | "apiTokenSecret" | "testFloatingIpId" | "gatewayFloatingIpId" | "gatewayIpv4" | "gatewayPurchasedAt" | "gatewayMonthlyPaise">): Promise<InstallRecord>;
     updateInstall(id: string, data: Partial<InstallRecord>): Promise<InstallRecord>;
     /** The registered node on this Hetzner server, with how many services and volumes it has. */
-    nodeByServerId(serverId: string): Promise<{ id: string; name: string; services: number; volumes: number; apiTokenId: string | null; apiTokenSecret: string | null; ip: string } | null>;
+    nodeByServerId(serverId: string): Promise<{ id: string; name: string; services: number; volumes: number; apiTokenId: string | null; apiTokenSecret: string | null; ip: string; gatewayFloatingIpId: string | null } | null>;
     nodeNameTaken(name: string): Promise<boolean>;
     registerNode(data: NodeRegistration): Promise<void>;
     deleteNode(id: string): Promise<void>;
@@ -177,7 +197,7 @@ export type InstallSettings = {
 export const INSTALL_LABEL = "sowsi-node-install";
 // The firewall comes before the Proxmox install, so port 8006 is never open to the
 // internet: ufw is already denying it when pveproxy first starts listening.
-export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "dns", "ipv6", "host-setup", "api-token", "lockdown", "keys", "verify", "register"] as const;
+export const STEPS = ["server", "ssh", "hostname", "firewall", "bridge", "boot-safety", "proxmox", "reboot", "dns", "ipv6", "host-setup", "api-token", "gateway", "lockdown", "keys", "verify", "register"] as const;
 export type StepId = (typeof STEPS)[number];
 
 export const STEP_TITLES: Record<StepId, string> = {
@@ -193,9 +213,10 @@ export const STEP_TITLES: Record<StepId, string> = {
   ipv6: "3e+ add IPv6 now the bridge is proven up, reload, verify",
   "host-setup": "3g proxmox-host-setup.sh (vmbr1, routes, sowsi-host, storage, template)",
   "api-token": "3h Proxmox API token, stored encrypted; check :8006 from sowsi-mgmt-01",
+  gateway: "3h+ shared IPv4 gateway: its own Floating IP, container 9000 with HAProxy, empty table, neutral 404",
   lockdown: "3i provisioning key in (restricted), install key out",
   keys: "3j list authorized_keys by fingerprint; fail on any key that isn't allowed",
-  verify: "4  test container: SSH, outbound, delete with verified cleanup",
+  verify: "4  test containers: SSH, outbound, NAT, gateway routing, isolation; delete with verified cleanup",
   register: "5  register the ProxmoxNode (closed, PROVISIONING)",
 };
 
@@ -239,7 +260,8 @@ export function explainHetznerError(err: unknown, ctx: { serverType: string; loc
 
 // ── Cost ──────────────────────────────────────────────────────────────
 
-export type Cost = { monthlyPaise: number; hourlyPaise: number; lines: string[] };
+/** monthlyPaise and hourlyPaise are the server's; the gateway's Floating IP is counted on its own. */
+export type Cost = { monthlyPaise: number; hourlyPaise: number; gatewayMonthlyPaise: number; lines: string[] };
 
 const inr = (paise: number) => `₹${(paise / 100).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
@@ -248,6 +270,8 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { curre
   if (ips.currency !== "USD") return { error: `Hetzner reports prices in ${ips.currency}, and costs here are worked out from USD with HETZNER_USD_TO_INR` };
   const ip = ips.primaryIpv4;
   if (!ip) return { error: `Hetzner's pricing has no Primary IPv4 price for ${s.location}` };
+  if (ips.floatingIpv4Monthly === null) return { error: `Hetzner's pricing has no Floating IPv4 price for ${s.location}, and every node's gateway needs one` };
+  const gatewayMonthlyPaise = Math.ceil(ips.floatingIpv4Monthly * s.usdToInr * 100);
   const monthly = price.monthly + ip.monthly;
   const hourly = price.hourly + ip.hourly;
   const monthlyPaise = Math.ceil(monthly * s.usdToInr * 100);
@@ -258,10 +282,11 @@ export function serverCost(serverType: string, price: HetznerPrice, ips: { curre
     `total: ${inr(monthlyPaise)}/month, ${inr(hourlyPaise)}/hour (at ₹${s.usdToInr}/$, HETZNER_USD_TO_INR). Billed hourly until deleted.`,
     `against the spend cap: ${inr(monthlyPaise)} if it stays as a node; if it's destroyed, only ${inr(hourlyPaise)} per started hour it lived`,
     `traffic: ${HETZNER_INVOICE.cpxIncludedTrafficTB} TB a month included with a CPX server, then $${HETZNER_INVOICE.trafficUsdPerTB.toFixed(2)}/TB (invoice; not in the total)`,
+    `gateway: one Floating IPv4 for the node's shared IPv4 gateway, ${describeFloatingIpv4(ips.floatingIpv4Monthly)}; kept while the node lives; ${inr(gatewayMonthlyPaise)} against the spend cap, the hours it lived if it's released`,
   ];
   if (withIpv4Test) lines.push(`--ipv4 test: one Floating IPv4, ${describeFloatingIpv4(ips.floatingIpv4Monthly)}; released right after the test`);
   if (s.rateWarning) lines.push(s.rateWarning);
-  return { monthlyPaise, hourlyPaise, lines };
+  return { monthlyPaise, hourlyPaise, gatewayMonthlyPaise, lines };
 }
 
 // ── Plan ──────────────────────────────────────────────────────────────
@@ -340,8 +365,9 @@ export async function planInstall(deps: InstallDeps, o: InstallOptions, s: Insta
 
   if (cost && resumeFrom === "server") {
     const spent = await deps.db.spentThisMonthPaise();
-    if (spent + cost.monthlyPaise > s.spendCapPaise) {
-      problems.push(`buying it takes this month's infrastructure spend to ${inr(spent + cost.monthlyPaise)}, over the ${inr(s.spendCapPaise)} cap (ENGINE_SPEND_CAP_PAISE) — already ${inr(spent)}`);
+    const total = cost.monthlyPaise + cost.gatewayMonthlyPaise;
+    if (spent + total > s.spendCapPaise) {
+      problems.push(`buying it and its gateway's Floating IP takes this month's infrastructure spend to ${inr(spent + total)}, over the ${inr(s.spendCapPaise)} cap (ENGINE_SPEND_CAP_PAISE) — already ${inr(spent)}`);
     }
   }
   if (resumeFrom === "reboot" && install?.ipv4) {
@@ -449,6 +475,9 @@ async function diagnoseOnNode(ctx: Ctx, step: StepId, problems: string[]) {
 
 type TestContainer = { vmid: number; address: string };
 
+/** The gateway's own route: what's left on the host once every test container is gone. */
+const gatewayRoutes = (ctx: Ctx) => (ctx.rec.gatewayIpv4 ? 1 : 0);
+
 /** Test containers and their Floating IP kept by an earlier --keep-on-failure run: gone before this run makes its own. */
 async function removeKeptTestContainers(ctx: Ctx, pve: ContainerApi, host: string): Promise<void> {
   const { deps } = ctx;
@@ -462,7 +491,7 @@ async function removeKeptTestContainers(ctx: Ctx, pve: ContainerApi, host: strin
     const left = await pve.listLXC();
     for (const c of kept) if (left.some((l) => l.vmid === c.vmid)) problems.push(`kept test container ${c.vmid} still exists`);
     const routes = S.parseRoutes(await deps.syncRoutes(host).catch(() => ""));
-    if (!routes || routes.ipv4 + routes.ipv6 !== 0) problems.push(`host routes after removing the kept test containers: ${JSON.stringify(routes)}`);
+    if (!routes || routes.ipv4 !== gatewayRoutes(ctx) || routes.ipv6 !== 0) problems.push(`host routes after removing the kept test containers: ${JSON.stringify(routes)}`);
   }
   const ip = ctx.rec.testFloatingIpId;
   if (ip) {
@@ -522,6 +551,110 @@ async function saveVerifyDiagnostics(ctx: Ctx, created: TestContainer[], host: s
   }
   parts.push(`=== isolation-report on the node\n${await deps.isolationReport(host).catch((e) => `not available: ${errMsg(e)}`)}`);
   return deps.saveDiagnostics(ctx.rec.hetznerServerId!, "-verify", parts.join("\n\n"));
+}
+
+// ── The gateway's Floating IP ─────────────────────────────────────────
+
+/** Labels on the installer's own Floating IPs: what --destroy releases without asking. */
+export const floatingIpLabels = (purpose: "test" | "gateway", node: string) => ({ [INSTALL_LABEL]: purpose, "sowsi-node": node });
+const isInstallerIp = (f: FloatingIpRow, node: string | undefined) => Boolean(node) && (f.labels[INSTALL_LABEL] === "test" || f.labels[INSTALL_LABEL] === "gateway") && f.labels["sowsi-node"] === node;
+
+/** Hetzner's answer to buying a Floating IP → what to do. Nothing was bought when this is thrown. */
+export function explainFloatingIpError(err: unknown): string {
+  const code = (err as { code?: string }).code;
+  const raw = err instanceof Error ? err.message : String(err);
+  if (code === "resource_limit_exceeded") return "Hetzner's Floating IP limit for this project is reached — ask Hetzner to raise it (Console → Limits), or release an unused one. Nothing was bought.";
+  if (code === "resource_unavailable") return "Hetzner has no Floating IPv4 available in this location right now — try again later. Nothing was bought.";
+  if (code === "forbidden" || code === "unauthorized" || code === "token_readonly") return `the Hetzner API token can't buy Floating IPs (${code}) — it needs read & write. Nothing was bought.`;
+  return `buying the gateway's Floating IP failed: ${raw}`;
+}
+
+const fipHourlyPaise = (usdToInr: number) => Math.ceil(HETZNER_INVOICE.floatingIpv4UsdHourly * usdToInr * 100);
+
+/**
+ * Releases the gateway's Floating IP and proves it's gone. The cap took a full month at purchase, so
+ * the difference to the started hours it lived (Hetzner's invoice: hourly, up to the monthly price)
+ * is given back once. The record is cleared first: a crash after it never counts the refund twice.
+ */
+async function releaseGatewayIp(deps: InstallDeps, rec: InstallRecord, usdToInr: number, problems: string[]): Promise<InstallRecord> {
+  if (!rec.gatewayFloatingIpId) return rec;
+  const id = Number(rec.gatewayFloatingIpId);
+  try {
+    await deps.hetzner.releaseFloatingIP(id);
+  } catch (e) {
+    problems.push(`gateway Floating IP ${id} NOT released: ${errMsg(e)}`);
+    return rec;
+  }
+  if (await deps.hetzner.floatingIpExists(id).catch(() => true)) {
+    problems.push(`gateway Floating IP ${id} still exists after release`);
+    return rec;
+  }
+  const { gatewayPurchasedAt: started, gatewayMonthlyPaise: monthly } = rec;
+  const updated = await deps.db.updateInstall(rec.id, { gatewayFloatingIpId: null, gatewayIpv4: null, gatewayPurchasedAt: null, gatewayMonthlyPaise: null });
+  if (started && monthly !== null) {
+    const hours = Math.max(1, Math.ceil((deps.now() - started.getTime()) / 3_600_000));
+    const accrued = Math.min(hours * fipHourlyPaise(usdToInr), monthly);
+    await deps.log({ action: "FLOATING_IP_COST_SETTLED", toNode: rec.name, cost: accrued - monthly, after: { floatingIpId: id, purpose: "gateway", hours, accruedPaise: accrued, monthlyPaise: monthly } });
+  }
+  await deps.log({ action: "FLOATING_IP_RELEASED", toNode: rec.name, after: { floatingIpId: id, purpose: "gateway" } });
+  return updated;
+}
+
+const gatewayLine = (f: Record<string, string>) => `HAProxy ${f.haproxy}, table version ${f.version} (${f.routes} routes), no logins, ports ${f.public_ports}${f.memory_mb ? `, ${f.memory_mb} MB in use` : ""}`;
+
+/** The table goes, and a name that worked a moment ago gets the neutral 404 again. */
+async function clearGatewayRoutes(ctx: Ctx, host: string, version: number): Promise<void> {
+  await ctx.deps.gatewaySync(host, version, "");
+}
+
+/**
+ * Step 4's routing proof: two test containers, each serving its own name on 80 and 443 through the
+ * gateway, from outside (curl --resolve on sowsi-mgmt-01); an unknown name gets the neutral 404 on
+ * 80 and a closed connection on 443; then the routes are removed and that 404 comes back.
+ */
+async function proveGateway(ctx: Ctx, host: string, backends: { vmid: number; ipv6: string; ipv4: string }[], routed: { version: number | null }): Promise<string> {
+  const { deps } = ctx;
+  const gw = ctx.rec.gatewayIpv4;
+  if (!gw) fail("gateway", ["no gateway Floating IP is recorded for this install"]);
+  for (const b of backends) {
+    const shell = await deps.containerShell(b.ipv6, 3 * 60_000);
+    try {
+      const f = S.parseFacts(await shell.exec("gateway backend", S.gatewayBackendScript(`backend-${b.vmid}`), { timeoutMs: 5 * 60_000 }));
+      if (f.listening !== "2") fail("gateway", [`test container ${b.vmid} has no web server on 0.0.0.0:80 and :443 (tools ${f.tools || "unknown"}, ${f.listening || 0} of 2 listening)`]);
+    } finally {
+      shell.close();
+    }
+  }
+  const before = S.parseFacts(await deps.gatewayStatus(host));
+  const applied = Number(before.version);
+  if (!/^\d{1,15}$/.test(before.version ?? "")) fail("gateway", ["the gateway has no table applied yet"]);
+  const version = Math.max(deps.now(), applied + 1);
+  const [one, two] = backends;
+  const table = S.gatewayTable([
+    { host: S.GATEWAY_TEST_NAMES.one, key: S.testServiceKey(one.vmid), ipv4: one.ipv4 },
+    { host: S.GATEWAY_TEST_NAMES.two, key: S.testServiceKey(two.vmid), ipv4: two.ipv4 },
+  ]);
+  const counter = async () => S.parseIsolationStatus(await deps.isolationStatus(host)).gateway_in ?? 0;
+  const inBefore = await counter();
+  await deps.gatewaySync(host, version, table);
+  routed.version = version;
+  const results: Partial<Record<S.GatewayProbeId, S.CurlResult>> = {};
+  for (const id of S.GATEWAY_PROBES) results[id] = await deps.curl(S.gatewayProbe(gw!, id));
+  const inAfter = await counter();
+  const proof = S.checkGatewayProof(results, { one: `backend-${one.vmid}`, two: `backend-${two.vmid}` });
+  const problems = [...proof.problems];
+  if (!(inAfter > inBefore)) problems.push(`gateway_in counted nothing (${inBefore} → ${inAfter}): the gateway's traffic to the containers didn't pass the rule meant for it`);
+  const routedStatus = S.checkGatewayStatus(S.parseFacts(await deps.gatewayStatus(host)), { ipv4: gw!, version: String(version), routes: 2 });
+  problems.push(...routedStatus);
+  if (problems.length) fail("gateway", problems);
+
+  await clearGatewayRoutes(ctx, host, version + 1);
+  routed.version = null;
+  const gone = S.curlReply(await deps.curl(S.gatewayProbe(gw!, "http_one")));
+  const after = S.checkGatewayStatus(S.parseFacts(await deps.gatewayStatus(host)), { ipv4: gw!, version: String(version + 1), routes: 0 });
+  if (gone.code !== "404") after.push(`${S.GATEWAY_TEST_NAMES.one} still got ${gone.code || "no answer"} after its route was removed, not the neutral 404`);
+  if (after.length) fail("gateway", after);
+  return `gateway ${gw}: ${S.GATEWAY_TEST_NAMES.one} → container ${one.vmid}, ${S.GATEWAY_TEST_NAMES.two} → container ${two.vmid}, on 80 and 443 (curl --resolve from sowsi-mgmt-01); X-Forwarded-For ${proof.clientIp}, the client's own value dropped; unknown name: 404 on 80, closed on 443, also with no name; routes removed again (gateway_in ${inBefore} → ${inAfter})`;
 }
 
 function api(ctx: Ctx): ContainerApi {
@@ -786,6 +919,60 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     }
   },
 
+  async gateway(ctx) {
+    const { deps, s, o } = ctx;
+    const serverId = Number(ctx.rec.hetznerServerId);
+    // The Floating IP: bought once, under the spend cap. A run that stopped right after buying adopts it.
+    if (!ctx.rec.gatewayFloatingIpId) {
+      const ips = await deps.hetzner.ipPrices(s.location);
+      if (ips.currency !== "USD" || ips.floatingIpv4Monthly === null) fail("gateway", [`no Floating IPv4 price in USD for ${s.location} (${ips.currency})`]);
+      const monthly = Math.ceil(ips.floatingIpv4Monthly! * s.usdToInr * 100);
+      const stray = (await deps.hetzner.listFloatingIps()).find((f) => isInstallerIp(f, ctx.rec.name) && f.labels[INSTALL_LABEL] === "gateway");
+      let fip: { id: number; ip: string };
+      if (stray) {
+        fip = stray;
+      } else {
+        const spent = await deps.db.spentThisMonthPaise();
+        if (spent + monthly > s.spendCapPaise) fail("gateway", [`its Floating IP takes this month's infrastructure spend to ${inr(spent + monthly)}, over the ${inr(s.spendCapPaise)} cap (ENGINE_SPEND_CAP_PAISE). Nothing was bought.`]);
+        try {
+          fip = await deps.hetzner.buyFloatingIP(`sowsi-gateway-${ctx.rec.name}`, s.location, floatingIpLabels("gateway", ctx.rec.name));
+        } catch (err) {
+          throw new Error(explainFloatingIpError(err));
+        }
+      }
+      await save(ctx, { gatewayFloatingIpId: String(fip.id), gatewayIpv4: fip.ip, gatewayPurchasedAt: new Date(deps.now()), gatewayMonthlyPaise: monthly });
+      await deps.log({ action: "FLOATING_IP_PURCHASED", toNode: ctx.rec.name, cost: monthly, after: { floatingIpId: fip.id, ip: fip.ip, purpose: "gateway", adopted: Boolean(stray), approvedBy: o.approvedBy } });
+    }
+    const id = Number(ctx.rec.gatewayFloatingIpId);
+    const ip = ctx.rec.gatewayIpv4!;
+    const current = (await deps.hetzner.listFloatingIps()).find((f) => f.id === id);
+    if (!current) fail("gateway", [`the gateway's Floating IP ${id} no longer exists at Hetzner`]);
+    if (current!.server !== serverId) {
+      if (current!.server !== null) fail("gateway", [`the gateway's Floating IP ${id} is assigned to server ${current!.server}, not this one`]);
+      await deps.hetzner.assignFloatingIP(id, serverId);
+    }
+
+    // Container 9000: created once, never one that isn't the gateway.
+    const pve = api(ctx);
+    const existing = (await pve.listLXC()).find((c) => c.vmid === GATEWAY_VMID);
+    if (existing && !isGatewayContainer(existing)) fail("gateway", [`container ${GATEWAY_VMID} exists and isn't the gateway (${existing.name ?? "no name"}) — not touching it`]);
+    if (!existing) {
+      await pve.createLXC({ vmid: GATEWAY_VMID, hostname: GATEWAY_HOSTNAME, ...GATEWAY_SIZE, osTemplate: "ubuntu-22.04", ipv4: ip, start: true });
+    }
+    await pve.waitForLXC(GATEWAY_VMID);
+    const routes = await onNode(ctx, "routes", "/usr/local/sbin/sowsi-routes");
+    if (!routes.includes(`gateway ${ip}`)) fail("gateway", [`sowsi-routes didn't take container ${GATEWAY_VMID} as the gateway (${routes.trim().split("\n").pop()})`]);
+    await onNode(ctx, "gateway install", "/usr/local/sbin/sowsi-gateway install", { timeoutMs: 15 * 60_000 });
+    const facts = S.parseFacts(await onNode(ctx, "gateway status", "/usr/local/sbin/sowsi-gateway status"));
+    const problems = S.checkGatewayStatus(facts, { ipv4: ip });
+    // From outside: the Floating IP reaches the gateway, which knows no name yet.
+    const outside: Partial<Record<S.GatewayProbeId, S.CurlResult>> = {};
+    for (const p of ["http_unknown", "https_unknown", "https_nosni"] as const) outside[p] = await deps.curl(S.gatewayProbe(ip, p));
+    problems.push(...S.checkGatewayUnknown(outside));
+    if (problems.length) fail("gateway", problems);
+    return `container ${GATEWAY_VMID} on Floating IP ${ip} (${id}): ${gatewayLine(facts)}; from sowsi-mgmt-01 an unknown name gets the neutral 404 on 80 and a closed connection on 443`;
+  },
+
   async lockdown(ctx) {
     const { deps } = ctx;
     const installKey = await deps.keys.installPublicKey(false);
@@ -837,10 +1024,11 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
     const created: TestContainer[] = [];
     let probing = false;
     let failure: unknown = null;
+    const routed: { version: number | null } = { version: null };
     try {
       await removeKeptTestContainers(ctx, pve, host);
       if (o.ipv4Test) {
-        const fip = await deps.hetzner.buyFloatingIP(`sowsi-node-test-${ctx.rec.name}`, s.location);
+        const fip = await deps.hetzner.buyFloatingIP(`sowsi-node-test-${ctx.rec.name}`, s.location, floatingIpLabels("test", ctx.rec.name));
         await save(ctx, { testFloatingIpId: String(fip.id) });
         await deps.hetzner.assignFloatingIP(fip.id, Number(ctx.rec.hetznerServerId));
         ipv4 = fip.ip;
@@ -855,8 +1043,14 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       await pve.createLXC({ vmid: neighbour, ...size, ipv6: neighbourIpv6, ipv4: S.TEST_IPV4.second });
       created.push({ vmid: neighbour, address: neighbourIpv6 });
       await pve.waitForLXC(neighbour);
+      // A third, also in shared mode: the gateway's second site.
+      const third = await pve.getNextVMID();
+      const thirdIpv6 = ipv6ForVmid(ctx.rec.ipv6Subnet!, third);
+      await pve.createLXC({ vmid: third, ...size, ipv6: thirdIpv6, ipv4: S.TEST_IPV4.third });
+      created.push({ vmid: third, address: thirdIpv6 });
+      await pve.waitForLXC(third);
       const routes = S.parseRoutes(await deps.syncRoutes(host));
-      if (!routes || routes.ipv6 !== 2 || routes.ipv4 !== 2) fail("verify", [`host routes after create: ${JSON.stringify(routes)}`]);
+      if (!routes || routes.ipv6 !== 3 || routes.ipv4 !== 3 + gatewayRoutes(ctx)) fail("verify", [`host routes after create: ${JSON.stringify(routes)}`]);
 
       const shell = await deps.containerShell(ipv4 ?? ipv6, 3 * 60_000);
       try {
@@ -878,6 +1072,13 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
         } finally {
           peer.close();
         }
+
+        lines.push(
+          await proveGateway(ctx, host, [
+            { vmid: neighbour, ipv6: neighbourIpv6, ipv4: S.TEST_IPV4.second },
+            { vmid: third, ipv6: thirdIpv6, ipv4: S.TEST_IPV4.third },
+          ], routed)
+        );
 
         await deps.isolationProbe(host, true);
         probing = true;
@@ -908,6 +1109,8 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       const cleanup: string[] = [];
       const keep = failure !== null && o.keepOnFailure && created.length > 0;
       if (probing) await deps.isolationProbe(host, false).catch((e) => cleanup.push(`probe interface: ${errMsg(e)}`));
+      // Test routes go before their containers; kept containers keep theirs, as evidence.
+      if (routed.version !== null && !keep) await clearGatewayRoutes(ctx, host, routed.version + 1).catch((e) => cleanup.push(`gateway test routes: ${errMsg(e)}`));
       if (keep) {
         const ip = ctx.rec.testFloatingIpId ? ` and Floating IP ${ctx.rec.testFloatingIpId}` : "";
         failure = new Error(`${errMsg(failure)} — kept for inspection: test containers ${created.map((c) => c.vmid).join(", ")}${ip}; a re-run deletes them first`);
@@ -920,7 +1123,7 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       }
       if (created.length && !keep) {
         const routes = S.parseRoutes(await deps.syncRoutes(host).catch(() => ""));
-        if (!routes || routes.ipv4 + routes.ipv6 !== 0) cleanup.push(`host routes after delete: ${JSON.stringify(routes)}`);
+        if (!routes || routes.ipv4 !== gatewayRoutes(ctx) || routes.ipv6 !== 0) cleanup.push(`host routes after delete: ${JSON.stringify(routes)}`);
       }
       if (ctx.rec.testFloatingIpId && !keep) {
         const id = Number(ctx.rec.testFloatingIpId);
@@ -939,6 +1142,9 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
   async register(ctx) {
     const pve = api(ctx);
     const [status, storage] = await Promise.all([pve.getNodeStatus(), pve.getStorageStatus("local")]);
+    const gateway = S.parseFacts(await ctx.deps.gatewayStatus(ctx.rec.ipv4!));
+    const gatewayProblems = S.checkGatewayStatus(gateway, { ipv4: ctx.rec.gatewayIpv4 ?? "(none recorded)", routes: 0 });
+    if (gatewayProblems.length || !ctx.rec.gatewayFloatingIpId) fail("register", gatewayProblems.length ? gatewayProblems : ["no gateway Floating IP is recorded"]);
     const reg: NodeRegistration = {
       name: ctx.rec.name,
       ip: ctx.rec.ipv4!,
@@ -951,10 +1157,14 @@ const RUN: Record<StepId, (ctx: Ctx) => Promise<string>> = {
       monthlyCost: ctx.rec.monthlyCostPaise,
       apiTokenId: S.API_TOKEN_ID,
       apiTokenSecret: ctx.rec.apiTokenSecret!,
+      gatewayIpv4: ctx.rec.gatewayIpv4!,
+      gatewayFloatingIpId: ctx.rec.gatewayFloatingIpId!,
+      gatewayVmId: GATEWAY_VMID,
+      gatewayRoutesVersion: BigInt(gateway.version),
     };
     await ctx.deps.db.registerNode(reg);
     await save(ctx, { status: "REGISTERED", apiTokenSecret: null });
-    return `${reg.name}: ${reg.physicalRamMB} MB RAM, ${reg.physicalDiskGB} GB disk, ${reg.physicalCpu} CPU — status PROVISIONING, acceptNewClients false`;
+    return `${reg.name}: ${reg.physicalRamMB} MB RAM, ${reg.physicalDiskGB} GB disk, ${reg.physicalCpu} CPU, gateway ${reg.gatewayIpv4} (table version ${gateway.version}) — status PROVISIONING, acceptNewClients false`;
   },
 };
 
@@ -1046,7 +1256,8 @@ async function customerProblem(deps: InstallDeps, serverId: string, tokenSecret:
       .proxmox(target, { tokenId: registered?.apiTokenId ?? S.API_TOKEN_ID, secret })
       .listLXC()
       .catch(() => null);
-    const others = containers?.filter((c) => c.name !== S.TEST_CONTAINER_HOSTNAME) ?? [];
+    // Test containers and the gateway are the installer's own; anything else may be a customer's.
+    const others = containers?.filter((c) => c.name !== S.TEST_CONTAINER_HOSTNAME && !isGatewayContainer(c)) ?? [];
     if (others.length) return `the node has container(s) ${others.map((c) => `${c.vmid} ${c.name ?? ""}`.trim()).join(", ")}`;
   }
   return null;
@@ -1075,7 +1286,10 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
     const blocked = await customerProblem(deps, serverId, secret, ctx.rec.ipv4 ? nodeRef(ctx) : null);
     if (blocked) {
       cleanup.push(`server ${serverId} NOT deleted: ${blocked}`);
+      if (ctx.rec.gatewayFloatingIpId) cleanup.push(`gateway Floating IP ${ctx.rec.gatewayFloatingIpId} kept with the server`);
     } else {
+      // The gateway's Floating IP goes with the server; --keep-on-failure keeps both.
+      ctx.rec = await releaseGatewayIp(deps, ctx.rec, ctx.s.usdToInr, cleanup);
       try {
         const { primaryIpsLeft } = await deps.hetzner.deleteServer(Number(serverId));
         serverDeleted = (await deps.hetzner.getServer(Number(serverId))) === null;
@@ -1097,7 +1311,7 @@ async function failInstall(ctx: Ctx, step: StepId, err: unknown): Promise<Instal
     errMsg(err),
     "",
     kept
-      ? `--keep-on-failure: server ${serverId} (${ctx.rec.ipv4}) is KEPT and still billed (${inr(ctx.rec.hourlyCostPaise)}/hour). Re-run to resume, or remove it: npx tsx scripts/node/install-node.ts --destroy ${serverId}`
+      ? `--keep-on-failure: server ${serverId} (${ctx.rec.ipv4})${ctx.rec.gatewayFloatingIpId ? ` and its gateway Floating IP ${ctx.rec.gatewayFloatingIpId}` : ""} are KEPT and still billed (${inr(ctx.rec.hourlyCostPaise)}/hour for the server). Re-run to resume, or remove them: npx tsx scripts/node/install-node.ts --destroy ${serverId}`
       : serverId
         ? serverDeleted
           ? `Server ${serverId} was deleted; its install key entry was removed. Nothing else was bought.`
@@ -1118,12 +1332,57 @@ function destroySpendNote(install: InstallRecord | null): string | null {
   return `correct the spend: ${inr(install.monthlyCostPaise)} was counted; only the started hours it lived, at ${inr(install.hourlyCostPaise)}/hour, will stay`;
 }
 
-export type DestroyPlan = { ok: boolean; problems: string[]; lines: string[]; server: HetznerServer | null; install: InstallRecord | null; nodeId: string | null };
+/** A Floating IP --destroy will release, and why it may. */
+export type DestroyFloatingIp = { id: number; ip: string; why: string; gateway: boolean };
 
-export async function planDestroy(deps: InstallDeps, serverId: string, s: InstallSettings): Promise<DestroyPlan> {
+/** Floating IPs the person running --destroy decided about: release it, or leave it as it is. */
+export type FloatingIpChoices = { release: string[]; keep: string[] };
+
+export type DestroyPlan = { ok: boolean; problems: string[]; lines: string[]; server: HetznerServer | null; install: InstallRecord | null; nodeId: string | null; floatingIps: DestroyFloatingIp[] };
+
+const describeFip = (f: FloatingIpRow) => `${f.id} (${f.ip}${f.description ? `, "${f.description}"` : ""})`;
+
+/**
+ * Every Floating IP on this server, or the installer's for this node anywhere: deleting the server only
+ * unassigns them, and an unassigned one still bills by the hour. The installer's own (recorded, or
+ * labelled by it) are released. Any other is never released without --release-floating-ip <id>.
+ */
+async function destroyFloatingIps(deps: InstallDeps, serverId: string, nodeName: string | undefined, recorded: { test: string | null; gateway: string | null }, choices: FloatingIpChoices, problems: string[], lines: string[]): Promise<DestroyFloatingIp[]> {
+  let all: FloatingIpRow[];
+  try {
+    all = await deps.hetzner.listFloatingIps();
+  } catch (err) {
+    problems.push(`can't list Floating IPs, so it can't tell what this server leaves billing: ${errMsg(err)}`);
+    return [];
+  }
+  const release: DestroyFloatingIp[] = [];
+  const onServer = (f: FloatingIpRow) => String(f.server) === serverId;
+  for (const id of [...choices.release, ...choices.keep]) {
+    const f = all.find((x) => String(x.id) === id);
+    if (!f) problems.push(`Floating IP ${id} (--release-floating-ip/--keep-floating-ip) doesn't exist`);
+    else if (!onServer(f)) problems.push(`Floating IP ${describeFip(f)} isn't assigned to server ${serverId}: --destroy only decides about this server's`);
+  }
+  for (const id of choices.release) if (choices.keep.includes(id)) problems.push(`Floating IP ${id} is both released and kept`);
+  for (const f of all) {
+    const id = String(f.id);
+    const gateway = id === recorded.gateway || (isInstallerIp(f, nodeName) && f.labels[INSTALL_LABEL] === "gateway");
+    if (id === recorded.test || id === recorded.gateway || isInstallerIp(f, nodeName)) {
+      release.push({ id: f.id, ip: f.ip, gateway, why: gateway ? "the node's gateway" : "the installer's test IP" });
+    } else if (onServer(f)) {
+      if (choices.release.includes(id)) release.push({ id: f.id, ip: f.ip, gateway: false, why: "--release-floating-ip" });
+      else if (choices.keep.includes(id)) lines.push(`keep Floating IP ${describeFip(f)} (--keep-floating-ip): it stays billed, unassigned, until you release it`);
+      else problems.push(`Floating IP ${describeFip(f)} is assigned to this server and isn't labelled as a test or installer IP: add --release-floating-ip ${f.id} to release it, or --keep-floating-ip ${f.id} to leave it (it stays billed, unassigned)`);
+    }
+  }
+  for (const id of [recorded.test, recorded.gateway]) if (id && !all.some((f) => String(f.id) === id)) lines.push(`Floating IP ${id} is already gone at Hetzner`);
+  for (const f of release) lines.push(`release Floating IP ${f.id} (${f.ip}), ${f.why}`);
+  return release;
+}
+
+export async function planDestroy(deps: InstallDeps, serverId: string, s: InstallSettings, choices: FloatingIpChoices = { release: [], keep: [] }): Promise<DestroyPlan> {
   const problems: string[] = s.wrongHost ? [s.wrongHost] : [];
   const lines: string[] = [];
-  if (!/^\d+$/.test(serverId)) return { ok: false, problems: [`--destroy needs a numeric Hetzner server id, got "${serverId}"`], lines, server: null, install: null, nodeId: null };
+  if (!/^\d+$/.test(serverId)) return { ok: false, problems: [`--destroy needs a numeric Hetzner server id, got "${serverId}"`], lines, server: null, install: null, nodeId: null, floatingIps: [] };
   if (s.protectedServerId && serverId === s.protectedServerId) problems.push(`server ${serverId} is HETZNER_SERVER_ID (a hand-built server) — never destroyed by this script`);
 
   const [server, install, node] = await Promise.all([deps.hetzner.getServer(Number(serverId)), deps.db.findInstallByServer(serverId), deps.db.nodeByServerId(serverId)]);
@@ -1134,46 +1393,63 @@ export async function planDestroy(deps: InstallDeps, serverId: string, s: Instal
 
   if (server) lines.push(`delete Hetzner server ${server.id} ${server.name} (${server.serverType}, ${server.ipv4}) and its Primary IPs ${server.primaryIpIds.join(", ") || "(none)"} — saves ${install ? `${inr(install.monthlyCostPaise)}/month` : "its monthly cost"}`);
   else lines.push(`server ${serverId} is already gone at Hetzner`);
-  if (install?.testFloatingIpId) lines.push(`release test Floating IP ${install.testFloatingIpId}`);
+  const floatingIps = await destroyFloatingIps(deps, serverId, install?.name ?? server?.name, { test: install?.testFloatingIpId ?? null, gateway: install?.gatewayFloatingIpId ?? node?.gatewayFloatingIpId ?? null }, choices, problems, lines);
   lines.push("remove the installer's key entry at Hetzner, if it's there");
   const spendNote = destroySpendNote(install);
   if (spendNote) lines.push(spendNote);
   if (node) lines.push(`remove ProxmoxNode ${node.name} (no services, no volumes)`);
   if (install) lines.push(`mark install ${install.name} DESTROYED`);
-  return { ok: problems.length === 0, problems, lines, server, install, nodeId: node?.id ?? null };
+  return { ok: problems.length === 0, problems, lines, server, install, nodeId: node?.id ?? null, floatingIps };
 }
 
-export async function executeDestroy(deps: InstallDeps, serverId: string, approvedBy: string | null, s: InstallSettings): Promise<{ ok: boolean; lines: string[] }> {
+export async function executeDestroy(deps: InstallDeps, serverId: string, approvedBy: string | null, s: InstallSettings, choices: FloatingIpChoices = { release: [], keep: [] }): Promise<{ ok: boolean; lines: string[] }> {
   if (!approvedBy?.trim()) return { ok: false, lines: ["--destroy --execute needs --approved-by <name>"] };
-  const plan = await planDestroy(deps, serverId, s);
+  const plan = await planDestroy(deps, serverId, s, choices);
   if (!plan.ok) return { ok: false, lines: plan.problems };
   const done: string[] = [];
-  if (plan.install?.testFloatingIpId) {
-    await deps.hetzner.releaseFloatingIP(Number(plan.install.testFloatingIpId));
-    done.push(`released Floating IP ${plan.install.testFloatingIpId}`);
+  const left: string[] = [];
+  let install = plan.install;
+  // A server already gone at Hetzner ended when its record last changed: read before anything here changes it.
+  const recordChangedAt = plan.install ? new Date(plan.install.updatedAt.getTime()) : null;
+  // Before the server goes, while each one is still known to be on it. Each is proven gone.
+  for (const f of plan.floatingIps) {
+    if (f.gateway && install && install.gatewayFloatingIpId === String(f.id)) {
+      const problems: string[] = [];
+      install = await releaseGatewayIp(deps, install, s.usdToInr, problems);
+      if (problems.length) left.push(...problems);
+      else done.push(`released Floating IP ${f.id} (${f.ip}), ${f.why}; its spend settled to the hours it lived`);
+      continue;
+    }
+    try {
+      await deps.hetzner.releaseFloatingIP(f.id);
+      if (await deps.hetzner.floatingIpExists(f.id).catch(() => true)) left.push(`Floating IP ${f.id} (${f.ip}) still exists after release — bills hourly; release it in the Hetzner Console`);
+      else done.push(`released Floating IP ${f.id} (${f.ip}), ${f.why}`);
+      await deps.log({ action: "FLOATING_IP_RELEASED", toNode: install?.name ?? plan.server?.name, after: { floatingIpId: f.id, why: f.why, approvedBy } });
+    } catch (err) {
+      left.push(`Floating IP ${f.id} (${f.ip}) NOT released: ${errMsg(err)}`);
+    }
   }
   if (plan.server) {
     const { primaryIpsRemoved, primaryIpsLeft } = await deps.hetzner.deleteServer(plan.server.id);
-    if (await deps.hetzner.getServer(plan.server.id)) return { ok: false, lines: [...done, `server ${plan.server.id} still exists after delete`] };
+    if (await deps.hetzner.getServer(plan.server.id)) return { ok: false, lines: [...done, ...left, `server ${plan.server.id} still exists after delete`] };
     done.push(`deleted server ${plan.server.id}`);
     if (primaryIpsRemoved.length) done.push(`deleted leftover Primary IP(s) ${primaryIpsRemoved.join(", ")}`);
-    if (primaryIpsLeft.length) return { ok: false, lines: [...done, `Primary IP(s) ${primaryIpsLeft.join(", ")} still exist and bill hourly — delete them in the Hetzner Console`] };
+    if (primaryIpsLeft.length) return { ok: false, lines: [...done, ...left, `Primary IP(s) ${primaryIpsLeft.join(", ")} still exist and bill hourly — delete them in the Hetzner Console`] };
   }
   if (plan.nodeId) {
     await deps.db.deleteNode(plan.nodeId);
     done.push("removed the ProxmoxNode row");
   }
-  if (plan.install) {
-    // A server already gone at Hetzner ended when its record last changed.
-    const alreadySettled = plan.install.costSettledPaise !== null;
-    const settled = await settleServerCost(deps, plan.install, plan.server ? new Date(deps.now()) : plan.install.updatedAt);
-    if (!alreadySettled) done.push(`spend corrected: ${inr(settled.costSettledPaise ?? 0)} for the hours it lived, not ${inr(plan.install.monthlyCostPaise)}`);
-    await deps.db.updateInstall(plan.install.id, { status: "DESTROYED", apiTokenSecret: null, testFloatingIpId: null });
+  if (install) {
+    const alreadySettled = install.costSettledPaise !== null;
+    const settled = await settleServerCost(deps, install, plan.server ? new Date(deps.now()) : recordChangedAt!);
+    if (!alreadySettled) done.push(`spend corrected: ${inr(settled.costSettledPaise ?? 0)} for the hours it lived, not ${inr(install.monthlyCostPaise)}`);
+    await deps.db.updateInstall(install.id, { status: "DESTROYED", apiTokenSecret: null, testFloatingIpId: null });
   }
   const keyProblems: string[] = [];
   await removeInstallKeys(deps, keyProblems);
   if (keyProblems.length === 0) done.push("no installer key entry left at Hetzner");
-  await deps.log({ action: "NODE_DESTROYED", toNode: plan.install?.name ?? plan.server?.name, after: { hetznerServerId: serverId, approvedBy, done } });
-  await deps.alert(`Node server destroyed: ${plan.install?.name ?? serverId}`, `${[...done, ...keyProblems].join("\n")}\nApproved by ${approvedBy}.`);
-  return { ok: keyProblems.length === 0, lines: [...done, ...keyProblems] };
+  await deps.log({ action: "NODE_DESTROYED", toNode: install?.name ?? plan.server?.name, after: { hetznerServerId: serverId, approvedBy, done, left } });
+  await deps.alert(`Node server destroyed: ${install?.name ?? serverId}`, `${[...done, ...left, ...keyProblems].join("\n")}\nApproved by ${approvedBy}.`);
+  return { ok: keyProblems.length === 0 && left.length === 0, lines: [...done, ...left, ...keyProblems] };
 }

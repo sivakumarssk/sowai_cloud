@@ -51,6 +51,19 @@ function setup(nodes: SimServer[]) {
   return { sim, monitor, events, types: () => events.map((e) => e.type), poll };
 }
 
+test("the gateway (container 9000) takes no customer's slot, but its RAM counts", async () => {
+  const gateway = { vmid: 9000, name: "sowsi-gateway", running: true, ramMB: 512 };
+  const { monitor, poll } = setup([node({ containers: [{ vmid: 100, running: true, ramMB: 2048 }, gateway] })]);
+  await poll();
+  const [s] = monitor.snapshot();
+  assert.equal(s.totalContainers, 1);
+  assert.equal(s.activeContainers, 1);
+  assert.equal(s.allocatedRam, (2048 + 512) * 1024 ** 2);
+  const lookalike = setup([node({ containers: [{ vmid: 9000, name: "sowsi-cmabc123", running: true, ramMB: 1024 }] })]);
+  await lookalike.poll();
+  assert.equal(lookalike.monitor.snapshot()[0].totalContainers, 1, "a customer's container at 9000 still counts");
+});
+
 test("free pool = storage − allocated − reserve, never negative", () => {
   assert.equal(freePoolBytes(150 * GB, 60 * GB, 20), 70 * GB);
   assert.equal(freePoolBytes(150 * GB, 140 * GB, 20), 0);

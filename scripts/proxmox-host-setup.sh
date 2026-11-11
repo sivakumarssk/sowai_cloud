@@ -123,6 +123,9 @@ GOOD=$STATE_DIR/rules.last-good.nft
 PROBE=sowsiprobe0
 # Shared mode: each such container has a private address from here, and leaves by NAT (Stage A).
 SHARED=100.64.0.0/10
+# The shared IPv4 gateway (Stage B): HAProxy in this container, on a Floating IP of its own.
+GATEWAY_VMID=9000
+GATEWAY_NAME=sowsi-gateway
 
 have_tables() { nft list table bridge sowsi >/dev/null 2>&1 && nft list table inet sowsi >/dev/null 2>&1; }
 load_last_good() { [[ -f $GOOD ]] && nft -f "$GOOD"; }
@@ -301,7 +304,7 @@ uplinks() {
 re4=',ip=([0-9.]+)/32'
 re6=',ip6=([0-9a-fA-F:]+)/'
 declare -A want4=() want6=()
-chains="" ports="" skipped="" count=0
+chains="" ports="" skipped="" count=0 gw4=""
 shopt -s nullglob
 for conf in "$LXC_DIR"/*.conf; do
   # The first net0 line is the live config; later ones belong to snapshots.
@@ -315,6 +318,11 @@ for conf in "$LXC_DIR"/*.conf; do
     chains+=$chain$'\n'
     ports+="\"veth${id}i0\" : jump ct$id, "
     count=$((count + 1))
+    # The gateway is container 9000 named sowsi-gateway, on a public address: never a shared one.
+    if [[ $id == "$GATEWAY_VMID" && $(grep -m1 '^hostname:' "$conf" || true) == "hostname: $GATEWAY_NAME" && $net0 =~ $re4 ]]; then
+      candidate=${BASH_REMATCH[1]}
+      if valid_ipv4 "$candidate" && ! [[ $candidate =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then gw4=$candidate; fi
+    fi
   else
     skipped+=" $id"
   fi
@@ -383,7 +391,7 @@ rules=$RUN_DIR/rules.nft
   echo "}"
   echo
   echo "table inet sowsi {"
-  for name in to_host to_neighbour_l3 to_other_iface to_private to_mail to_metadata api_refused ssh_limited nat_out shared_in; do
+  for name in to_host to_neighbour_l3 to_other_iface to_private to_mail to_metadata api_refused ssh_limited nat_out shared_in gateway_in gateway_hairpin; do
     echo "  counter $name { }"
   done
   echo "  set ssh4 { type ipv4_addr; flags dynamic, timeout; timeout 2m; }"
@@ -392,6 +400,14 @@ rules=$RUN_DIR/rules.nft
   echo "    type filter hook forward priority -10; policy accept;"
   # A shared address is never reached from outside: only replies to its own connections come back.
   echo "    iifname != \"$BRIDGE\" ip daddr $SHARED ct state new counter name shared_in drop"
+  if [[ -n $gw4 ]]; then
+    # The gateway reaches shared-mode containers on 80 and 443 only, and any container reaches the
+    # gateway on 80 and 443 (a site calling its own domain). Everything else between ports stays dropped.
+    echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" ip saddr $gw4 ip daddr $SHARED tcp dport { 80, 443 } counter name gateway_in accept"
+    echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" ip saddr $SHARED ip daddr $gw4 tcp sport { 80, 443 } ct direction reply ct state established accept"
+    echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" ip daddr $gw4 tcp dport { 80, 443 } counter name gateway_hairpin accept"
+    echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" ip saddr $gw4 tcp sport { 80, 443 } ct direction reply ct state established accept"
+  fi
   echo "    iifname \"$BRIDGE\" oifname \"$BRIDGE\" counter name to_neighbour_l3 drop"
   # Forwarded traffic may leave by the public uplink only, never into a private network.
   echo "    iifname \"$BRIDGE\" oifname != { ${allowed%, } } counter name to_other_iface drop"
@@ -440,10 +456,356 @@ else
 fi
 
 echo "routes: ${#want4[@]} IPv4, ${#want6[@]} IPv6"
-echo "isolation: $count containers${skipped:+, refused:$skipped}${failed:+, RULES NOT LOADED}"
+echo "isolation: $count containers${skipped:+, refused:$skipped}${gw4:+, gateway $gw4}${failed:+, RULES NOT LOADED}"
 if [[ -n $failed ]]; then exit 1; fi
 SCRIPT
 chmod 755 /usr/local/sbin/sowsi-routes
+
+if [[ -z $ISOLATION_ONLY ]]; then
+echo "== 4b. Shared IPv4 gateway tool"
+cat > /usr/local/sbin/sowsi-gateway <<'SCRIPT'
+#!/usr/bin/env bash
+# The shared IPv4 gateway (Stage B): HAProxy in container 9000, on the gateway's own Floating IP.
+# Port 80 is routed by the Host header and port 443 by the TLS name (SNI), still encrypted.
+# The route table arrives from sowsi-mgmt-01 as plain data. The config is generated here and
+# never taken from outside, and a table with one bad line is refused whole, before anything changes.
+#
+#   sowsi-gateway status            facts about the gateway, read only
+#   sowsi-gateway sync <version>    the whole route table on stdin, one route per line:
+#                                     <hostname> <service key> <backend IPv4> <PROXY protocol 0|1>
+#   sowsi-gateway install           HAProxy into the container, no logins, an empty table (the installer, as root)
+set -euo pipefail
+
+VMID=9000
+NAME=sowsi-gateway
+BRIDGE=vmbr1
+LXC_DIR=${SOWSI_LXC_DIR:-/etc/pve/lxc}
+STATE=${SOWSI_GATEWAY_STATE:-/etc/sowsi/gateway}
+RUN_DIR=${SOWSI_RUN_DIR:-/run/sowsi}
+# Inside the container: one folder per version, and "current" pointing at the live one.
+CT_DIR=/etc/haproxy/sowsi
+MAX_BYTES=1048576
+MAX_LINES=5000
+PROBE_HOST=sowsi-probe.invalid
+
+refuse() { echo "refused: $*" >&2; exit 2; }
+die() { echo "gateway: $*" >&2; exit 1; }
+usage() { echo "usage: sowsi-gateway status | sync <version> | install" >&2; exit 2; }
+# fd 9 is this script's lock: nothing run in the container may hold it, or the next sync waits forever.
+ct() { pct exec "$VMID" -- "$@" 9>&-; }
+push() { pct push "$VMID" "$1" "$2" --perms 0644 9>&-; }
+# What the container says is printed as one plain word: it can't add a line or a field.
+clean() { LC_ALL=C tr -cd 'A-Za-z0-9._:/+,-' | head -c 80; }
+
+# The gateway's own address: container 9000 named sowsi-gateway, with a /32 IPv4 on the bridge.
+gateway_ipv4() {
+  local conf=$LXC_DIR/$VMID.conf net0
+  [[ -f $conf ]] || return 1
+  [[ $(grep -m1 '^hostname:' "$conf" || true) == "hostname: $NAME" ]] || return 1
+  net0=$(grep -m1 '^net0:' "$conf" || true)
+  [[ $net0 == *"bridge=$BRIDGE"* && $net0 =~ ,ip=([0-9.]+)/32 ]] || return 1
+  echo "${BASH_REMATCH[1]}"
+}
+
+# 100.64.0.0/10, written the one way net0 writes it (no leading zeros).
+shared_ipv4() {
+  [[ $1 =~ ^100\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  ((BASH_REMATCH[1] >= 64 && BASH_REMATCH[1] <= 127 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255))
+}
+
+# Lowercase labels of 1-63 characters, at most 253 in all, and a real top-level part. No wildcard.
+valid_host() {
+  local h=$1 label
+  local -a labels=()
+  ((${#h} <= 253)) || return 1
+  [[ $h =~ ^[a-z0-9.-]+$ && $h == *.* && $h != .* && $h != *. && $h != *..* ]] || return 1
+  IFS=. read -ra labels <<<"$h"
+  for label in "${labels[@]}"; do
+    [[ $label =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+  done
+  [[ ${labels[-1]} =~ ^[a-z]{2,63}$ || ${labels[-1]} =~ ^xn--[a-z0-9-]{1,59}$ ]]
+}
+
+# Shared-mode addresses of this node's containers: a route may only point at one of these.
+declare -A here=()
+node_backends() {
+  local f id net0 ip
+  for f in "$LXC_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    id=${f##*/}
+    id=${id%.conf}
+    [[ $id != "$VMID" ]] || continue
+    net0=$(grep -m1 '^net0:' "$f" || true)
+    [[ $net0 == *"bridge=$BRIDGE"* && $net0 =~ ,ip=([0-9.]+)/32 ]] || continue
+    # Copied first: shared_ipv4 runs a match of its own.
+    ip=${BASH_REMATCH[1]}
+    if shared_ipv4 "$ip"; then here[$ip]=1; fi
+  done
+}
+
+# stdin -> $work/routes, every line checked. One bad line refuses the whole table.
+read_table() {
+  local raw=$work/table.in line n=0 host key ip proxy
+  local -A hosts=() key_ip=() ip_key=()
+  head -c $((MAX_BYTES + 1)) >"$raw"
+  (($(wc -c <"$raw") <= MAX_BYTES)) || refuse "the table is over $MAX_BYTES bytes"
+  # Lowercase letters, digits, dots, dashes, spaces and newlines: nothing else, anywhere.
+  (($(LC_ALL=C tr -d 'a-z0-9. \n-' <"$raw" | wc -c) == 0)) || refuse "the table has a character other than a-z 0-9 . - space and newline"
+  : >"$work/routes"
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    ((n <= MAX_LINES)) || refuse "the table is over $MAX_LINES lines"
+    [[ $line =~ ^([a-z0-9.-]+)\ ([a-z0-9]{16})\ ([0-9.]+)\ ([01])$ ]] || refuse "line $n isn't: hostname key ipv4 0|1"
+    host=${BASH_REMATCH[1]} key=${BASH_REMATCH[2]} ip=${BASH_REMATCH[3]} proxy=${BASH_REMATCH[4]}
+    valid_host "$host" || refuse "line $n: not a hostname"
+    [[ -z ${hosts[$host]:-} ]] || refuse "line $n: $host is listed twice"
+    shared_ipv4 "$ip" || refuse "line $n: the backend isn't a shared-mode address"
+    [[ -n ${here[$ip]:-} ]] || refuse "line $n: no container on this node has $ip"
+    [[ -z ${key_ip[$key]:-} || ${key_ip[$key]} == "$ip" ]] || refuse "line $n: service $key has two addresses"
+    [[ -z ${ip_key[$ip]:-} || ${ip_key[$ip]} == "$key" ]] || refuse "line $n: $ip belongs to two services"
+    hosts[$host]=1 key_ip[$key]=$ip ip_key[$ip]=$key
+    echo "$host $key $ip $proxy" >>"$work/routes"
+  done <"$raw"
+}
+
+# $work/routes -> haproxy.cfg and the two maps in $work/out, for version $1.
+render() {
+  local v=$1 dir=$CT_DIR/$1 out=$work/out host key ip proxy name
+  local -A http=() tls=()
+  mkdir -p "$out"
+  : >"$out/http.map"
+  : >"$out/tls.map"
+  while read -r host key ip proxy; do
+    echo "$host h_$key" >>"$out/http.map"
+    if [[ $proxy == 1 ]]; then name=p_$key; else name=t_$key; fi
+    echo "$host $name" >>"$out/tls.map"
+    http[h_$key]=$ip
+    tls[$name]=$ip
+  done <"$work/routes"
+  {
+    cat <<EOF
+# Generated by sowsi-gateway, version $v. Every sync replaces it, so don't edit it.
+global
+  log /dev/log local0 warning
+  chroot /var/lib/haproxy
+  user haproxy
+  group haproxy
+  maxconn 5000
+  hard-stop-after 1h
+
+defaults
+  log global
+  maxconn 5000
+  timeout connect 5s
+  timeout client 60s
+  timeout server 300s
+  timeout tunnel 1h
+  timeout http-request 10s
+  timeout queue 30s
+
+# Port 80, by the Host header. An unknown name gets a neutral 404, never a customer's site.
+frontend http_in
+  bind :80
+  mode http
+  http-request return status 204 hdr x-sowsi-gateway-version $v if { src 127.0.0.1 } { req.hdr(host) -m str $PROBE_HOST }
+  http-request del-header X-Forwarded-For
+  http-request del-header Forwarded
+  http-request del-header X-Real-IP
+  option forwardfor
+  use_backend %[req.hdr(host),lower,field(1,:),map($dir/http.map)]
+  default_backend unknown_host
+
+# Port 443, by the TLS name, passed through still encrypted. An unknown or missing name is closed.
+frontend tls_in
+  bind :443
+  mode tcp
+  tcp-request inspect-delay 5s
+  tcp-request content accept if { req.ssl_hello_type 1 }
+  use_backend %[req.ssl_sni,lower,map($dir/tls.map)]
+  default_backend refuse
+
+backend unknown_host
+  mode http
+  http-request return status 404 content-type text/plain string "Not found"
+
+backend refuse
+  mode tcp
+  tcp-request content reject
+EOF
+    for name in $(printf '%s\n' "${!http[@]}" | sort); do
+      printf '\nbackend %s\n  mode http\n  server s %s:80 maxconn 500\n' "$name" "${http[$name]}"
+    done
+    for name in $(printf '%s\n' "${!tls[@]}" | sort); do
+      if [[ $name == p_* ]]; then proxy=" send-proxy-v2"; else proxy=""; fi
+      printf '\nbackend %s\n  mode tcp\n  server s %s:443 maxconn 500%s\n' "$name" "${tls[$name]}" "$proxy"
+    done
+    if [[ -n ${SOWSI_GATEWAY_TEST_APPEND:-} ]]; then echo "$SOWSI_GATEWAY_TEST_APPEND"; fi
+  } >"$out/haproxy.cfg"
+}
+
+# The version the running HAProxy answers with, asked from inside the container.
+live_version() {
+  ct curl -s -m 5 -o /dev/null -D - -H "Host: $PROBE_HOST" http://127.0.0.1/ 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1) == "x-sowsi-gateway-version" { print $2 }' | clean || true
+}
+unknown_host_code() {
+  ct curl -s -m 5 -o /dev/null -w '%{http_code}' -H 'Host: unknown.invalid' http://127.0.0.1/ 2>/dev/null | clean || true
+}
+serving() { # version
+  local _
+  for _ in $(seq 1 20); do
+    if [[ $(live_version) == "$1" && $(unknown_host_code) == 404 ]]; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+current_version() {
+  local v
+  v=$(ct readlink "$CT_DIR/current" 2>/dev/null | clean || true)
+  if [[ $v =~ ^[0-9]{1,15}$ ]]; then echo "$v"; fi
+}
+
+point_at() { # version
+  ct ln -sfn "$1" "$CT_DIR/current.new"
+  ct mv -Tf "$CT_DIR/current.new" "$CT_DIR/current"
+}
+
+# Validated routes -> live: config test first, then swap, reload and prove it, else back to the last good.
+apply() {
+  local v=$1 prev out f d
+  [[ $(pct status "$VMID" 9>&- 2>/dev/null | awk '{ print $2 }' || true) == running ]] || die "container $VMID isn't running: nothing changed"
+  render "$v"
+  ct mkdir -p "$CT_DIR/$v"
+  for f in haproxy.cfg http.map tls.map; do push "$work/out/$f" "$CT_DIR/$v/$f"; done
+  if ! out=$(ct haproxy -c -f "$CT_DIR/$v/haproxy.cfg" 2>&1); then
+    ct rm -rf "$CT_DIR/$v" || true
+    echo "$out" | LC_ALL=C tr -cd '[:print:]\n' | tail -5 >&2
+    die "version $v failed HAProxy's config test: nothing changed"
+  fi
+  prev=$(current_version)
+  point_at "$v"
+  if ct systemctl reload-or-restart haproxy && serving "$v"; then
+    mkdir -p "$STATE"
+    cp "$work/routes" "$STATE/table.tmp"
+    mv -f "$STATE/table.tmp" "$STATE/table"
+    echo "$v" >"$STATE/version.tmp"
+    mv -f "$STATE/version.tmp" "$STATE/version"
+    # Keep this version and the one before it; the rest go.
+    for d in $(ct ls -1 "$CT_DIR" 2>/dev/null | LC_ALL=C tr -cd '0-9a-z.\n' || true); do
+      if [[ $d =~ ^[0-9]{1,15}$ && $d != "$v" && $d != "${prev:-}" ]]; then ct rm -rf "$CT_DIR/$d" || true; fi
+    done
+    logger -t sowsi-gateway "version $v: $(wc -l <"$work/routes") routes" 2>/dev/null || true
+    echo "gateway: version $v, $(wc -l <"$work/routes") routes"
+    return 0
+  fi
+  if [[ -n $prev ]]; then
+    point_at "$prev"
+    ct systemctl reload-or-restart haproxy || true
+    ct rm -rf "$CT_DIR/$v" || true
+    if serving "$prev"; then die "version $v didn't come up: rolled back to version $prev"; fi
+    die "version $v didn't come up, and version $prev isn't serving after the rollback either"
+  fi
+  die "version $v didn't come up, and there's no earlier version to go back to"
+}
+
+lock() {
+  mkdir -p "$RUN_DIR"
+  exec 9>"$RUN_DIR/gateway.lock"
+  flock 9
+  work=$(mktemp -d "$RUN_DIR/gateway.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+}
+
+applied_version() { if [[ -f $STATE/version ]]; then clean <"$STATE/version"; fi; }
+
+sync_table() {
+  local v=$((10#$1)) applied
+  lock
+  node_backends
+  read_table
+  applied=$(applied_version)
+  if [[ $applied =~ ^[0-9]{1,15}$ ]]; then
+    if ((v < applied)); then refuse "version $v is older than the applied version $applied"; fi
+    if ((v == applied)); then
+      if cmp -s "$work/routes" "$STATE/table"; then echo "gateway: version $v already applied"; return 0; fi
+      refuse "version $v was applied with a different table"
+    fi
+  fi
+  gateway_ipv4 >/dev/null || die "container $VMID isn't the gateway: nothing changed"
+  apply "$v"
+}
+
+status() {
+  local ip state route=0 m ports
+  ip=$(gateway_ipv4 || true)
+  state=$(pct status "$VMID" 9>&- 2>/dev/null | awk '{ print $2 }' | clean || true)
+  if [[ -n $ip ]]; then route=$(ip -4 route show "$ip/32" dev "$BRIDGE" 2>/dev/null | grep -c . || true); fi
+  echo "container=${state:-missing}"
+  echo "ipv4=$ip"
+  echo "route=$route"
+  echo "version=$(applied_version)"
+  echo "routes=$(if [[ -f $STATE/table ]]; then wc -l <"$STATE/table"; else echo 0; fi)"
+  [[ $state == running ]] || return 0
+  echo "haproxy=$(ct systemctl is-active haproxy 2>/dev/null | clean || true)"
+  echo "haproxy_enabled=$(ct systemctl is-enabled haproxy 2>/dev/null | clean || true)"
+  echo "config=$(ct systemctl show -p Environment --value haproxy 2>/dev/null | tr ' ' '\n' | sed -n 's/^CONFIG=//p' | clean || true)"
+  echo "live_version=$(live_version)"
+  echo "unknown_host=$(unknown_host_code)"
+  echo "ssh=$(ct systemctl is-active ssh 2>/dev/null | clean || true)"
+  echo "logins=$(ct sh -c 'grep -c . /root/.ssh/authorized_keys 2>/dev/null || true' 2>/dev/null | clean || true)"
+  # Ports open beyond the container itself: only HAProxy's.
+  ports=$(ct ss -Hltnu 2>/dev/null | awk '{ print $5 }' | grep -vE '^(127\.|\[::1\]|[^ ]*%lo:)' | sed 's/.*://' | sort -un | paste -sd, - | clean || true)
+  echo "public_ports=$ports"
+  m=$(ct cat /sys/fs/cgroup/memory.current 2>/dev/null | clean || true)
+  if [[ $m =~ ^[0-9]{1,15}$ ]]; then echo "memory_mb=$((m / 1048576))"; fi
+}
+
+install() {
+  local _
+  lock
+  gateway_ipv4 >/dev/null || die "container $VMID isn't the gateway (hostname $NAME, a /32 IPv4 on $BRIDGE)"
+  [[ $(pct status "$VMID" 9>&- | awk '{ print $2 }') == running ]] || pct start "$VMID" 9>&-
+  for _ in $(seq 1 30); do
+    if ct getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1; then break; fi
+    sleep 2
+  done
+  ct env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  ct env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq haproxy curl >/dev/null
+  # No logins: the gateway is run through pct only, so nothing listens on it but HAProxy.
+  ct systemctl disable --now ssh.service >/dev/null 2>&1 || true
+  ct systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+  ct systemctl mask ssh.service >/dev/null 2>&1 || true
+  ct sh -c ': > /root/.ssh/authorized_keys' 2>/dev/null || true
+  # The package's unit reads $CONFIG: pointed at the generated config, which an upgrade never touches.
+  printf '[Service]\nEnvironment="CONFIG=%s/current/haproxy.cfg"\n' "$CT_DIR" >"$work/sowsi.conf"
+  ct mkdir -p /etc/systemd/system/haproxy.service.d "$CT_DIR"
+  push "$work/sowsi.conf" /etc/systemd/system/haproxy.service.d/sowsi.conf
+  ct systemctl daemon-reload
+  ct systemctl enable haproxy >/dev/null 2>&1
+  local applied
+  applied=$(applied_version)
+  if [[ $applied =~ ^[0-9]{1,15}$ && -n $(current_version) ]]; then
+    ct systemctl reload-or-restart haproxy
+    serving "$applied" || die "HAProxy isn't serving version $applied"
+    echo "gateway: installed, version $applied"
+  else
+    : >"$work/routes"
+    apply 0
+  fi
+}
+
+case "${1:-}" in
+  status) [[ $# == 1 ]] || usage; status ;;
+  sync)
+    [[ $# == 2 && $2 =~ ^[0-9]{1,15}$ ]] || refuse "usage: sowsi-gateway sync <version>, the table on stdin"
+    sync_table "$2" ;;
+  install) [[ $# == 1 ]] || usage; install ;;
+  *) usage ;;
+esac
+SCRIPT
+chmod 755 /usr/local/sbin/sowsi-gateway
+mkdir -p /etc/sowsi/gateway
+fi
 
 if [[ -z $ISOLATION_ONLY ]]; then
 echo "== 5. Routed bridge vmbr1"
@@ -520,6 +882,8 @@ cat > /usr/local/sbin/sowsi-host <<'SCRIPT'
 #   isolation-status               isolation rule counters
 #   isolation-report               isolation rules, counters, ports and their journal, for a failed proof
 #   isolation-probe on|off         a dummy interface, for the installer's proof
+#   gateway-status                 facts about the shared IPv4 gateway (container 9000)
+#   gateway-sync <version>         the gateway's whole route table, on stdin; sowsi-gateway checks every line
 #   mount-volume <hetzner-id>      mount an attached Hetzner Volume and register it as Proxmox storage
 #   unmount-volume <hetzner-id>    unregister + unmount it (refused while any disk is on it)
 #   authorized-keys                root's authorized keys as fingerprints, never the keys
@@ -535,6 +899,11 @@ case "$cmd" in
   isolation-probe)
     if [[ "${arg:-}" != on && "${arg:-}" != off ]]; then echo "invalid probe" >&2; exit 2; fi
     exec /usr/local/sbin/sowsi-routes --probe "$arg" ;;
+  gateway-status) no_arguments; exec /usr/local/sbin/sowsi-gateway status ;;
+  gateway-sync)
+    # stdin carries the table. The command line carries only its version number.
+    if ! [[ "${arg:-}" =~ ^[0-9]{1,15}$ ]]; then echo "invalid version" >&2; exit 2; fi
+    exec /usr/local/sbin/sowsi-gateway sync "$arg" ;;
   authorized-keys)
     no_arguments
     # sshd reads both files. The line count catches anything ssh-keygen can't read.

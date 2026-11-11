@@ -122,6 +122,16 @@ type WorldCfg = {
     natCountsNothing?: boolean;
     /** The shared-mode container's answer, field by field. */
     shared?: Record<string, string>;
+    /** `sowsi-gateway status`, field by field over a working gateway. */
+    gatewayStatus?: Record<string, string>;
+    /** The gateway, as curl sees it from sowsi-mgmt-01, gets this wrong. */
+    gatewayFault?: "xff_passes" | "swapped" | "unknown_served" | "tls_answers" | "no_sni_answers" | "route_stays" | "not_counted";
+    /** A test container's web server never listens. */
+    backendDown?: boolean;
+    /** sowsi-routes doesn't take container 9000 as the gateway. */
+    routesIgnoreGateway?: boolean;
+    /** sowsi-gateway refuses every table. */
+    syncRefused?: boolean;
 };
 
 function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
@@ -166,6 +176,9 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     probes: [] as boolean[],
     proofScript: "",
     created: [] as { vmid: number; ipv4?: string; ipv6?: string }[],
+    /** The node's gateway: installed, the applied version and table, and every sync it was sent. */
+    gw: { installed: false, version: null as number | null, table: "", syncs: [] as { version: number; table: string }[], counted: 0 },
+    curls: [] as string[][],
   };
 
   const live = () => ({ nic: "eth0", mac: "96:00:03:aa:bb:cc", ipv4: SERVER_IPV4, gateway: "172.31.1.1" });
@@ -223,6 +236,47 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
   const evidence = () =>
     `addr<<\nlo UNKNOWN 127.0.0.1/8\neth0@if7 UP ${S.TEST_IPV4.second}/32\n>>addr\nroute<<\ndefault via 172.31.1.1 dev eth0 onlink\n>>route\nneigh<<\n${w.gatewayKnown ? "172.31.1.1 lladdr fe:ff:ff:ff:ff:ff REACHABLE" : "172.31.1.1 INCOMPLETE"}\n>>neigh`;
 
+  // ── The gateway, simulated: container 9000, HAProxy's table, and what curl sees from outside ──
+  const gatewayCt = () => w.containers.find((c) => c.vmid === 9000 && c.name === "sowsi-gateway") as { vmid: number; name: string; ipv4?: string } | undefined;
+  const routesNow = () => {
+    const withV4 = w.containers.filter((c) => (c.name === S.TEST_CONTAINER_HOSTNAME || c.name === "sowsi-gateway") && (c as { ipv4?: string }).ipv4).length;
+    const withV6 = w.containers.filter((c) => c.name === S.TEST_CONTAINER_HOSTNAME).length;
+    const gw = gatewayCt();
+    return `routes: ${withV4} IPv4, ${withV6} IPv6\nisolation: ${w.containers.length} containers${gw && !cfg.routesIgnoreGateway ? `, gateway ${gw.ipv4}` : ""}`;
+  };
+  const gatewayStatusText = () => {
+    const gw = gatewayCt();
+    const lines = w.gw.table.split("\n").filter(Boolean).length;
+    const f: Record<string, string> = gw
+      ? { container: "running", ipv4: gw.ipv4 ?? "", route: "1", version: w.gw.version === null ? "" : String(w.gw.version), routes: String(lines), haproxy: w.gw.installed ? "active" : "inactive", haproxy_enabled: w.gw.installed ? "enabled" : "disabled", config: w.gw.installed ? S.GATEWAY_CONFIG : "", live_version: w.gw.version === null ? "" : String(w.gw.version), unknown_host: w.gw.installed ? "404" : "", ssh: "inactive", logins: "0", public_ports: w.gw.installed ? "80,443" : "22", memory_mb: "61" }
+      : { container: "missing", ipv4: "", route: "0", version: "", routes: "0" };
+    return Object.entries({ ...f, ...(gw ? cfg.gatewayStatus : {}) }).map(([k, v]) => `${k}=${v}`).join("\n");
+  };
+  const fakeCurl = (args: string[]): S.CurlResult => {
+    w.curls.push(args);
+    const url = new URL(args[args.length - 1]);
+    const resolve = args[args.indexOf("--resolve") + 1];
+    const ip = args.includes("--resolve") ? resolve.split(":")[2] : url.hostname;
+    const tls = url.protocol === "https:";
+    const gw = gatewayCt();
+    if (!gw || ip !== gw.ipv4 || !w.gw.installed) return { exit: 7, stdout: "\ncode=000" };
+    const sni = args.includes("--resolve") ? url.hostname : null;
+    const routes = Object.fromEntries(w.gw.table.split("\n").filter(Boolean).map((l) => l.split(" ")).map(([h, , v4]) => [h, v4]));
+    let backend = sni ? routes[sni] : undefined;
+    if (cfg.gatewayFault === "route_stays" && !backend && sni === S.GATEWAY_TEST_NAMES.one && w.gw.syncs.length > 1) backend = S.TEST_IPV4.second;
+    if (cfg.gatewayFault === "swapped" && backend) backend = backend === S.TEST_IPV4.second ? S.TEST_IPV4.third : S.TEST_IPV4.second;
+    if (!backend) {
+      if (cfg.gatewayFault === "unknown_served" && !tls) return { exit: 0, stdout: `backend-101 xff=${settings.mgmtIp}\ncode=200` };
+      if (tls && (cfg.gatewayFault === "tls_answers" ? sni !== null : cfg.gatewayFault === "no_sni_answers" ? sni === null : false)) return { exit: 0, stdout: "hello\ncode=200" };
+      return tls ? { exit: 35, stdout: "\ncode=000" } : { exit: 0, stdout: "Not found\ncode=404" };
+    }
+    const ct = w.containers.find((c) => (c as { ipv4?: string }).ipv4 === backend);
+    if (!ct) return tls ? { exit: 35, stdout: "\ncode=000" } : { exit: 0, stdout: "\ncode=503" };
+    if (cfg.gatewayFault !== "not_counted") w.gw.counted++;
+    const xff = tls ? "-" : cfg.gatewayFault === "xff_passes" ? `${S.SPOOFED_CLIENT},${settings.mgmtIp}` : settings.mgmtIp;
+    return { exit: 0, stdout: `backend-${ct.vmid} xff=${xff}\ncode=200` };
+  };
+
   const shellFor = (): Shell => ({
     async exec(label, command, o) {
       w.commands.push(label);
@@ -269,7 +323,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           if (cfg.firewallLostOnReboot && w.kernel.endsWith("-pve")) w.firewall.active = false;
           return runFirewallScript(w.firewall, command);
         case "proxmox-host-setup.sh": assert.match(o!.stdin!, /sowsi-routes/); return "== 1. DNS\n…\n== Done";
-        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2\niso_tables=2\niso_ports=2\niso_between=1\niso_forward=7\niso_nat=1\niso_mgmt=1\niso_timer=enabled\niso_before_guests=1\niso_last_good=ok\niso_redirects=0\niso_accept_ra=0\nnftables_service=masked\npve_nft_tables=0";
+        case "host checks": return "out4=ok\nout6=ok\ntemplate=1\nroutes_service=enabled\ndispatcher=yes\ngateway_tool=yes\ngateway_commands=2\nvmbr1=<NO-CARRIER,BROADCAST,MULTICAST,UP>\nstorage=iso,vztmpl,backup,rootdir,images\nforward4=1\nforward6=1\nforward_saved=2\nproxy_ndp=1\nproxy_arp=1\nproxy_saved=2\niso_tables=2\niso_ports=2\niso_between=1\niso_forward=7\niso_nat=1\niso_mgmt=1\niso_timer=enabled\niso_before_guests=1\niso_last_good=ok\niso_redirects=0\niso_accept_ra=0\nnftables_service=masked\npve_nft_tables=0";
         case "API token": w.tokenMade = true; return JSON.stringify({ "full-tokenid": "root@pam!sowsi", info: { privsep: "0" }, value: SECRET });
         case "add provisioning key": w.authorized.push(`restrict,command="/usr/local/sbin/sowsi-host" ${PROV_KEY}`); return "1";
         case "remove install key": w.authorized = w.authorized.filter((k) => k !== INSTALL_KEY); return `install_lines=0\nadmin_lines=${w.authorized.includes(ADMIN_KEY) ? 1 : 0}`;
@@ -300,6 +354,14 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
           return Object.entries(facts).map(([k, v]) => `${k}=${v}`).join("\n");
         }
         case "container diagnostics": return `--- ip -br addr\neth0 UP ${S.TEST_IPV4.second}/32\n--- ip neigh\n172.31.1.1 dev eth0 INCOMPLETE`;
+        case "routes": return routesNow();
+        case "gateway install":
+          if (!gatewayCt()) throw new Error("gateway install failed (exit 1):\ngateway: container 9000 isn't the gateway");
+          w.gw.installed = true;
+          if (w.gw.version === null) w.gw.version = 0;
+          return `gateway: version ${w.gw.version}, 0 routes`;
+        case "gateway status": return gatewayStatusText();
+        case "gateway backend": return `tools=present\nlistening=${cfg.backendDown ? 0 : 2}`;
         default: return "";
       }
     },
@@ -335,9 +397,23 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     containerShell: async () => shellFor(),
     syncRoutes: async () => {
       if (!w.authorized.some((k) => k.includes(PROV_KEY))) throw new Error("All configured authentication methods failed");
-      const ours = w.containers.filter((c) => c.name === S.TEST_CONTAINER_HOSTNAME);
-      return `routes: ${ours.filter((c) => (c as { ipv4?: string }).ipv4).length} IPv4, ${ours.length} IPv6`;
+      return routesNow();
     },
+    gatewayStatus: async () => {
+      if (!w.authorized.some((k) => k.includes(PROV_KEY))) throw new Error("All configured authentication methods failed");
+      return gatewayStatusText();
+    },
+    gatewaySync: async (_host, version, table) => {
+      if (!w.authorized.some((k) => k.includes(PROV_KEY))) throw new Error("All configured authentication methods failed");
+      w.commands.push(`gateway sync ${version}`);
+      if (cfg.syncRefused) throw new Error(`gateway-sync ${version} failed (exit 2):\nrefused: line 1: no container on this node has ${S.TEST_IPV4.second}`);
+      if (w.gw.version !== null && version <= w.gw.version) throw new Error(`gateway-sync ${version} failed (exit 2):\nrefused: version ${version} is older than the applied version ${w.gw.version}`);
+      w.gw.syncs.push({ version, table });
+      w.gw.version = version;
+      w.gw.table = table;
+      return `gateway: version ${version}, ${table.split("\n").filter(Boolean).length} routes`;
+    },
+    curl: async (args) => fakeCurl(args),
     authorizedKeys: async () => {
       // Proxmox adds the node's own key itself; a planted key sits next to the others.
       const lines = [...w.authorized, NODE_KEY, ...(cfg.strangerKey ? [STRANGER_KEY] : [])];
@@ -351,7 +427,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       // After the restart the two spoof counters count only what was actually stopped.
       const value = (n: string) =>
         w.restarted && (n === "spoof_ip4" || n === "spoof_arp") ? 1000 + w.afterRestart[n] : n === cfg.isolationHole || frozen ? 1 : w.isolationReads;
-      return ["tables=2", ...names.map((n) => `${n}=${value(n)}`), `nat_out=${w.natOut}`].join("\n");
+      return ["tables=2", ...names.map((n) => `${n}=${value(n)}`), `nat_out=${w.natOut}`, `gateway_in=${w.gw.counted}`].join("\n");
     },
     isolationReport: async () => {
       w.commands.push("isolation report");
@@ -394,7 +470,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       findInstall: async (name) => w.installs.get(name) ?? null,
       findInstallByServer: async (id) => [...w.installs.values()].find((r) => r.hetznerServerId === id) ?? null,
       async createInstall(d) {
-        const r: InstallRecord = { id: `ni_${w.installs.size + 1}`, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, purchasedAt: null, costSettledPaise: null, createdAt: new Date(w.clock), updatedAt: new Date(w.clock), apiTokenSecret: null, testFloatingIpId: null, ...d };
+        const r: InstallRecord = { id: `ni_${w.installs.size + 1}`, status: "IN_PROGRESS", completedSteps: [], error: null, hetznerServerId: null, ipv4: null, ipv6Subnet: null, hostKeySha256: null, bootIdBeforeReboot: null, repairedAt: null, purchasedAt: null, costSettledPaise: null, createdAt: new Date(w.clock), updatedAt: new Date(w.clock), apiTokenSecret: null, testFloatingIpId: null, gatewayFloatingIpId: null, gatewayIpv4: null, gatewayPurchasedAt: null, gatewayMonthlyPaise: null, ...d };
         w.installs.set(r.name, r);
         return { ...r };
       },
@@ -409,7 +485,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
       },
       async nodeByServerId(id) {
         const n = w.nodes.find((x) => x.hetznerServerId === id);
-        return n ? { id: n.id, name: n.name, ip: n.ip, services: n.services, volumes: n.volumes, apiTokenId: n.apiTokenId, apiTokenSecret: n.apiTokenSecret } : null;
+        return n ? { id: n.id, name: n.name, ip: n.ip, services: n.services, volumes: n.volumes, apiTokenId: n.apiTokenId, apiTokenSecret: n.apiTokenSecret, gatewayFloatingIpId: n.gatewayFloatingIpId } : null;
       },
       nodeNameTaken: async (name) => w.nodes.some((n) => n.name === name),
       registerNode: async (d) => void w.nodes.push({ ...d, id: `node_${w.nodes.length + 1}`, services: 0, volumes: 0 }),
@@ -436,6 +512,9 @@ const servers = (w: World) => w.hz.state.servers;
 const hetznerRequests = (w: World) => w.hz.requests;
 
 const steps = (w: World) => w.logs.filter((l) => l.action === "NODE_INSTALL_STEP").map((l) => (l.after as { step: string }).step);
+/** Containers other than the gateway (9000), which stays with the node. */
+const testContainers = (w: World) => w.containers.filter((c) => c.vmid !== 9000);
+const gatewayIps = (w: World) => [...w.hz.state.floatingIps.values()].filter((f) => (f.labels as Record<string, string>)[INSTALL_LABEL] === "gateway");
 
 // ── Plan and spend ────────────────────────────────────────────────────
 
@@ -555,17 +634,26 @@ test("execute: every step in order; registered closed with measured specs and th
   assert.deepEqual(w.authorized.filter((k) => k === INSTALL_KEY), [], "install key gone from the server");
   ok(w.authorized.includes(ADMIN_KEY));
   assert.deepEqual([...w.hz.state.sshKeys.values()].map((k) => k.public_key), [ADMIN_KEY], "install key entry removed from Hetzner; admin key kept");
-  assert.deepEqual(w.containers, [], "test container deleted");
+  assert.deepEqual(testContainers(w), [], "test containers deleted");
+  assert.deepEqual(w.containers, [{ vmid: 9000, name: "sowsi-gateway", ipv4: "198.51.100.7" }], "the gateway stays, on its Floating IP");
+  assert.equal(node.gatewayIpv4, "198.51.100.7");
+  assert.equal(node.gatewayFloatingIpId, String(gatewayIps(w)[0].id));
+  assert.equal(node.gatewayVmId, 9000);
+  assert.equal(node.gatewayRoutesVersion, BigInt(w.gw.version!), "the last table version the gateway applied");
+  assert.equal(w.gw.table, "", "registered with an empty table");
   assert.match(w.alerts[0].subject, /New Proxmox node installed/);
 });
 
 test("--ipv4: the test container gets a Floating IP, which is released afterwards", async () => {
   const w = world();
   assert.equal((await executeInstall(w.deps, opts({ ipv4Test: true }), settings)).ok, true);
-  assert.equal(w.hz.state.floatingIps.size, 0);
+  assert.equal(w.hz.state.floatingIps.size, 1, "only the gateway's is left");
+  assert.equal(gatewayIps(w).length, 1);
   assert.equal(w.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
-  assert.notEqual(w.created[0].ipv4, S.TEST_IPV4.first);
-  assert.equal(w.created[1].ipv4, S.TEST_IPV4.second, "the neighbour doesn't need one");
+  assert.equal(w.created[0].vmid, 9000, "the gateway first, on its own Floating IP");
+  assert.notEqual(w.created[1].ipv4, S.TEST_IPV4.first);
+  assert.notEqual(w.created[1].ipv4, w.created[0].ipv4, "the test container's Floating IP isn't the gateway's");
+  assert.equal(w.created[2].ipv4, S.TEST_IPV4.second, "the neighbour doesn't need one");
 });
 
 // ── Proving the isolation rules ──────────────────────────────────────
@@ -574,13 +662,13 @@ test("verify proves isolation with two containers, without buying an IP, and lea
   const w = world();
   assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
   assert.equal(w.nodes.length, 1);
-  assert.deepEqual(w.created.map((c) => c.vmid), [100, 101]);
-  assert.deepEqual(w.created.map((c) => c.ipv4), [S.TEST_IPV4.first, S.TEST_IPV4.second], "an unrouted address and a shared-mode one, so no Floating IP");
+  assert.deepEqual(w.created.map((c) => c.vmid), [9000, 100, 101, 102]);
+  assert.deepEqual(w.created.map((c) => c.ipv4), ["198.51.100.7", S.TEST_IPV4.first, S.TEST_IPV4.second, S.TEST_IPV4.third], "the gateway's Floating IP; then an unrouted address and two shared-mode ones, so no test Floating IP");
   assert.equal(S.TEST_IPV4.second, "100.127.255.11", "the neighbour is in shared mode, from the block reserved for tests");
   ok(w.commands.indexOf("shared outbound") > 0 && w.commands.indexOf("shared outbound") < w.commands.indexOf("isolation proof"), "NAT is proven before the isolation proof");
   assert.equal(w.natOut, 1);
-  assert.equal(w.hz.state.floatingIps.size, 0);
-  assert.deepEqual(w.containers, []);
+  assert.equal(w.hz.state.floatingIps.size, 1, "the gateway's, and no other");
+  assert.deepEqual(testContainers(w), []);
   assert.deepEqual(w.probes, [true, false], "the dummy interface comes and goes");
   ok(w.restarted, "the neighbour was restarted");
   assert.match(w.proofScript, /'10\.0\.0\.7' 22/, "it tries sowsi-mgmt-01's private address");
@@ -594,7 +682,7 @@ for (const hole of ["to_neighbour_l2", "to_neighbour_l3", "to_host", "to_other_i
     assert.equal(r.ok, false);
     assert.match((r as { error: string }).error, new RegExp(`rule ${hole} stopped nothing`));
     assert.equal(w.nodes.length, 0);
-    assert.deepEqual(w.containers, []);
+    assert.deepEqual(testContainers(w), []);
     assert.deepEqual(w.probes, [true, false], "the dummy interface is removed on failure too");
   });
 }
@@ -612,7 +700,7 @@ test("shared mode: no NAT, no IPv4, no DNS or the wrong address fails step 4 and
     assert.equal(r.ok, false);
     assert.match((r as { error: string }).error, why);
     assert.equal(w.nodes.length, 0);
-    assert.deepEqual(w.containers, []);
+    assert.deepEqual(testContainers(w), []);
     ok(!w.commands.includes("isolation proof"), "stops before the isolation proof");
   }
 });
@@ -642,7 +730,7 @@ test("rules that stop applying after a container restart fail the install, with 
   assert.match(error, /ip neigh: 172\.31\.1\.1 lladdr fe:ff:ff:ff:ff:ff REACHABLE; /, "the gateway was known when the IPv4 spoof went out");
   assert.match(error, /ip neigh after the ARP spoof: 172\.31\.1\.1 INCOMPLETE/);
   assert.equal(w.nodes.length, 0);
-  assert.deepEqual(w.containers, []);
+  assert.deepEqual(testContainers(w), []);
 });
 
 test("after a restart the gateway is learned from the real address before the spoof (the sowsi-test-02 failure)", async () => {
@@ -700,7 +788,7 @@ test("a step 4 failure saves what the test containers and isolation-report show,
   const c = w.commands;
   ok(c.indexOf("container diagnostics") > c.indexOf("restart arp spoof"), "after the failed check");
   ok(c.indexOf("isolation report") > 0 && c.indexOf("isolation report") < c.indexOf("saved diagnostics-verify"), "report read, then saved");
-  assert.deepEqual(w.containers, [], "then cleaned up as before");
+  assert.deepEqual(testContainers(w), [], "then cleaned up as before");
   assert.deepEqual(w.probes, [true, false]);
   assert.doesNotMatch(text, new RegExp(`${SECRET}|${PROV_KEY.split(" ")[1]}|${INSTALL_KEY.split(" ")[1]}`), "no secrets or keys");
   ok(!c.includes("node diagnostics"), "the install-key diagnostics isn't tried: that key is gone");
@@ -711,8 +799,8 @@ test("--keep-on-failure keeps nothing when step 4 passes", async () => {
   const w = world();
   const r = await executeInstall(w.deps, opts({ ipv4Test: true, keepOnFailure: true }), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
-  assert.deepEqual(w.containers, []);
-  assert.equal(w.hz.state.floatingIps.size, 0);
+  assert.deepEqual(testContainers(w), []);
+  assert.equal(w.hz.state.floatingIps.size, 1, "the gateway's only");
   assert.equal(w.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
   assert.deepEqual(w.saved, []);
 });
@@ -737,10 +825,10 @@ test("--keep-on-failure at step 4 keeps the test containers and their Floating I
   const r = await executeInstall(w.deps, opts({ ipv4Test: true, keepOnFailure: true }), settings);
   const error = (r as { error: string }).error;
   const rec = w.installs.get("sowsi-proxmox-02")!;
-  assert.deepEqual(w.containers.map((c) => c.vmid), [100, 101], "both kept");
-  assert.equal(w.hz.state.floatingIps.size, 1, "the Floating IP A holds is kept");
+  assert.deepEqual(testContainers(w).map((c) => c.vmid), [100, 101, 102], "all three kept");
+  assert.equal(w.hz.state.floatingIps.size, 2, "the Floating IP A holds is kept, and the gateway's with the server");
   assert.notEqual(rec.testFloatingIpId, null, "and still on the record, so a re-run or --destroy can release it");
-  assert.match(error, new RegExp(`kept for inspection: test containers 100, 101 and Floating IP ${rec.testFloatingIpId}; a re-run deletes them first`));
+  assert.match(error, new RegExp(`kept for inspection: test containers 100, 101, 102 and Floating IP ${rec.testFloatingIpId}; a re-run deletes them first`));
   assert.deepEqual(w.probes, [true, false], "the probe interface is still removed");
   assert.equal(servers(w).size, 1);
   assert.deepEqual(w.saved.map((d) => d.suffix), ["-verify"]);
@@ -761,10 +849,11 @@ test("a re-run deletes what --keep-on-failure kept before making its own, and le
   };
   const r = await executeInstall(resumed.deps, opts({ ipv4Test: true }), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
-  assert.deepEqual(destroyed.slice(0, 2), [100, 101], "the kept ones go first");
+  assert.deepEqual(destroyed.slice(0, 3), [100, 101, 102], "the kept ones go first");
   ok(!destroyed.includes(104), "a customer's container is never touched");
-  assert.deepEqual(resumed.containers, [other]);
-  assert.equal(resumed.hz.state.floatingIps.size, 0, "kept and new Floating IPs both released");
+  assert.deepEqual(testContainers(resumed), [other]);
+  assert.equal(resumed.hz.state.floatingIps.size, 1, "kept and new test Floating IPs both released; the gateway's stays");
+  assert.equal(gatewayIps(resumed).length, 1);
   ok(![...resumed.hz.state.floatingIps.keys()].map(String).includes(String(keptIp)));
   assert.equal(resumed.installs.get("sowsi-proxmox-02")!.testFloatingIpId, null);
   assert.equal(resumed.nodes.length, 1);
@@ -785,7 +874,7 @@ test("a kept test container that won't delete stops the re-run before it makes n
 test("without --keep-on-failure a step 4 failure releases the Floating IP and deletes everything", async () => {
   const w = world({ rulesLostOnRestart: true });
   await executeInstall(w.deps, opts({ ipv4Test: true }), settings);
-  assert.deepEqual(w.containers, []);
+  assert.deepEqual(testContainers(w), []);
   assert.equal(w.hz.state.floatingIps.size, 0);
   assert.equal(servers(w).size, 0);
 });
@@ -872,7 +961,7 @@ test("a failed test container is cleaned up (container, Floating IP) before the 
   const w = world({ outbound6: "fail" });
   const r = await executeInstall(w.deps, opts({ ipv4Test: true }), settings);
   assert.match((r as { error: string }).error, /can't reach the internet over IPv6/);
-  assert.deepEqual(w.containers, []);
+  assert.deepEqual(testContainers(w), []);
   assert.equal(w.hz.state.floatingIps.size, 0);
   assert.equal(servers(w).size, 0);
   assert.equal(w.nodes.length, 0, "never registered");
@@ -918,7 +1007,7 @@ test("a re-run resumes at the first unfinished step and repeats nothing before i
 /** The same simulated Hetzner, server and records, with no injected failure unless `cfg` says so. */
 function resumeWorld(w: World, cfg: WorldCfg = {}): World {
   const fresh = world(cfg, w.hz);
-  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt", "pinName", "guardInstalled", "repaired", "resolvStatic"] as const) {
+  for (const key of ["installs", "nodes", "logs", "alerts", "commands", "booted", "kernel", "staged", "installed", "pveInstall", "hostKey", "authorized", "containers", "clock", "firewall", "saved", "rebootAt", "pinName", "guardInstalled", "repaired", "resolvStatic", "gw", "curls"] as const) {
     (fresh as Record<string, unknown>)[key] = (w as Record<string, unknown>)[key];
   }
   return fresh;
@@ -1565,7 +1654,7 @@ test("re-installing a destroyed name never reuses the row: the old record stays 
   const shown: string[] = [];
   w.deps.report = (l) => void shown.push(l);
   // A brand-new server this time.
-  Object.assign(w, { authorized: [INSTALL_KEY, ADMIN_KEY], pveInstall: "none", kernel: "6.1.0-26-cloud-amd64", staged: "", installed: "original", rebootAt: null, booted: "boot-1", pinName: null, guardInstalled: false });
+  Object.assign(w, { authorized: [INSTALL_KEY, ADMIN_KEY], pveInstall: "none", kernel: "6.1.0-26-cloud-amd64", staged: "", installed: "original", rebootAt: null, booted: "boot-1", pinName: null, guardInstalled: false, containers: [], gw: { installed: false, version: null, table: "", syncs: [], counted: 0 } });
   w.nodes.length = 0;
   const r = await executeInstall(w.deps, opts(), settings);
   assert.equal(r.ok, true, (r as { error?: string }).error);
@@ -1807,4 +1896,279 @@ test("prices in another currency are refused, not converted at the dollar rate",
   assert.equal(p.ok, false);
   assert.match(p.problems.join(), /Hetzner reports prices in EUR/);
   ok(hetznerRequests(w).every((r) => r.method === "GET"), "nothing bought");
+});
+
+// ── The shared IPv4 gateway (Stage B) ────────────────────────────────
+
+const GATEWAY_MONTHLY = Math.ceil(3.5 * 100 * 100);
+const FIP_HOURLY = Math.ceil(0.0056 * 100 * 100);
+const fipRow = (id: number, ip: string, server: number | null, labels: Record<string, string>, description: string | null = null) => ({ id, name: `fip-${id}`, description, ip, type: "ipv4", server, home_location: { name: "nbg1" }, blocked: false, labels, dns_ptr: [] });
+const errorOf = (r: { ok: boolean }) => (r as { error?: string }).error ?? "";
+
+test("gateway: its own Floating IP, labelled and counted against the cap, container 9000 on it, HAProxy, checked from outside", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, errorOf(r));
+  const [serverId] = [...servers(w).keys()];
+  const [fip] = gatewayIps(w);
+  assert.equal(fip.server, serverId, "assigned to the node");
+  assert.deepEqual(fip.labels, { [INSTALL_LABEL]: "gateway", "sowsi-node": NAME }, "labelled, so --destroy knows it's the installer's");
+  assert.equal(fip.description, `sowsi-gateway-${NAME}`);
+  const bought = w.logs.filter((l) => l.action === "FLOATING_IP_PURCHASED");
+  assert.equal(bought.length, 1);
+  assert.equal(bought[0].cost, GATEWAY_MONTHLY, "a full month against the cap, like a server");
+  assert.deepEqual(w.created.find((c) => c.vmid === 9000), { vmid: 9000, ipv4: fip.ip, ipv6: undefined }, "its Floating IP, and no IPv6: IPv6 visitors go straight to the container");
+  const c = w.commands;
+  ok(c.indexOf("routes") < c.indexOf("gateway install") && c.indexOf("gateway install") < c.indexOf("gateway status"), "routes first, then HAProxy, then its facts");
+  ok(c.indexOf("gateway status") < c.indexOf("add provisioning key"), "all before the lockdown, on the install key");
+  for (const id of ["http_unknown", "https_unknown", "https_nosni"] as const) ok(w.curls.some((a) => JSON.stringify(a) === JSON.stringify(S.gatewayProbe(fip.ip as string, id))), `checked from outside: ${id}`);
+  const rec = w.installs.get(NAME)!;
+  assert.equal(rec.gatewayFloatingIpId, String(fip.id));
+  assert.equal(rec.gatewayMonthlyPaise, GATEWAY_MONTHLY);
+  assert.match(JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "gateway")), /container 9000 on Floating IP 198\.51\.100\.7 .*HAProxy active, table version 0 \(0 routes\), no logins, ports 80,443, 61 MB in use/);
+});
+
+test("gateway: the plan shows its Floating IP and counts it against the cap with the server", async () => {
+  const ok1 = await planInstall(world().deps, opts(), settings);
+  assert.equal(ok1.cost!.gatewayMonthlyPaise, GATEWAY_MONTHLY);
+  assert.match(ok1.cost!.lines.join("\n"), /gateway: one Floating IPv4 for the node's shared IPv4 gateway, \$0\.0056\/hour, at most \$3\.50\/month \(invoice\); the API lists \$3\.50\/month; kept while the node lives; ₹350 against the spend cap/);
+  const server = Math.ceil(23.49 * 100 * 100);
+  const tight = await planInstall(world({ spent: settings.spendCapPaise - server - 100 }).deps, opts(), settings);
+  assert.equal(tight.ok, false, "the server alone would fit; with its gateway it doesn't");
+  assert.match(tight.problems.join(), /buying it and its gateway's Floating IP takes this month's infrastructure spend to ₹5,349, over the ₹5,000 cap/);
+});
+
+test("gateway: a cap reached since the plan stops it before anything is bought", async () => {
+  const w = world();
+  let reads = 0;
+  w.deps.db.spentThisMonthPaise = async () => (reads++ === 0 ? 0 : settings.spendCapPaise - 100);
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, false);
+  assert.match(errorOf(r), /failed at step 3h\+ shared IPv4 gateway[\s\S]*its Floating IP takes this month's infrastructure spend to ₹5,349, over the ₹5,000 cap \(ENGINE_SPEND_CAP_PAISE\)\. Nothing was bought\./);
+  assert.equal(w.hz.state.floatingIps.size, 0);
+  ok(!hetznerRequests(w).some((q) => q.method === "POST" && q.path === "/floating_ips"), "never asked Hetzner for one");
+  assert.equal(servers(w).size, 0, "and the server went, as with any failed install");
+});
+
+test("gateway: Hetzner's Floating IP limit is said plainly; nothing was bought", async () => {
+  const w = world();
+  w.deps.hetzner.buyFloatingIP = async () => {
+    throw Object.assign(new Error("floating_ip limit exceeded"), { code: "resource_limit_exceeded" });
+  };
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.match(errorOf(r), /Hetzner's Floating IP limit for this project is reached — ask Hetzner to raise it \(Console → Limits\), or release an unused one\. Nothing was bought\./);
+  assert.equal(w.logs.filter((l) => l.action === "FLOATING_IP_PURCHASED").length, 0, "no spend recorded");
+});
+
+test("gateway: a run that stopped right after buying adopts that IP, and buys no second one", async () => {
+  const w = world();
+  w.hz.state.floatingIps.set(7777, fipRow(7777, "198.51.100.40", null, { [INSTALL_LABEL]: "gateway", "sowsi-node": NAME }, `sowsi-gateway-${NAME}`));
+  // Someone else's, unlabelled, and a gateway IP of another node: neither is taken.
+  w.hz.state.floatingIps.set(7778, fipRow(7778, "198.51.100.41", null, {}));
+  w.hz.state.floatingIps.set(7779, fipRow(7779, "198.51.100.42", null, { [INSTALL_LABEL]: "gateway", "sowsi-node": "sowsi-proxmox-09" }));
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, errorOf(r));
+  ok(!hetznerRequests(w).some((q) => q.method === "POST" && q.path === "/floating_ips"), "nothing bought");
+  assert.equal(w.installs.get(NAME)!.gatewayFloatingIpId, "7777");
+  assert.equal(w.hz.state.floatingIps.get(7777)!.server, [...servers(w).keys()][0]);
+  assert.equal(w.hz.state.floatingIps.get(7778)!.server, null);
+  assert.equal(w.hz.state.floatingIps.get(7779)!.server, null);
+  const log = w.logs.find((l) => l.action === "FLOATING_IP_PURCHASED")!;
+  assert.equal((log.after as { adopted: boolean }).adopted, true);
+  assert.equal(log.cost, GATEWAY_MONTHLY, "an adopted IP is counted too: it was bought this run");
+});
+
+test("gateway: a container 9000 that isn't the gateway is never touched, and the server it's on is never deleted", async () => {
+  const w = world({ otherContainers: [{ vmid: 9000, name: "sowsi-cmabc123" }] });
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, false);
+  assert.match(errorOf(r), /container 9000 exists and isn't the gateway \(sowsi-cmabc123\) — not touching it/);
+  assert.match(errorOf(r), /server \d+ NOT deleted: the node has container\(s\) 9000 sowsi-cmabc123/);
+  assert.match(errorOf(r), /gateway Floating IP \d+ kept with the server/);
+  assert.deepEqual(w.containers, [{ vmid: 9000, name: "sowsi-cmabc123" }]);
+  assert.equal(servers(w).size, 1);
+  ok(!w.created.some((c) => c.vmid === 9000), "nothing was created over it");
+});
+
+test("gateway: a broken gateway fails its step; its Floating IP goes with the server, and the spend is settled to the hours it lived", async () => {
+  const cases: [WorldCfg, RegExp][] = [
+    [{ gatewayStatus: { public_ports: "22,80,443" } }, /ports open on the gateway: 22,80,443, expected 80,443/],
+    [{ gatewayStatus: { config: "/etc/haproxy/haproxy.cfg" } }, /HAProxy reads \/etc\/haproxy\/haproxy\.cfg/],
+    [{ gatewayStatus: { haproxy_enabled: "disabled" } }, /wouldn't start after a reboot/],
+    [{ gatewayStatus: { logins: "1" } }, /holds 1 authorized SSH key/],
+    [{ routesIgnoreGateway: true }, /sowsi-routes didn't take container 9000 as the gateway/],
+    [{ gatewayFault: "unknown_served" }, /an unknown name on port 80 got 200, not the neutral 404/],
+    [{ gatewayFault: "no_sni_answers" }, /TLS with no name on port 443 was answered/],
+  ];
+  for (const [cfg, why] of cases) {
+    const w = world(cfg);
+    const r = await executeInstall(w.deps, opts(), settings);
+    assert.equal(r.ok, false, JSON.stringify(cfg));
+    assert.match(errorOf(r), /failed at step 3h\+ shared IPv4 gateway/, JSON.stringify(cfg));
+    assert.match(errorOf(r), why);
+    assert.equal(w.hz.state.floatingIps.size, 0, `${JSON.stringify(cfg)}: released`);
+    assert.equal(servers(w).size, 0);
+    const settled = w.logs.find((l) => l.action === "FLOATING_IP_COST_SETTLED")!;
+    const after = settled.after as { hours: number; accruedPaise: number; monthlyPaise: number };
+    assert.equal(after.monthlyPaise, GATEWAY_MONTHLY);
+    assert.equal(after.accruedPaise, Math.min(after.hours * FIP_HOURLY, GATEWAY_MONTHLY), "billed hourly, up to the monthly price (the invoice)");
+    assert.equal(settled.cost, after.accruedPaise - GATEWAY_MONTHLY, "the difference is given back to the cap");
+    const rec = w.installs.get(NAME)!;
+    assert.deepEqual([rec.gatewayFloatingIpId, rec.gatewayIpv4, rec.gatewayPurchasedAt, rec.gatewayMonthlyPaise], [null, null, null, null]);
+  }
+});
+
+test("gateway: --keep-on-failure keeps its Floating IP with the server, and says so", async () => {
+  const w = world({ gatewayStatus: { ssh: "active" } });
+  const r = await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  assert.match(errorOf(r), /SSH is running in the gateway/);
+  assert.match(errorOf(r), /server \d+ \(203\.0\.113\.20\) and its gateway Floating IP \d+ are KEPT/);
+  assert.equal(gatewayIps(w).length, 1);
+  assert.equal(w.logs.filter((l) => l.action === "FLOATING_IP_COST_SETTLED").length, 0);
+});
+
+test("step 4: two names reach two shared containers through the gateway, from outside, then the routes go", async () => {
+  const w = world();
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, true, errorOf(r));
+  assert.equal(w.gw.syncs.length, 2);
+  const [routed, cleared] = w.gw.syncs;
+  assert.equal(routed.table, `one.gateway.test sowsitest0000101 ${S.TEST_IPV4.second} 0\ntwo.gateway.test sowsitest0000102 ${S.TEST_IPV4.third} 0\n`);
+  ok(routed.version > 0, "above the empty table the install applied");
+  assert.deepEqual(cleared, { version: routed.version + 1, table: "" });
+  for (const id of S.GATEWAY_PROBES) ok(w.curls.some((a) => JSON.stringify(a) === JSON.stringify(S.gatewayProbe("198.51.100.7", id))), `asked from outside: ${id}`);
+  ok(w.gw.counted >= 4, "the rule meant for the gateway's traffic counted it");
+  const detail = JSON.stringify(w.logs.find((l) => (l.after as { step?: string })?.step === "verify"));
+  assert.match(detail, /gateway 198\.51\.100\.7: one\.gateway\.test → container 101, two\.gateway\.test → container 102, on 80 and 443 \(curl --resolve from sowsi-mgmt-01\); X-Forwarded-For 2\.31\.11\.105, the client's own value dropped; unknown name: 404 on 80, closed on 443, also with no name; routes removed again/);
+  const c = w.commands;
+  ok(c.indexOf("shared outbound") < c.indexOf(`gateway sync ${routed.version}`) && c.indexOf(`gateway sync ${cleared.version}`) < c.indexOf("isolation proof"), "after NAT is proven, before the isolation proof");
+  assert.equal(w.nodes[0].gatewayRoutesVersion, BigInt(cleared.version));
+});
+
+test("step 4: a gateway that routes wrongly, passes a client's header, answers an unknown name or keeps a removed route fails, and leaves nothing behind", async () => {
+  const cases: [WorldCfg, RegExp][] = [
+    [{ gatewayFault: "swapped" }, /one\.gateway\.test on port 80 reached backend-102, not backend-101/],
+    [{ gatewayFault: "xff_passes" }, /the client's own X-Forwarded-For \(198\.51\.100\.66\) reached the site on one\.gateway\.test/],
+    [{ gatewayFault: "tls_answers" }, /an unknown TLS name on port 443 was answered/],
+    [{ gatewayFault: "route_stays" }, /one\.gateway\.test still got 200 after its route was removed, not the neutral 404/],
+    [{ gatewayFault: "not_counted" }, /gateway_in counted nothing \(0 → 0\)/],
+    [{ backendDown: true }, /test container 101 has no web server on 0\.0\.0\.0:80 and :443 \(tools present, 0 of 2 listening\)/],
+    [{ syncRefused: true }, /refused: line 1: no container on this node has 100\.127\.255\.11/],
+  ];
+  for (const [cfg, why] of cases) {
+    const w = world(cfg);
+    const r = await executeInstall(w.deps, opts(), settings);
+    assert.equal(r.ok, false, JSON.stringify(cfg));
+    assert.match(errorOf(r), why);
+    assert.deepEqual(testContainers(w), [], JSON.stringify(cfg));
+    assert.equal(w.gw.table, "", `${JSON.stringify(cfg)}: no test route left on the gateway`);
+    assert.equal(w.nodes.length, 0);
+    assert.equal(w.hz.state.floatingIps.size, 0, "the gateway's IP went with the server");
+  }
+});
+
+test("step 4: --keep-on-failure keeps the test routes with the containers they point at, and a re-run replaces them", async () => {
+  const w = world({ gatewayFault: "swapped" });
+  await executeInstall(w.deps, opts({ keepOnFailure: true }), settings);
+  assert.equal(w.gw.table.split("\n").filter(Boolean).length, 2, "kept as evidence");
+  const kept = w.gw.version!;
+  const resumed = resumeWorld(w);
+  const r = await executeInstall(resumed.deps, opts(), settings);
+  assert.equal(r.ok, true, errorOf(r));
+  ok(resumed.gw.syncs.at(-1)!.version > kept, "each new table's version is higher");
+  assert.equal(resumed.gw.table, "");
+});
+
+test("--destroy releases the node's gateway Floating IP and settles its spend; the plan lists it", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  const sid = String([...servers(w).keys()][0]);
+  const plan = await planDestroy(w.deps, sid, settings);
+  assert.equal(plan.ok, true, plan.problems.join());
+  assert.match(plan.lines.join("\n"), /release Floating IP \d+ \(198\.51\.100\.7\), the node's gateway/);
+  w.clock += 3 * 3_600_000;
+  const r = await executeDestroy(w.deps, sid, "sivakumar", settings);
+  assert.equal(r.ok, true, r.lines.join("\n"));
+  assert.match(r.lines.join("\n"), /released Floating IP \d+ \(198\.51\.100\.7\), the node's gateway; its spend settled to the hours it lived/);
+  assert.equal(w.hz.state.floatingIps.size, 0);
+  const settled = w.logs.find((l) => l.action === "FLOATING_IP_COST_SETTLED")!;
+  const after = settled.after as { hours: number; accruedPaise: number };
+  ok(after.hours >= 3, `${after.hours} hours`);
+  assert.equal(settled.cost, after.accruedPaise - GATEWAY_MONTHLY);
+  assert.equal(w.nodes.length, 0);
+});
+
+test("--destroy asks about a Floating IP it didn't buy, and never decides about another server's", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  const sid = String([...servers(w).keys()][0]);
+  // As on sowsi-test-04: a test IP made in the console and assigned to the server, with no labels.
+  w.hz.state.floatingIps.set(8888, fipRow(8888, "198.51.100.90", Number(sid), {}));
+  w.hz.state.floatingIps.set(8889, fipRow(8889, "198.51.100.91", 424242, {}, "someone else's"));
+  const plain = await planDestroy(w.deps, sid, settings);
+  assert.equal(plain.ok, false);
+  assert.match(plain.problems.join(), /Floating IP 8888 \(198\.51\.100\.90\) is assigned to this server and isn't labelled as a test or installer IP: add --release-floating-ip 8888 to release it, or --keep-floating-ip 8888 to leave it \(it stays billed, unassigned\)/);
+  assert.doesNotMatch(plain.problems.join(), /8889/);
+  assert.equal((await executeDestroy(w.deps, sid, "sivakumar", settings)).ok, false);
+  assert.equal(servers(w).size, 1, "nothing done until it's decided");
+  ok(w.hz.state.floatingIps.has(8888));
+  assert.match((await planDestroy(w.deps, sid, settings, { release: ["8889"], keep: [] })).problems.join(), /Floating IP 8889 \(198\.51\.100\.91, "someone else's"\) isn't assigned to server \d+: --destroy only decides about this server's/);
+  assert.match((await planDestroy(w.deps, sid, settings, { release: ["8888"], keep: ["8888"] })).problems.join(), /Floating IP 8888 is both released and kept/);
+  assert.match((await planDestroy(w.deps, sid, settings, { release: ["123"], keep: [] })).problems.join(), /Floating IP 123 \(--release-floating-ip\/--keep-floating-ip\) doesn't exist/);
+  const keep = await planDestroy(w.deps, sid, settings, { release: [], keep: ["8888"] });
+  assert.equal(keep.ok, true, keep.problems.join());
+  assert.match(keep.lines.join("\n"), /keep Floating IP 8888 \(198\.51\.100\.90\) \(--keep-floating-ip\): it stays billed, unassigned, until you release it/);
+  const r = await executeDestroy(w.deps, sid, "sivakumar", settings, { release: ["8888"], keep: [] });
+  assert.equal(r.ok, true, r.lines.join("\n"));
+  assert.match(r.lines.join("\n"), /released Floating IP 8888 \(198\.51\.100\.90\), --release-floating-ip/);
+  ok(!w.hz.state.floatingIps.has(8888));
+  ok(w.hz.state.floatingIps.has(8889), "another server's is never touched");
+  assert.equal(gatewayIps(w).length, 0);
+});
+
+test("--keep-floating-ip leaves it, unassigned: the server goes and the IP doesn't", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  const sid = String([...servers(w).keys()][0]);
+  w.hz.state.floatingIps.set(8888, fipRow(8888, "198.51.100.90", Number(sid), {}));
+  const r = await executeDestroy(w.deps, sid, "sivakumar", settings, { release: [], keep: ["8888"] });
+  assert.equal(r.ok, true, r.lines.join("\n"));
+  assert.equal(w.hz.state.floatingIps.get(8888)!.server, null, "left unassigned by the server's deletion, as you chose");
+});
+
+test("--destroy releases an installer-labelled IP no record holds (left by a run that stopped), and reports one that won't go", async () => {
+  const w = world();
+  assert.equal((await executeInstall(w.deps, opts(), settings)).ok, true);
+  const sid = String([...servers(w).keys()][0]);
+  w.hz.state.floatingIps.set(8890, fipRow(8890, "198.51.100.92", null, { [INSTALL_LABEL]: "test", "sowsi-node": NAME }));
+  const plan = await planDestroy(w.deps, sid, settings);
+  assert.equal(plan.ok, true, plan.problems.join());
+  assert.match(plan.lines.join("\n"), /release Floating IP 8890 \(198\.51\.100\.92\), the installer's test IP/);
+  const release = w.deps.hetzner.releaseFloatingIP;
+  w.deps.hetzner.releaseFloatingIP = async (id) => {
+    if (id === 8890) throw new Error("locked");
+    return release(id);
+  };
+  const r = await executeDestroy(w.deps, sid, "sivakumar", settings);
+  assert.equal(r.ok, false);
+  assert.match(r.lines.join("\n"), /Floating IP 8890 \(198\.51\.100\.92\) NOT released: locked/);
+  assert.match(r.lines.join("\n"), /deleted server/, "the server still goes");
+  assert.equal(gatewayIps(w).length, 0, "and the gateway's IP was released");
+});
+
+test("the gateway's spend actions count towards the cap", async () => {
+  const { SPEND_ACTIONS } = await import("@/engine/data/spend");
+  for (const a of ["FLOATING_IP_PURCHASED", "FLOATING_IP_COST_SETTLED"]) ok((SPEND_ACTIONS as readonly string[]).includes(a), a);
+});
+
+test("gateway: a Floating IP still there after its release is reported, kept on the record, and not settled", async () => {
+  const w = world({ gatewayStatus: { haproxy: "failed" } });
+  // Hetzner answers the release, but the IP is still listed afterwards.
+  w.deps.hetzner.releaseFloatingIP = async () => {};
+  const r = await executeInstall(w.deps, opts(), settings);
+  assert.equal(r.ok, false);
+  const id = w.installs.get(NAME)!.gatewayFloatingIpId;
+  assert.notEqual(id, null, "still on the record, so --destroy can release it");
+  assert.match(errorOf(r), new RegExp(`gateway Floating IP ${id} still exists after release`));
+  assert.equal(w.logs.filter((l) => l.action === "FLOATING_IP_COST_SETTLED").length, 0, "no spend given back for an IP that's still billing");
 });

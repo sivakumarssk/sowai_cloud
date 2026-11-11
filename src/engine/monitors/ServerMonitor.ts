@@ -4,6 +4,7 @@ import type { EngineConfig } from "../config";
 import { createLogger, type Logger } from "../log";
 import { Poller } from "../core/poller";
 import { nextLevel, sustained, type Level } from "./levels";
+import { isGatewayContainer } from "@/lib/nodes/gateway";
 
 const MB = 1024 ** 2;
 const GB = 1024 ** 3;
@@ -29,7 +30,7 @@ export type NodeReading = {
 
 export type StorageReading = { total: number; used: number };
 export type DiskImage = { vmid: number | null; size: number };
-export type NodeContainer = { vmid: number; status: string; mem: number; maxmem: number };
+export type NodeContainer = { vmid: number; name?: string; status: string; mem: number; maxmem: number };
 
 export type NodeUpdate = {
   nodeId: string;
@@ -277,8 +278,9 @@ export class ServerMonitor {
       freePoolBytes: freePoolBytes(disk.total, allocatedDisk, this.config.diskPoolReserveGB),
       physicalCpu: status.cpus,
       physicalCpuPct: round1(Math.min(1, Math.max(0, Number.isFinite(status.cpu) ? status.cpu : 0)) * 100),
-      totalContainers: containers.length,
-      activeContainers: containers.filter((c) => c.status === "running").length,
+      // The gateway (container 9000) is ours: its RAM counts, but it takes no customer's slot.
+      totalContainers: containers.filter((c) => !isGatewayContainer(c)).length,
+      activeContainers: containers.filter((c) => !isGatewayContainer(c) && c.status === "running").length,
       allocatedRam: containers.reduce((sum, c) => sum + c.maxmem, 0),
       volumes,
       volumeTotalSpace: volumes.reduce((sum, v) => sum + v.sizeBytes, 0),

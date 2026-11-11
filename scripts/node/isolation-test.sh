@@ -2,8 +2,8 @@
 # The isolation tests for a THROWAWAY node. It creates containers, reboots, resets ufw and changes
 # rules, so it refuses to run unless the node's name contains "test".
 #
-#   FIP=<floating ip> bash -s -- main     tests 1-14, 16, 17, 19, 21-24 (creates containers 900-902)
-#   bash -s -- reboot-check               test 18, after rebooting the node
+#   FIP=<floating ip> bash -s -- main     tests 1-14, 16, 17, 19, 21-24, 26-28 (creates containers 900-902)
+#   bash -s -- reboot-check               test 18, after rebooting the node (with the gateway, 28)
 #   bash -s -- bad-boot-prep              test 20, then reboot
 #   bash -s -- bad-boot-check             test 20, after that reboot
 #   bash -s -- rollback-prep              test 25: makes the node look like one without these rules
@@ -49,6 +49,21 @@ blocked() { # label counter container host port
   after=$(count "$counter")
   if ((after > before)); then ok "$label ($counter +$((after - before)))"; else bad "$label: refused, but $counter stayed at $after"; fi
 }
+# The gateway (container 9000, Stage B), as sowsi-gateway status reports it.
+gateway_fact() { /usr/local/sbin/sowsi-gateway status 2>/dev/null | sed -n "s/^$1=//p" | head -1; }
+gateway_check() { # label
+  local label=$1 gw code v
+  gw=$(gateway_fact ipv4) v=$(gateway_fact version)
+  if [[ $(gateway_fact container) == running ]]; then ok "$label the gateway container is running, on $gw"; else bad "$label the gateway container isn't running"; return; fi
+  if [[ $(gateway_fact haproxy) == active && $(gateway_fact haproxy_enabled) == enabled ]]; then ok "$label HAProxy is active and enabled"; else bad "$label HAProxy is $(gateway_fact haproxy), $(gateway_fact haproxy_enabled)"; fi
+  if [[ -n $v && $(gateway_fact live_version) == "$v" ]]; then ok "$label HAProxy serves the applied table (version $v, $(gateway_fact routes) routes)"; else bad "$label HAProxy serves version $(gateway_fact live_version), applied: ${v:-none}"; fi
+  if [[ $(gateway_fact route) == 1 ]]; then ok "$label the host routes $gw to it"; else bad "$label no host route for $gw"; fi
+  if [[ $(gateway_fact public_ports) == 80,443 && $(gateway_fact ssh) != active ]]; then ok "$label only 80 and 443 are open on it, and no SSH"; else bad "$label open: $(gateway_fact public_ports), ssh $(gateway_fact ssh)"; fi
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -H 'Host: unknown.gateway.test' "http://$gw/")
+  if [[ $code == 404 ]]; then ok "$label an unknown name on port 80 gets the neutral 404"; else bad "$label an unknown name on port 80 got $code"; fi
+  if curl -sk -m 5 -o /dev/null --resolve "unknown.gateway.test:443:$gw" https://unknown.gateway.test/; then bad "$label an unknown TLS name was answered"; else ok "$label an unknown TLS name on port 443 is closed"; fi
+}
+
 same_counter() {
   local label=$1 counter=$2 before after; shift 2
   before=$(count "$counter")
@@ -225,8 +240,20 @@ until docker info >/dev/null 2>&1; do
   if ((SECONDS >= deadline)); then echo "step=daemon"; exit 1; fi
   sleep 1
 done
+# Whatever an earlier run left under this name goes first.
 docker rm -f t >/dev/null 2>&1
-if ! docker run -d --name t -p 8080:80 nginx:alpine >/dev/null 2>&1; then echo "step=run"; docker ps -a 2>&1 | tail -3; exit 1; fi
+# The error and exit code of docker run, and one retry: a pull can fail once on a slow registry.
+started=no
+for attempt in 1 2; do
+  rc=0
+  err=$(docker run -d --name t -p 8080:80 nginx:alpine 2>&1 >/dev/null) || rc=$?
+  if ((rc == 0)); then started=yes; break; fi
+  echo "run_exit=$rc (attempt $attempt)"
+  printf "%s\n" "$err" | tail -5 | sed "s/^/run_error: /"
+  docker rm -f t >/dev/null 2>&1
+  sleep 5
+done
+if [[ $started != yes ]]; then echo "step=run"; docker ps -a 2>&1 | tail -3; exit 1; fi
 start=$SECONDS deadline=$((SECONDS + 30)) rc=1
 while ((SECONDS < deadline)); do
   if curl -fsS -m 2 -o /dev/null http://localhost:8080; then rc=0; echo "served_after=$((SECONDS - start))s"; break; fi
@@ -236,12 +263,35 @@ if ((rc != 0)); then echo "step=port"; docker ps -a 2>&1 | tail -3; docker logs 
 docker rm -f t >/dev/null 2>&1
 exit $rc'
   if docker_out=$(in_ct "$A" "$docker_check" 2>&1); then
-    ok "16 Docker pulled and served a published port (${docker_out#served_after=})"
+    served=$(sed -n 's/^served_after=//p' <<<"$docker_out")
+    if grep -q '^run_exit=' <<<"$docker_out"; then
+      ok "16 Docker pulled and served a published port (after $served, on the second try)"
+      grep -E '^run_(exit|error)' <<<"$docker_out" | sed 's/^/       /'
+    else
+      ok "16 Docker pulled and served a published port (after $served)"
+    fi
   else
     bad "16 Docker failed at $(sed -n 's/^step=//p' <<<"$docker_out" | head -1): check whether the rules or Docker in LXC are the cause"
     sed 's/^/       /' <<<"$docker_out"
   fi
   if [[ $(count spoof_ip4) == "$spoofs" ]]; then ok "16 no spoof counter rose"; else bad "16 Docker's traffic hit a spoof rule"; fi
+
+  echo "== 28 the shared IPv4 gateway"
+  gateway_check "28"
+  gw=$(gateway_fact ipv4) v=$(gateway_fact version)
+  if [[ -n $gw && -n $v ]]; then
+    if printf 'A.EXAMPLE.COM sowsitest0000901 %s 0\n' "$IP4_B" | /usr/local/sbin/sowsi-gateway sync $((v + 1)) >/dev/null 2>&1; then bad "28 a table with a bad line was applied"; else ok "28 a table with a bad line is refused"; fi
+    if [[ $(gateway_fact version) == "$v" ]]; then ok "28 and the applied version is unchanged"; else bad "28 the applied version changed to $(gateway_fact version)"; fi
+    if SOWSI_GATEWAY_TEST_APPEND="this is not haproxy" /usr/local/sbin/sowsi-gateway sync $((v + 1)) </dev/null >/dev/null 2>&1; then bad "28 a config HAProxy rejects was applied"; else ok "28 a config HAProxy rejects is refused"; fi
+    if [[ $(gateway_fact version) == "$v" && $(gateway_fact live_version) == "$v" ]]; then ok "28 the last good config is still serving (version $v)"; else bad "28 serving $(gateway_fact live_version), applied $(gateway_fact version)"; fi
+    if ((v > 0)); then
+      if /usr/local/sbin/sowsi-gateway sync $((v - 1)) </dev/null >/dev/null 2>&1; then bad "28 an older version was applied"; else ok "28 an older version is refused"; fi
+    fi
+    blocked "28 a container with its own IP can't reach a shared container's port 80: only the gateway may" to_neighbour_l3 "$A" "$IP4_B" 80
+    blocked "28 the gateway can't reach a shared container's SSH" to_neighbour_l3 9000 "$IP4_B" 22
+    rises "28 a container reaches the gateway on port 80 (a site calling its own domain)" gateway_hairpin reach "$B" "$gw" 80
+    blocked "28 but not on any other port" to_neighbour_l3 "$B" "$gw" 22
+  fi
 
   echo "== 17 container restart"
   pct reboot "$B"
@@ -314,6 +364,7 @@ reboot_check() {
   blocked "18 the host is still blocked" to_host "$A" "$NODE4" 22
   check "18 the neighbour came back" pct status "$B"
   rises "18 shared mode still leaves by NAT after the reboot" nat_out in_ct "$B" "ping -4 -c 2 -W 3 1.1.1.1"
+  gateway_check "18 after the reboot:"
   restart_spoof_check "18 after the reboot" "$A" "$(sed -n 's/^net0:.*,ip=\([0-9.]*\)\/32.*/\1/p' "/etc/pve/lxc/$A.conf" | head -1)"
   finish
 }

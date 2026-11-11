@@ -11,6 +11,7 @@ committed, and stops for review before the next one starts.
 - Razorpay checkout and webhooks; plan prices with intro, renewal, GST and the 2% charges.
 - Truth pass: claims the product doesn't deliver were removed from the site.
 
+
 **Environments and data safety**
 - `APP_ENV` development | production, checked by the app, every script, the billing cron and the
   engine. Development: test keys, simulated provisioner, no real infrastructure tokens.
@@ -38,19 +39,48 @@ committed, and stops for review before the next one starts.
 - Invoice facts recorded: 20 TB traffic a month per CPX server, then $1.20/TB; Floating IPv4
   $0.0056/hour, at most $3.50 a month.
 
+**Shared IPv4 gateway, Stage A: private IPv4 per service and NAT** (proven on sowsi-test-04, 11 Nov 2026)
+- Each service can hold a private IPv4 from `100.64.0.0/10`, from a sequence, never reused;
+  `100.127.255.0/24` is kept for tests. A Proxmox service may be ACTIVE with a Floating IP, or in
+  shared mode with a private IPv4 (database constraint and `serverReady.ts`).
+- NAT in the sowsi tables (`shared_out`, counted as `nat_out`); new connections from outside to the
+  range are dropped (`shared_in`); the range is a private destination containers can't send to.
+- Installer step 4 proves it: the second test container is at `100.127.255.11` and reached the
+  internet over IPv4 through NAT (nat_out 0 → 3).
+- isolation-test.sh: 65 passed, 1 failed (test 16, the test itself: see Stage B). Test 27, all 6;
+  reboot-check, 14 passed, including NAT after the reboot. Destroy and `--expect-gone` clean.
+- Every service still defaults to a dedicated IPv4; nothing uses shared mode until Stage C.
+
 ## In progress
 
-**1. Shared IPv4 gateway — Stage A: private IPv4 per service and NAT.**
-Built and tested locally; waiting for the throwaway-node test.
+**1. Shared IPv4 gateway — Stage B: the gateway container.** Built and tested locally; waiting
+for the throwaway-node test.
+- `sowsi-gateway` on each node: HAProxy in container 9000 on a Floating IP of its own. Port 80 by
+  the Host header, 443 by the TLS name, passed through still encrypted. Unknown name: a neutral 404
+  on 80, a closed connection on 443. The client's own X-Forwarded-For is dropped.
+- `sync <version>`: the whole table on stdin, every line checked (hostname, 16-character key,
+  a shared address of a container on this node, PROXY 0 or 1), size-capped, older versions refused;
+  then HAProxy's config test, a graceful reload, proof the new version serves, else back to the
+  last good. Dispatcher: `gateway-status`, `gateway-sync <version>`.
+- Rules: the gateway reaches shared containers on 80 and 443 only; containers reach it on 80 and
+  443 only (a site calling its own domain).
+- Installer: a gateway step (its Floating IP under the spend cap, adopted if a run stopped after
+  buying it, released with the server on a failed install), step 4 proves two names route to two
+  containers from outside, and the node registers with its gateway. The gateway takes no
+  customer's slot in `maxContainers`.
+- `--destroy` releases every Floating IP the installer labelled; any other on the server stops the
+  plan until `--release-floating-ip <id>` or `--keep-floating-ip <id>`.
+- isolation-test.sh test 16 prints docker run's own error and retries once; test 28 checks the
+  gateway on the node, and again after a reboot.
 
 ## Pending
 
 **1. Shared IPv4 gateway** (design: "Shared IPv4 Gateway Design", with your answers of 11 Nov 2026)
-- Stage B: gateway container (VM 9000, HAProxy, its own Floating IP), `sowsi-gateway sync`,
-  dispatcher command, injection tests, installer step.
 - Stage C: shared mode in provisioning behind a per-node flag, one connection helper, labels
-  everywhere an IP is shown.
-- Stage F: abuse limits and a per-service ports panel (IPv6 default-deny).
+  everywhere an IP is shown. The sync job (on every route change and every 5 minutes) sends
+  versions above the node's `gatewayRoutesVersion`.
+- Stage F: abuse limits and a per-service ports panel (IPv6 default-deny); per-client limits in
+  HAProxy (Stage B has a 5,000 connection ceiling and 500 per site).
 - Stage G: dedicated IPv4 add-on (monthly). Touches billing: designed in test mode first, then your
   approval, and the questions for Razorpay in writing. Until it's live, every new service keeps a
   dedicated IPv4 included and nobody can untick it. Coolify plans keep it included until a Traefik

@@ -176,6 +176,54 @@ whenBash("shared mode: a private address leaves by NAT on the uplink only, and i
   assert.equal(r.rules.match(/\bmasquerade\b/g)!.length, 1);
 });
 
+const GATEWAY = "hostname: sowsi-gateway\nnet0: name=eth0,bridge=vmbr1,gw=172.31.1.1,hwaddr=BC:24:11:AA:BB:90,ip=203.0.113.50/32,type=veth";
+const forwarded = (rules: string) => /  chain forwarded \{\n([\s\S]*?)\n  \}/.exec(rules)?.[1] ?? "";
+
+whenBash("the gateway (container 9000) reaches shared containers on 80 and 443 only, and containers reach it on 80 and 443 only", () => {
+  const r = runRoutes({ containers: { 100: FLOATING, 102: SHARED, 9000: GATEWAY } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^isolation: 3 containers, gateway 203\.0\.113\.50$/m);
+  const fwd = forwarded(r.rules).split("\n").map((l) => l.trim());
+  assert.deepEqual(fwd.slice(1, 6), [
+    'iifname != "vmbr1" ip daddr 100.64.0.0/10 ct state new counter name shared_in drop',
+    'iifname "vmbr1" oifname "vmbr1" ip saddr 203.0.113.50 ip daddr 100.64.0.0/10 tcp dport { 80, 443 } counter name gateway_in accept',
+    'iifname "vmbr1" oifname "vmbr1" ip saddr 100.64.0.0/10 ip daddr 203.0.113.50 tcp sport { 80, 443 } ct direction reply ct state established accept',
+    'iifname "vmbr1" oifname "vmbr1" ip daddr 203.0.113.50 tcp dport { 80, 443 } counter name gateway_hairpin accept',
+    'iifname "vmbr1" oifname "vmbr1" ip saddr 203.0.113.50 tcp sport { 80, 443 } ct direction reply ct state established accept',
+  ], "after the outside drop, before everything between ports is dropped");
+  before(r.rules, "counter name gateway_hairpin accept", "counter name to_neighbour_l3 drop");
+  assert.equal(fwd.filter((l) => l.endsWith("accept") && l.includes('oifname "vmbr1"')).length, 4, "no other way between ports");
+  assert.ok(fwd.filter((l) => l.includes("203.0.113.50")).every((l) => l.includes("tcp dport { 80, 443 }") || l.includes("tcp sport { 80, 443 } ct direction reply ct state established")), "every gateway rule is 80 and 443 only; replies only the other way");
+  assert.match(r.rules, /counter gateway_in \{ \}\n  counter gateway_hairpin \{ \}/);
+  // Isolated like any container: its own MAC and address, IPv4 only.
+  const c = chain(r.rules, "9000");
+  assert.ok(c.includes("ether type ip ip saddr != 203.0.113.50 counter name spoof_ip4 drop"));
+  assert.ok(c.includes("ether type != { arp, ip } counter name bad_frame drop"));
+  assert.match(r.calls, /^ip route replace 203\.0\.113\.50\/32 dev vmbr1 proto 250$/m);
+});
+
+whenBash("only container 9000 named sowsi-gateway, on a public address with a valid line, is taken for the gateway", () => {
+  const cases: [Record<string, string>, string][] = [
+    [{ 9000: GATEWAY.replace("sowsi-gateway", "sowsi-cmabc123") }, "a customer's container at 9000"],
+    [{ 9000: GATEWAY.replace("hostname: sowsi-gateway\n", "") }, "no hostname"],
+    [{ 101: GATEWAY }, "the name, at another id"],
+    [{ 9000: GATEWAY.replace("203.0.113.50", "100.64.0.50") }, "a shared address"],
+    [{ 9000: GATEWAY.replace("hwaddr=BC:24:11:AA:BB:90", "hwaddr=NOT-A-MAC") }, "a refused net0 line"],
+    [{ 9000: GATEWAY.replace("bridge=vmbr1", "bridge=vmbr0") }, "another bridge"],
+    [{ 9000: `${GATEWAY}\n\n[snapshot]\nhostname: old` }, ""],
+  ];
+  for (const [containers, why] of cases) {
+    const r = runRoutes({ containers: { 102: SHARED, ...containers } });
+    assert.equal(r.status, 0, r.stderr);
+    if (!why) {
+      assert.match(r.rules, /gateway_in accept/, "a snapshot's hostname doesn't matter: the first one does");
+      continue;
+    }
+    assert.doesNotMatch(r.rules, /counter name gateway_(in|hairpin) accept/, why);
+    assert.doesNotMatch(r.stdout, /gateway /, why);
+  }
+});
+
 whenBash("the uplink follows the default route if the boot guard has dropped the bridge, and never includes vmbr1 or a bad name", () => {
   assert.ok(runRoutes({ defaultDev: "eth0" }).rules.includes('oifname != { "eth0", "vmbr0" }'));
   assert.ok(runRoutes({ defaultDev: "vmbr1" }).rules.includes('oifname != { "vmbr0" }'));
@@ -536,7 +584,7 @@ whenBash("isolation-test.sh tests 17 and 18 learn the gateway first, then check 
 });
 
 /** isolation-test.sh test 16's in-container script, with apt, docker and curl faked. sleep moves bash's clock. */
-function runDockerCheck(o: { daemonAfter?: number; portAfter?: number; runFails?: boolean; installFails?: boolean } = {}) {
+function runDockerCheck(o: { daemonAfter?: number; portAfter?: number; runFails?: boolean; runFailsOnce?: boolean; installFails?: boolean } = {}) {
   const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8").replace(/\r\n/g, "\n");
   const check = /\n {2}docker_check='([\s\S]*?)'\n/.exec(script)![1];
   const fakes = `
@@ -545,7 +593,16 @@ apt-get() { return ${o.installFails ? 1 : 0}; }
 docker() {
   case "$1" in
     info) [ "$SECONDS" -ge ${o.daemonAfter ?? 0} ] ;;
-    run) echo "docker run $*" >> calls; return ${o.runFails ? 125 : 0} ;;
+    run)
+      echo "docker run $*" >> calls
+      if ${o.runFails ? "true" : o.runFailsOnce ? "[ ! -f ran ]" : "false"}; then
+        : > ran
+        echo "docker: Error response from daemon: Get \"https://registry-1.docker.io/v2/\": net/http: TLS handshake timeout." >&2
+        echo "See 'docker run --help'." >&2
+        return 125
+      fi
+      echo "3f9ac21e7b10"
+      ;;
     rm) echo "docker rm" >> calls ;;
     ps) echo "CONTAINER ID   IMAGE          STATUS" ;;
     logs) echo "nginx: starting" ;;
@@ -574,9 +631,26 @@ whenBash("test 16 waits up to 30 seconds for Docker's port, and says which step 
   assert.ok(tries.length >= 20 && tries.at(-1)! < 31, `retried for 30 seconds, then stopped (${tries.length} tries, last at ${tries.at(-1)})`);
 
   assert.match(runDockerCheck({ daemonAfter: 999 }).stdout, /^step=daemon$/m);
-  assert.match(runDockerCheck({ runFails: true }).stdout, /^step=run$/m);
   assert.match(runDockerCheck({ installFails: true }).stdout, /^step=install$/m);
-  assert.doesNotMatch(runDockerCheck({ runFails: true }).calls, /curl/, "no waiting on a port that can't come");
+});
+
+whenBash("test 16 removes a leftover test container first, prints docker run's own error and exit code, and tries once more", () => {
+  const fails = runDockerCheck({ runFails: true });
+  assert.notEqual(fails.status, 0);
+  assert.match(fails.stdout, /^step=run$/m);
+  assert.match(fails.stdout, /^run_exit=125 \(attempt 1\)$/m);
+  assert.match(fails.stdout, /^run_exit=125 \(attempt 2\)$/m);
+  assert.match(fails.stdout, /^run_error: docker: Error response from daemon: Get "?https:\/\/registry-1\.docker\.io\/v2\/"?: net\/http: TLS handshake timeout\.$/m, "Docker's own words, not an empty ps header");
+  assert.equal(fails.calls.match(/^docker run /gm)!.length, 2, "two tries, no more");
+  assert.match(fails.calls, /^docker rm\ndocker run /, "a container left by an earlier run is removed before the first try");
+  assert.doesNotMatch(fails.calls, /curl/, "no waiting on a port that can't come");
+  assert.doesNotMatch(fails.stdout, /3f9ac21e7b10/, "the container id isn't mistaken for an error");
+
+  const once = runDockerCheck({ runFailsOnce: true, portAfter: 2 });
+  assert.equal(once.status, 0, once.stdout + once.stderr);
+  assert.match(once.stdout, /^run_exit=125 \(attempt 1\)$/m, "the failed try is still shown");
+  assert.match(once.stdout, /^served_after=/m);
+  assert.match(once.calls, /docker run [^\n]*\ndocker rm\ndocker run /, "the half-made container is removed before the second try");
 });
 
 test("the proof fails on any attempt that got through and any rule that stopped nothing", () => {

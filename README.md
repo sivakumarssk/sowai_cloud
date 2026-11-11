@@ -204,6 +204,16 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   neighbour container uses `100.127.255.11`, so every install proves outbound IPv4 through NAT
   without buying an IP. Nothing uses shared mode yet: until the add-on is live, every new service
   is `DEDICATED` with its own Floating IP. ROADMAP.md tracks the stages.
+- **Shared IPv4, Stage B (the gateway):** each node has HAProxy in container 9000 (`sowsi-gateway`,
+  hostname `sowsi-gateway`) on a Floating IP of its own, bought by the installer's gateway step
+  under the spend cap and labelled `sowsi-node-install=gateway`. Port 80 is routed by Host, 443 by
+  the TLS name without decrypting; an unknown name gets a neutral 404 on 80 and a closed
+  connection on 443. `sowsi-gateway sync <version>` (dispatcher: `gateway-sync <version>`, the table
+  on stdin) checks every line, generates the config itself, runs HAProxy's config test, reloads
+  gracefully and goes back to the last good version if the new one doesn't serve.
+  `sowsi-gateway status` (`gateway-status`) prints its facts. The node's rules let the gateway reach
+  shared containers on 80 and 443 only. The gateway never counts towards `maxContainers`, and
+  `--destroy` releases its Floating IP with the server.
 - **Throwaway tests:** `--simulate-bad-nic` points the bridge at a card that
   doesn't exist before the reboot (the `--name` must contain `test`). Add
   `--no-guard` to prove the rescue repair instead of the guard.

@@ -1,5 +1,5 @@
 import { inrRate } from "@/lib/provisioning/capacityReport";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import path from "node:path";
@@ -98,6 +98,21 @@ export function prismaInstallDeps(): InstallDeps {
     isolationStatus: (host) => runOnHost({ name: host, ip: host }, "isolation-status", 60_000),
     isolationReport: (host) => runOnHost({ name: host, ip: host }, "isolation-report", 60_000),
     isolationProbe: async (host, on) => void (await runOnHost({ name: host, ip: host }, `isolation-probe ${on ? "on" : "off"}`, 60_000)),
+    gatewayStatus: (host) => runOnHost({ name: host, ip: host }, "gateway-status", 60_000),
+    gatewaySync: (host, version, table) => {
+      // The command line carries only the version; the dispatcher refuses anything else.
+      if (!Number.isSafeInteger(version) || version < 0 || String(version).length > 15) throw new Error(`gateway table version ${version} isn't 1 to 15 digits`);
+      return runOnHost({ name: host, ip: host }, `gateway-sync ${version}`, 2 * 60_000, table);
+    },
+    curl: (args) =>
+      new Promise((resolve, reject) => {
+        // No shell: each argument reaches curl as it is.
+        execFile("curl", args, { timeout: 30_000, encoding: "utf8" }, (err, stdout) => {
+          if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return reject(new Error("curl isn't installed on this machine"));
+          const code = err ? (typeof (err as { code?: unknown }).code === "number" ? Number((err as { code?: unknown }).code) : 1) : 0;
+          resolve({ exit: code, stdout: String(stdout ?? "") });
+        });
+      }),
     hostSetupScript: () => readFileSync(path.join(process.cwd(), "scripts", "proxmox-host-setup.sh"), "utf8").replace(/\r\n/g, "\n"),
 
     proxmox(node, token) {
@@ -139,7 +154,7 @@ export function prismaInstallDeps(): InstallDeps {
       },
       async nodeByServerId(serverId) {
         const n = await prisma.proxmoxNode.findUnique({ where: { hetznerServerId: serverId }, include: { _count: { select: { services: true, volumes: true } } } });
-        return n ? { id: n.id, name: n.name, ip: n.ip, services: n._count.services, volumes: n._count.volumes, apiTokenId: n.apiTokenId, apiTokenSecret: n.apiTokenSecret } : null;
+        return n ? { id: n.id, name: n.name, ip: n.ip, services: n._count.services, volumes: n._count.volumes, apiTokenId: n.apiTokenId, apiTokenSecret: n.apiTokenSecret, gatewayFloatingIpId: n.gatewayFloatingIpId } : null;
       },
       nodeNameTaken: async (name) => (await prisma.proxmoxNode.count({ where: { name } })) > 0,
       async registerNode(d) {
@@ -200,6 +215,13 @@ export function installSettings(env = process.env): InstallSettings {
     const pub = readFileSync(`${keyPath}.pub`, "utf8");
     if (admin && keyId(pub) === keyId(admin)) problems.push("the install key is your admin key — it must be a dedicated key");
     if (prov && keyId(pub) === keyId(prov)) problems.push("the install key is the provisioning key — it must be a dedicated key");
+  }
+
+  // Step 4 and the gateway step look at the gateway from here, as the internet does.
+  try {
+    execFileSync("curl", ["--version"], { stdio: "ignore" });
+  } catch {
+    problems.push("curl isn't installed on this machine: the gateway checks need it (apt-get install curl)");
   }
 
   const rate = inrRate("USD", env);

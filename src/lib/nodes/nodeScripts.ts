@@ -653,6 +653,8 @@ echo "out6=$(curl -6 -fsS -o /dev/null -m 15 ${OUTBOUND_URL} && echo ok || echo 
 echo "template=$(pveam list local 2>/dev/null | grep -c ubuntu-22.04-standard)"
 echo "routes_service=$(systemctl is-enabled sowsi-routes.service 2>/dev/null)"
 echo "dispatcher=$(test -x /usr/local/sbin/sowsi-host && echo yes || echo no)"
+echo "gateway_tool=$(test -x /usr/local/sbin/sowsi-gateway && bash -n /usr/local/sbin/sowsi-gateway && echo yes || echo no)"
+echo "gateway_commands=$(grep -cE '^  gateway-(status|sync)\\)' /usr/local/sbin/sowsi-host 2>/dev/null)"
 echo "vmbr1=$(ip -br link show vmbr1 2>/dev/null | awk '{print $NF}')"
 echo "storage=$(pvesh get /storage/local --output-format json | sed -n 's/.*"content":"\\([^"]*\\)".*/\\1/p')"
 echo "forward4=$(sysctl -n net.ipv4.ip_forward)"
@@ -684,6 +686,8 @@ export function checkHostSetup(setupOutput: string, facts: Record<string, string
   if (!(Number(facts.template) >= 1)) problems.push("the Ubuntu 22.04 LXC template isn't downloaded");
   if (facts.routes_service !== "enabled") problems.push("sowsi-routes.service isn't enabled");
   if (facts.dispatcher !== "yes") problems.push("/usr/local/sbin/sowsi-host is missing");
+  if (facts.gateway_tool !== "yes") problems.push("/usr/local/sbin/sowsi-gateway is missing or isn't valid bash");
+  if (facts.gateway_commands !== "2") problems.push("the dispatcher doesn't have gateway-status and gateway-sync");
   // Its state column says DOWN (no carrier) until the first container: read the UP flag instead.
   if (!/[<,]UP[,>]/.test(facts.vmbr1 ?? "")) problems.push(`vmbr1 isn't up (${facts.vmbr1 || "missing"})`);
   const content = `,${facts.storage ?? ""},`;
@@ -841,7 +845,7 @@ export function parseRoutes(output: string): { ipv4: number; ipv6: number } | nu
  * shared-mode address from the block reserved for tests (never given to a service), so every install
  * also proves outbound IPv4 through NAT, without buying an IP.
  */
-export const TEST_IPV4 = { first: "198.18.254.10", second: "100.127.255.11", spoof: "198.18.254.99" };
+export const TEST_IPV4 = { first: "198.18.254.10", second: "100.127.255.11", third: "100.127.255.12", spoof: "198.18.254.99" };
 
 /** One container in shared mode reaches the internet over IPv4 through NAT, and resolves names. */
 export function sharedOutboundScript(): string {
@@ -1044,4 +1048,173 @@ export function containerOutboundScript(ipv4: boolean): string {
   const get = (v: 4 | 6) =>
     `(ping -${v} -c 2 -W 3 ${v === 6 ? IPV6_TARGETS[0] : "1.1.1.1"} >/dev/null 2>&1 || curl -${v} -fsS -o /dev/null -m 15 ${OUTBOUND_URL} 2>/dev/null || wget -${v} -q -O /dev/null -T 15 ${OUTBOUND_URL}) && echo ok || echo fail`;
   return [`echo "out6=$(${get(6)})"`, ipv4 ? `echo "out4=$(${get(4)})"` : `echo "out4=skipped"`].join("\n");
+}
+
+// ── The shared IPv4 gateway (Stage B) ────────────────────────────────
+
+/** The config HAProxy must be reading: the one sowsi-gateway generates, not the package's own. */
+export const GATEWAY_CONFIG = "/etc/haproxy/sowsi/current/haproxy.cfg";
+/** Names for step 4's routing proof. ".test" is reserved (RFC 2606), so none of them is anyone's. */
+export const GATEWAY_TEST_NAMES = { one: "one.gateway.test", two: "two.gateway.test", unknown: "unknown.gateway.test" } as const;
+/** A client's own X-Forwarded-For (TEST-NET-2), which the gateway must drop. */
+export const SPOOFED_CLIENT = "198.51.100.66";
+
+/** A service key for a test container: 16 lowercase letters and digits, as sowsi-gateway wants. */
+export const testServiceKey = (vmid: number) => `sowsitest${String(vmid).padStart(7, "0")}`;
+
+export type GatewayRoute = { host: string; key: string; ipv4: string; proxy?: boolean };
+
+const GATEWAY_HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
+const SHARED_IPV4_RE = /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$/;
+
+/** The table sowsi-gateway reads, checked the way it checks it: a table it would refuse is never sent. */
+export function gatewayTable(routes: GatewayRoute[]): string {
+  const seen = new Set<string>();
+  return routes
+    .map((r) => {
+      if (!GATEWAY_HOST_RE.test(r.host)) throw new Error(`gateway route: "${r.host}" isn't a lowercase hostname`);
+      if (seen.has(r.host)) throw new Error(`gateway route: ${r.host} is listed twice`);
+      seen.add(r.host);
+      if (!/^[a-z0-9]{16}$/.test(r.key)) throw new Error(`gateway route: "${r.key}" isn't a 16-character key`);
+      if (!SHARED_IPV4_RE.test(r.ipv4) || r.ipv4.split(".").slice(2).some((o) => Number(o) > 255)) throw new Error(`gateway route: ${r.ipv4} isn't a shared-mode address`);
+      return `${r.host} ${r.key} ${r.ipv4} ${r.proxy ? 1 : 0}\n`;
+    })
+    .join("");
+}
+
+/** What `sowsi-gateway status` must say about a working gateway. */
+export function checkGatewayStatus(f: Record<string, string>, expect: { ipv4: string; version?: string; routes?: number }): string[] {
+  const problems: string[] = [];
+  if (f.container !== "running") return [`the gateway container isn't running (${f.container || "no answer"})`];
+  if (f.ipv4 !== expect.ipv4) problems.push(`the gateway's address is ${f.ipv4 || "missing"}, not ${expect.ipv4}`);
+  if (f.route !== "1") problems.push("the host has no route for the gateway's Floating IP");
+  if (f.haproxy !== "active") problems.push(`HAProxy isn't running in the gateway (${f.haproxy || "unknown"})`);
+  if (f.haproxy_enabled !== "enabled") problems.push(`HAProxy isn't enabled, so it wouldn't start after a reboot (${f.haproxy_enabled || "unknown"})`);
+  if (f.config !== GATEWAY_CONFIG) problems.push(`HAProxy reads ${f.config || "its package config"}, not ${GATEWAY_CONFIG}`);
+  if (!/^\d{1,15}$/.test(f.version ?? "")) problems.push("no route table has been applied");
+  else if (f.live_version !== f.version) problems.push(`HAProxy serves table version ${f.live_version || "none"}, not the applied ${f.version}`);
+  if (f.unknown_host !== "404") problems.push(`an unknown name gets ${f.unknown_host || "no answer"}, not the neutral 404`);
+  if (f.ssh === "active") problems.push("SSH is running in the gateway: it should take no logins");
+  if (f.logins && f.logins !== "0") problems.push(`the gateway holds ${f.logins} authorized SSH key(s)`);
+  if (f.public_ports !== "80,443") problems.push(`ports open on the gateway: ${f.public_ports || "none"}, expected 80,443`);
+  if (expect.version !== undefined && f.version !== expect.version) problems.push(`the applied table is version ${f.version || "none"}, not ${expect.version}`);
+  if (expect.routes !== undefined && Number(f.routes) !== expect.routes) problems.push(`the gateway has ${f.routes || 0} routes, not ${expect.routes}`);
+  return problems;
+}
+
+/**
+ * A test container's web server for the routing proof: port 80 in plain HTTP and 443 in TLS with a
+ * throwaway certificate, both on 0.0.0.0 (IPv4 only, as many apps listen). Each answers with its
+ * name and the X-Forwarded-For it received.
+ */
+export function gatewayBackendScript(name: string): string {
+  if (!/^[a-z0-9-]{1,40}$/.test(name)) throw new Error(`backend name "${name}"`);
+  return `need=""
+command -v python3 >/dev/null 2>&1 || need="$need python3"
+command -v openssl >/dev/null 2>&1 || need="$need openssl"
+if [ -n "$need" ]; then
+  if (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need) >/dev/null 2>&1; then echo "tools=installed$need"; else echo "tools=missing$need"; exit 0; fi
+else
+  echo "tools=present"
+fi
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=sowsi-gateway-test -days 2 -keyout /root/sowsi-web.key -out /root/sowsi-web.crt >/dev/null 2>&1
+cat > /root/sowsi-web.py <<'PY'
+import http.server, ssl, sys, threading
+NAME = sys.argv[1]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ("%s xff=%s\\n" % (NAME, self.headers.get("X-Forwarded-For") or "-")).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+def serve(port, tls):
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain("/root/sowsi-web.crt", "/root/sowsi-web.key")
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
+threading.Thread(target=serve, args=(80, False), daemon=True).start()
+serve(443, True)
+PY
+setsid -f python3 /root/sowsi-web.py ${q(name)} >/dev/null 2>&1 </dev/null
+for _ in $(seq 1 30); do
+  [ "$(ss -Hltn | awk '{ print $4 }' | grep -cE '^0\\.0\\.0\\.0:(80|443)$')" = 2 ] && break
+  sleep 0.5
+done
+echo "listening=$(ss -Hltn | awk '{ print $4 }' | grep -cE '^0\\.0\\.0\\.0:(80|443)$')"`;
+}
+
+export type CurlResult = { exit: number; stdout: string };
+export type GatewayProbeId = "http_one" | "http_two" | "https_one" | "https_two" | "http_unknown" | "https_unknown" | "https_nosni";
+
+/** curl's arguments (run without a shell) for one request to the gateway, from sowsi-mgmt-01. */
+export function gatewayProbe(gw: string, id: GatewayProbeId): string[] {
+  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(gw)) throw new Error(`gateway address "${gw}"`);
+  const n = GATEWAY_TEST_NAMES;
+  const base = ["-sS", "-m", "10", "-w", "\\ncode=%{http_code}"];
+  const http = (host: string) => [...base, "--resolve", `${host}:80:${gw}`, "-H", `X-Forwarded-For: ${SPOOFED_CLIENT}`, `http://${host}/`];
+  // -k: the test backends' certificates are throwaways. The gateway never decrypts, so it doesn't matter.
+  const https = (host: string) => [...base, "-k", "--resolve", `${host}:443:${gw}`, `https://${host}/`];
+  switch (id) {
+    case "http_one": return http(n.one);
+    case "http_two": return http(n.two);
+    case "https_one": return https(n.one);
+    case "https_two": return https(n.two);
+    case "http_unknown": return http(n.unknown);
+    case "https_unknown": return https(n.unknown);
+    // An address in the URL: curl sends no TLS name at all.
+    case "https_nosni": return [...base, "-k", `https://${gw}/`];
+  }
+}
+
+export const GATEWAY_PROBES: GatewayProbeId[] = ["http_one", "http_two", "https_one", "https_two", "http_unknown", "https_unknown", "https_nosni"];
+
+/** curl's output: the body, then "code=" and the HTTP status (000 when nothing came back). */
+export function curlReply(r: CurlResult | undefined): { exit: number; code: string; body: string } {
+  if (!r) return { exit: -1, code: "", body: "" };
+  const at = r.stdout.lastIndexOf("\ncode=");
+  return at < 0 ? { exit: r.exit, code: "", body: r.stdout.trim() } : { exit: r.exit, code: r.stdout.slice(at + 6).trim(), body: r.stdout.slice(0, at).trim() };
+}
+
+/** An unknown name: the neutral 404 on port 80, a closed connection on 443, and never a customer's site. */
+export function checkGatewayUnknown(results: Partial<Record<GatewayProbeId, CurlResult>>): string[] {
+  const problems: string[] = [];
+  const http = curlReply(results.http_unknown);
+  if (http.exit !== 0 || http.code !== "404") problems.push(`an unknown name on port 80 got ${http.code || `curl exit ${http.exit}`}, not the neutral 404`);
+  if (/backend|xff=/.test(http.body)) problems.push("an unknown name on port 80 reached a site");
+  for (const id of ["https_unknown", "https_nosni"] as const) {
+    if (!results[id]) continue;
+    const r = curlReply(results[id]);
+    const what = id === "https_unknown" ? "an unknown TLS name" : "TLS with no name";
+    if (r.exit === 0) problems.push(`${what} on port 443 was answered (${r.code}), not closed`);
+    if (/backend|xff=/.test(r.body)) problems.push(`${what} on port 443 reached a site`);
+  }
+  return problems;
+}
+
+/** Two names, each to its own container on both ports; the client's own X-Forwarded-For dropped. */
+export function checkGatewayProof(results: Partial<Record<GatewayProbeId, CurlResult>>, expect: { one: string; two: string }): { problems: string[]; clientIp: string | null } {
+  const problems: string[] = [];
+  let clientIp: string | null = null;
+  const cases = [["http_one", expect.one, 80], ["http_two", expect.two, 80], ["https_one", expect.one, 443], ["https_two", expect.two, 443]] as const;
+  for (const [id, want, port] of cases) {
+    const r = curlReply(results[id]);
+    const name = id.endsWith("one") ? GATEWAY_TEST_NAMES.one : GATEWAY_TEST_NAMES.two;
+    const m = /^(\S+) xff=(\S+)$/.exec(r.body);
+    if (r.exit !== 0 || r.code !== "200" || !m) {
+      problems.push(`${name} on port ${port} got ${r.code || `curl exit ${r.exit}`}${r.body ? ` "${r.body.slice(0, 60)}"` : ""}, not ${want}`);
+      continue;
+    }
+    if (m[1] !== want) problems.push(`${name} on port ${port} reached ${m[1]}, not ${want}`);
+    if (port === 80) {
+      if (m[2].includes(SPOOFED_CLIENT)) problems.push(`the client's own X-Forwarded-For (${SPOOFED_CLIENT}) reached the site on ${name}`);
+      else if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(m[2])) problems.push(`${name} on port 80 saw X-Forwarded-For "${m[2]}", not one client address`);
+      else clientIp = m[2];
+    } else if (m[2] !== "-") problems.push(`${name} on port 443 had an X-Forwarded-For (${m[2]}): the gateway should pass TLS through untouched`);
+  }
+  return { problems: [...problems, ...checkGatewayUnknown(results)], clientIp };
 }

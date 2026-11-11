@@ -103,7 +103,7 @@ export type SimServer = ServerNode & {
   cpuPct: (tick: number) => number;
   /** Disk promised to containers on the container storage, GB. */
   allocatedDiskGB: number;
-  containers: { vmid: number; running: boolean; ramMB: number }[];
+  containers: { vmid: number; name?: string; running: boolean; ramMB: number }[];
   volumeAllocatedGB?: Record<string, number>;
   down?: (tick: number) => boolean;
   failSave?: boolean;
@@ -142,7 +142,7 @@ export class SimulatedServers {
         const gb = s.volumes.some((v) => v.storage === storage) ? s.volumeAllocatedGB?.[storage] ?? 0 : s.allocatedDiskGB;
         return gb ? [{ vmid: 100, size: gb * GB }] : [];
       },
-      containers: async (node) => find(node).containers.map((c) => ({ vmid: c.vmid, status: c.running ? "running" : "stopped", mem: 0, maxmem: c.ramMB * MB })),
+      containers: async (node) => find(node).containers.map((c) => ({ vmid: c.vmid, name: c.name, status: c.running ? "running" : "stopped", mem: 0, maxmem: c.ramMB * MB })),
       saveNode: async (update) => {
         if (this.nodes.find((n) => n.id === update.nodeId)?.failSave) throw new Error("db down");
         this.saved.push(update);

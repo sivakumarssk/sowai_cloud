@@ -167,7 +167,7 @@ test("a Floating IP that's unassigned, or on a server that isn't a node in servi
   const text = formatResults(results);
   assert.match(text, new RegExp(`Floating IP ${onNode.id} \\(198\\.51\\.100\\.7, "customer"\\) on node sowsi-proxmox-02\\n`));
   assert.doesNotMatch(text, new RegExp(`FLAG Floating IP ${onNode.id} `));
-  assert.match(text, new RegExp(`FLAG Floating IP ${loose.id} \\(198\\.51\\.100\\.7, "forgotten"\\) is unassigned: billed \\$0\\.0056/hour, up to \\$3\\.50/month`));
+  assert.match(text, new RegExp(`FLAG Floating IP ${loose.id} \\(${loose.ip.replaceAll(".", "\\.")}, "forgotten"\\) is unassigned: billed \\$0\\.0056/hour, up to \\$3\\.50/month`));
   assert.match(text, new RegExp(`FLAG Floating IP ${onMgmt.id} .* is on server ${mgmt.id}, which isn't a registered node`));
   assert.match(text, new RegExp(`FLAG Floating IP ${onRetired.id} .* is on sowsi-proxmox-01, a retired node`));
   assert.match(text, /3 flag\(s\): see the FLAG lines above\./);
@@ -230,8 +230,10 @@ test("--expect-gone also fails on a Floating IP or Volume still pointing at the 
   await h.attachVolume(vol.id, old.id);
   await h.deleteServer(old.id).catch(() => undefined);
   hz.state.servers.delete(old.id);
+  // Hetzner unassigns a Floating IP when its server goes (the fake does too): this one is made to still point there.
+  hz.state.floatingIps.get(fip.id)!.server = old.id;
   const text = formatResults(await runHetznerChecks(get, { serverType: "cpx22", location: "nbg1", nodes: [], expectGone: [String(old.id)] }));
-  assert.match(text, new RegExp(`LEFT Floating IP ${fip.id} \\(198\\.51\\.100\\.7\\) is still on server ${old.id}`));
+  assert.match(text, new RegExp(`LEFT Floating IP ${fip.id} \\(${fip.ip.replaceAll(".", "\\.")}\\) is still on server ${old.id}`));
   assert.match(text, new RegExp(`LEFT Volume ${vol.id} \\(data\\) is still attached to server ${old.id}`));
   // Hetzner failing isn't proof that the server is gone.
   const flaky: typeof get = async (p, params) => {
