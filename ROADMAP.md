@@ -55,6 +55,16 @@ committed, and stops for review before the next one starts.
 
 **1. Shared IPv4 gateway — Stage B: the gateway container.** Built and tested locally; waiting
 for the throwaway-node test.
+- First test (sowsi-test-05, server 175731990, 12 Nov 2026): failed at the gateway step. HAProxy
+  started by apt on the package's config, and a reload keeps the config the master started with,
+  so ours was never loaded. Fixed: HAProxy is restarted onto our config whenever the running
+  process isn't on it (read from its master's command line), and "serving" now requires it. The
+  rig now behaves like systemd and reproduces the failure with the old script.
+- Also from that test: the card's name pin matched vmbr0 too (same MAC), so udev tried to rename
+  the bridge. Fixed with `Type=ether`, as Proxmox's own docs do; the installer now checks after the
+  reboot that the pin doesn't apply to vmbr0 and that udev never tried to rename it.
+- `sowsi-gateway` refusing a command line now shows what it got (a stray carriage return showed
+  only as the usage line).
 - `sowsi-gateway` on each node: HAProxy in container 9000 on a Floating IP of its own. Port 80 by
   the Host header, 443 by the TLS name, passed through still encrypted. Unknown name: a neutral 404
   on 80, a closed connection on 443. The client's own X-Forwarded-For is dropped.

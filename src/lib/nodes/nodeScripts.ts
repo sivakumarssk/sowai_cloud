@@ -106,9 +106,12 @@ iface vmbr0 inet static
 export const LINK_FILE = "/etc/systemd/network/10-sowsi-uplink.link";
 
 export function linkFile({ nic, mac }: { nic: string; mac: string }): string {
+  // Type=ether: vmbr0 takes the card's MAC, and without it udev tries to rename the bridge too
+  // ("Failed to rename network interface … from 'vmbr0'"). Proxmox's docs do the same (bug #5429).
   return `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.
 [Match]
 MACAddress=${mac}
+Type=ether
 
 [Link]
 Name=${nic}
@@ -532,6 +535,8 @@ echo "vmbr0_ipv4=$(ip -o -4 addr show dev vmbr0 2>/dev/null | awk '{print $4; ex
 echo "gateway=$(ip -o -4 route show to default | awk '{print $3" "$5; exit}')"
 echo "ipv6=$(ip -o -6 addr show dev vmbr0 scope global 2>/dev/null | awk '{print $4; exit}')"
 echo "pve_services=$(systemctl is-active pve-cluster pvedaemon pveproxy | tr '\\n' ' ')"
+echo "pin_vmbr0=$(udevadm test-builtin net_setup_link /sys/class/net/vmbr0 2>/dev/null | sed -n 's/^ID_NET_LINK_FILE=//p')"
+echo "vmbr0_renames=$(journalctl -b --no-pager -o cat 2>/dev/null | grep -cE "Failed to rename network interface [0-9]+ from 'vmbr")"
 echo "boot_id=$(cat /proc/sys/kernel/random/boot_id)"`;
 }
 
@@ -545,6 +550,10 @@ export function checkAfterReboot(facts: Record<string, string>, expected: { ipv4
   if (facts.gateway !== `${HETZNER_GATEWAY4} vmbr0`) problems.push(`default route is "${facts.gateway}", expected via ${HETZNER_GATEWAY4} on vmbr0`);
   if (expected.ipv6Subnet && facts.ipv6 !== `${expected.ipv6Subnet}::1/64`) problems.push(`vmbr0 has IPv6 "${facts.ipv6}", expected ${expected.ipv6Subnet}::1/64`);
   if (facts.pve_services !== "active active active") problems.push(`Proxmox services: ${facts.pve_services} (pve-cluster pvedaemon pveproxy)`);
+  // The card's pin must never reach the bridge, which has the same MAC.
+  if (!facts.pin_vmbr0) problems.push("udev can't say which .link file it applies to vmbr0");
+  else if (facts.pin_vmbr0 === LINK_FILE) problems.push(`udev applies the card's pin (${LINK_FILE}) to vmbr0 too`);
+  if (facts.vmbr0_renames && facts.vmbr0_renames !== "0") problems.push(`udev tried to rename vmbr0 in this boot (${facts.vmbr0_renames} time(s): "Failed to rename network interface … from 'vmbr…'")`);
   return problems;
 }
 
@@ -1090,7 +1099,9 @@ export function checkGatewayStatus(f: Record<string, string>, expect: { ipv4: st
   if (f.route !== "1") problems.push("the host has no route for the gateway's Floating IP");
   if (f.haproxy !== "active") problems.push(`HAProxy isn't running in the gateway (${f.haproxy || "unknown"})`);
   if (f.haproxy_enabled !== "enabled") problems.push(`HAProxy isn't enabled, so it wouldn't start after a reboot (${f.haproxy_enabled || "unknown"})`);
-  if (f.config !== GATEWAY_CONFIG) problems.push(`HAProxy reads ${f.config || "its package config"}, not ${GATEWAY_CONFIG}`);
+  if (f.config !== GATEWAY_CONFIG) problems.push(`HAProxy's unit reads ${f.config || "its package config"}, not ${GATEWAY_CONFIG}`);
+  // The unit can say one thing while the process runs another: a reload keeps the config HAProxy started with.
+  if (f.running_config !== GATEWAY_CONFIG) problems.push(`HAProxy is running ${f.running_config || "no config it can name"}, not ${GATEWAY_CONFIG}`);
   if (!/^\d{1,15}$/.test(f.version ?? "")) problems.push("no route table has been applied");
   else if (f.live_version !== f.version) problems.push(`HAProxy serves table version ${f.live_version || "none"}, not the applied ${f.version}`);
   if (f.unknown_host !== "404") problems.push(`an unknown name gets ${f.unknown_host || "no answer"}, not the neutral 404`);

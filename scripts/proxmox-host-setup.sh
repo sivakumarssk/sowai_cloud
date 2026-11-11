@@ -490,7 +490,8 @@ PROBE_HOST=sowsi-probe.invalid
 
 refuse() { echo "refused: $*" >&2; exit 2; }
 die() { echo "gateway: $*" >&2; exit 1; }
-usage() { echo "usage: sowsi-gateway status | sync <version> | install" >&2; exit 2; }
+# Says what it was given, quoted: a stray carriage return (a command kept in a Windows file) shows as $'\r'.
+usage() { echo "usage: sowsi-gateway status | sync <version> | install (got:$(printf ' %q' "${ARGS[@]}"))" >&2; exit 2; }
 # fd 9 is this script's lock: nothing run in the container may hold it, or the next sync waits forever.
 ct() { pct exec "$VMID" -- "$@" 9>&-; }
 push() { pct push "$VMID" "$1" "$2" --perms 0644 9>&-; }
@@ -650,10 +651,31 @@ live_version() {
 unknown_host_code() {
   ct curl -s -m 5 -o /dev/null -w '%{http_code}' -H 'Host: unknown.invalid' http://127.0.0.1/ 2>/dev/null | clean || true
 }
+# The config the running HAProxy was started with: its master's -f, read from /proc in the container.
+# A reload re-executes the master with the arguments it started with, so this changes only on a restart.
+running_config() {
+  local pid
+  pid=$(ct systemctl show -p MainPID --value haproxy 2>/dev/null | clean || true)
+  [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || return 0
+  ct cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' '\n' | awk 'prev == "-f" { print; exit } { prev = $0 }' | clean || true
+}
+LIVE_CONFIG=$CT_DIR/current/haproxy.cfg
+
+# Running on our config: a graceful reload. Otherwise (not running, or still on the package's own
+# config, as apt starts it at install) only a restart makes it read the unit's CONFIG again.
+haproxy_up() {
+  if [[ $(ct systemctl is-active haproxy 2>/dev/null | clean || true) == active && $(running_config) == "$LIVE_CONFIG" ]]; then
+    ct systemctl reload haproxy
+  else
+    ct systemctl daemon-reload && ct systemctl restart haproxy
+  fi
+}
+
+# Serving version $1: on our config, answering with that version, and the neutral 404 for an unknown name.
 serving() { # version
   local _
   for _ in $(seq 1 20); do
-    if [[ $(live_version) == "$1" && $(unknown_host_code) == 404 ]]; then return 0; fi
+    if [[ $(running_config) == "$LIVE_CONFIG" && $(live_version) == "$1" && $(unknown_host_code) == 404 ]]; then return 0; fi
     sleep 0.5
   done
   return 1
@@ -684,7 +706,7 @@ apply() {
   fi
   prev=$(current_version)
   point_at "$v"
-  if ct systemctl reload-or-restart haproxy && serving "$v"; then
+  if haproxy_up && serving "$v"; then
     mkdir -p "$STATE"
     cp "$work/routes" "$STATE/table.tmp"
     mv -f "$STATE/table.tmp" "$STATE/table"
@@ -698,14 +720,16 @@ apply() {
     echo "gateway: version $v, $(wc -l <"$work/routes") routes"
     return 0
   fi
+  local run_cfg run_v
+  run_cfg=$(running_config) run_v=$(live_version)
   if [[ -n $prev ]]; then
     point_at "$prev"
-    ct systemctl reload-or-restart haproxy || true
+    haproxy_up || true
     ct rm -rf "$CT_DIR/$v" || true
     if serving "$prev"; then die "version $v didn't come up: rolled back to version $prev"; fi
     die "version $v didn't come up, and version $prev isn't serving after the rollback either"
   fi
-  die "version $v didn't come up, and there's no earlier version to go back to"
+  die "version $v didn't come up (HAProxy runs ${run_cfg:-nothing}, live version ${run_v:-none}), and there's no earlier version to go back to"
 }
 
 lock() {
@@ -749,6 +773,7 @@ status() {
   echo "haproxy=$(ct systemctl is-active haproxy 2>/dev/null | clean || true)"
   echo "haproxy_enabled=$(ct systemctl is-enabled haproxy 2>/dev/null | clean || true)"
   echo "config=$(ct systemctl show -p Environment --value haproxy 2>/dev/null | tr ' ' '\n' | sed -n 's/^CONFIG=//p' | clean || true)"
+  echo "running_config=$(running_config)"
   echo "live_version=$(live_version)"
   echo "unknown_host=$(unknown_host_code)"
   echo "ssh=$(ct systemctl is-active ssh 2>/dev/null | clean || true)"
@@ -785,8 +810,8 @@ install() {
   local applied
   applied=$(applied_version)
   if [[ $applied =~ ^[0-9]{1,15}$ && -n $(current_version) ]]; then
-    ct systemctl reload-or-restart haproxy
-    serving "$applied" || die "HAProxy isn't serving version $applied"
+    haproxy_up
+    serving "$applied" || die "HAProxy isn't serving version $applied (it runs $(running_config))"
     echo "gateway: installed, version $applied"
   else
     : >"$work/routes"
@@ -794,6 +819,7 @@ install() {
   fi
 }
 
+ARGS=("$@")
 case "${1:-}" in
   status) [[ $# == 1 ]] || usage; status ;;
   sync)

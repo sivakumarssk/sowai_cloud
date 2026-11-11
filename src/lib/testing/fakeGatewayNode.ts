@@ -1,6 +1,9 @@
 // Test harness: sowsi-gateway, exactly as proxmox-host-setup.sh writes it, run in bash. The container
 // is faked: `pct exec 9000 --` works on a folder (ct/), HAProxy's config test and reload are
-// recorded, and "live" holds the version the running HAProxy would answer with. Used by
+// recorded, and "live" holds the version the running HAProxy would answer with. systemd is modelled
+// as it really behaves (sowsi-test-05): apt starts HAProxy on the package's own config, a reload
+// re-executes the master with the -f it started with, and a restart reads CONFIG as of the last
+// daemon-reload. "running_cfg" is the running master's -f, "unit_cfg" the unit's CONFIG. Used by
 // gatewayScript.test.ts and gatewayTable.test.ts (two files: each runs bash many times, and the
 // test runner gives each file 120 seconds).
 import { test } from "node:test";
@@ -34,6 +37,14 @@ type Run = {
   containers?: Record<string, string>;
   /** Applied before this run: version 5, one route, live in the container. */
   applied?: boolean;
+  /** The running master's -f, as a line ("" = not running). Default: ours once applied. */
+  running?: string;
+  /** The unit's CONFIG as systemd has it loaded, as a line. Default: ours once applied. */
+  unit?: string;
+  /** The drop-in is on disk (whether or not systemd has read it). */
+  dropin?: boolean;
+  /** Arguments as bash words (e.g. "$'status\\r'"), for what Windows can't pass on a command line. */
+  bashArgs?: string;
   env?: Record<string, string>;
 };
 
@@ -72,27 +83,56 @@ ctexec() {
     rm) rm -rf "ct$3" ;;
     ls) ls -1 "ct$3" 2>/dev/null ;;
     systemctl)
-      case $2 in
-        reload-or-restart)
-          log "reload"
-          if [ -n "\${RELOAD_FAILS:-}" ]; then return 1; fi
-          if [ -z "\${RELOAD_NOOP:-}" ] && [ -f ct/etc/haproxy/sowsi/current ]; then cp ct/etc/haproxy/sowsi/current live; fi ;;
-        is-active) if [ "$3" = ssh ]; then echo "\${SSH_STATE:-inactive}"; else printf "%s" "\${HAPROXY_ACTIVE:-active}"; fi ;;
-        is-enabled) echo enabled ;;
-        show) echo "CONFIG=/etc/haproxy/sowsi/current/haproxy.cfg PIDFILE=/run/haproxy.pid EXTRAOPTS=-S /run/haproxy-master.sock" ;;
+      case "$2 \${3:-}" in
+        "reload haproxy")
+          log "haproxy reload"
+          if [ -n "\${RELOAD_FAILS:-}" ] || [ ! -s running_cfg ]; then return 1; fi
+          if [ -z "\${RELOAD_NOOP:-}" ]; then answer; fi ;;
+        "restart haproxy")
+          log "haproxy restart"
+          if [ -n "\${RESTART_FAILS:-}" ]; then return 1; fi
+          cp unit_cfg running_cfg
+          if [ -z "\${RELOAD_NOOP:-}" ]; then answer; fi ;;
+        "daemon-reload "*)
+          log "daemon-reload"
+          if [ -z "\${DROPIN_IGNORED:-}" ] && grep -q '^Environment="CONFIG=' ct/etc/systemd/system/haproxy.service.d/sowsi.conf 2>/dev/null; then
+            sed -n 's/^Environment="CONFIG=\\(.*\\)"$/\\1/p' ct/etc/systemd/system/haproxy.service.d/sowsi.conf > unit_cfg
+          fi ;;
+        "is-active ssh") echo "\${SSH_STATE:-inactive}" ;;
+        "is-active haproxy") if [ -n "\${HAPROXY_ACTIVE:-}" ]; then printf "%s" "$HAPROXY_ACTIVE"; elif [ -s running_cfg ]; then echo active; else echo inactive; fi ;;
+        "is-enabled "*) echo enabled ;;
+        "show -p")
+          case "$4" in
+            MainPID) if [ -s running_cfg ]; then echo 4242; else echo 0; fi ;;
+            Environment) echo "CONFIG=$(cat unit_cfg) PIDFILE=/run/haproxy.pid EXTRAOPTS=-S /run/haproxy-master.sock" ;;
+          esac ;;
         *) log "ct $*" ;;
       esac ;;
     curl)
+      # The package's own config has no frontend: nothing answers until ours is running.
+      if [ ! -s live ]; then printf '000'; return 7; fi
       case "$*" in
         *sowsi-probe.invalid*) printf 'HTTP/1.1 204 No Content\\r\\nx-sowsi-gateway-version: %s\\r\\n\\r\\n' "$(cat live 2>/dev/null)" ;;
         *) printf '%s' "\${UNKNOWN_CODE:-404}" ;;
       esac ;;
-    env) log "ct $*" ;;
+    env)
+      log "ct $*"
+      # Installing the package starts HAProxy at once, on the package's own config.
+      case "$*" in *"apt-get install"*haproxy*) if [ ! -s running_cfg ]; then echo /etc/haproxy/haproxy.cfg > running_cfg; : > live; fi ;; esac ;;
     getent) return 0 ;;
     sh) log "ct $*"; case "$*" in *grep*) echo "\${LOGINS:-0}" ;; esac ;;
     ss) printf 'tcp LISTEN 0 4096 0.0.0.0:80 0.0.0.0:*\\ntcp LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\\ntcp LISTEN 0 4096 127.0.0.53%%lo:53 0.0.0.0:*\\n' ;;
-    cat) echo "\${MEMORY:-64000000}" ;;
+    cat)
+      case "$2" in
+        /proc/4242/cmdline) printf '/usr/sbin/haproxy\\0-sf\\0790\\0-Ws\\0-f\\0%s\\0-p\\0/run/haproxy.pid\\0' "$(cat running_cfg)" ;;
+        *) echo "\${MEMORY:-64000000}" ;;
+      esac ;;
   esac
+}
+# What the running HAProxy answers with: the current version, but only on our config (or, for a
+# test, any config: OTHER_CONFIG_ANSWERS).
+answer() {
+  if [ -f ct/etc/haproxy/sowsi/current ] && { [ "$(cat running_cfg)" = /etc/haproxy/sowsi/current/haproxy.cfg ] || [ -n "\${OTHER_CONFIG_ANSWERS:-}" ]; }; then cp ct/etc/haproxy/sowsi/current live; else : > live; fi
 }
 `;
 
@@ -123,11 +163,20 @@ export function runGateway(o: Run) {
     writeFileSync(path.join(dir, "ct", "etc", "haproxy", "sowsi", "current"), "5\n");
     writeFileSync(path.join(dir, "live"), "5\n");
   }
+  // HAProxy as it stands: on our config once applied, unless a test says otherwise; not running before.
+  const ours = "/etc/haproxy/sowsi/current/haproxy.cfg\n";
+  writeFileSync(path.join(dir, "running_cfg"), o.running ?? (o.applied !== false ? ours : ""));
+  writeFileSync(path.join(dir, "unit_cfg"), o.unit ?? (o.applied !== false ? ours : "/etc/haproxy/haproxy.cfg\n"));
+  if (o.dropin) {
+    mkdirSync(path.join(dir, "ct", "etc", "systemd", "system", "haproxy.service.d"), { recursive: true });
+    writeFileSync(path.join(dir, "ct", "etc", "systemd", "system", "haproxy.service.d", "sowsi.conf"), `[Service]\nEnvironment="CONFIG=${ours.trim()}"\n`);
+  }
   const before = { state: files(path.join(dir, "state")), ct: files(path.join(dir, "ct")) };
   const script = gatewayScript().replace("set -euo pipefail\n", `set -euo pipefail\n${FAKES}\n`);
   // From a file: a command line this long is cut short on Windows.
   writeFileSync(path.join(dir, "sowsi-gateway"), script);
-  const r = spawnSync("bash", ["sowsi-gateway", ...o.args.split(" ").filter(Boolean)], { input: o.stdin ?? "", encoding: "utf8", cwd: dir, env: { ...process.env, ...o.env }, maxBuffer: 64 * 1024 * 1024 });
+  const argv = o.bashArgs ? ["-c", `exec bash sowsi-gateway ${o.bashArgs}`] : ["sowsi-gateway", ...o.args.split(" ").filter(Boolean)];
+  const r = spawnSync("bash", argv, { input: o.stdin ?? "", encoding: "utf8", cwd: dir, env: { ...process.env, ...o.env }, maxBuffer: 64 * 1024 * 1024 });
   const read = (f: string) => (existsSync(path.join(dir, f)) ? readFileSync(path.join(dir, f), "utf8") : "");
   const result = {
     ...r,

@@ -92,7 +92,7 @@ test("the bridge check catches everything that would leave the server unreachabl
 });
 
 test("after the reboot: Proxmox kernel, pve-manager, vmbr0 with both addresses, default route on vmbr0", () => {
-  const ok = { kernel: "6.8.12-4-pve", pveversion: "pve-manager/8.3.0/1234", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active" };
+  const ok = { kernel: "6.8.12-4-pve", pveversion: "pve-manager/8.3.0/1234", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active", pin_vmbr0: "/usr/lib/systemd/network/99-default.link", vmbr0_renames: "0" };
   assert.deepEqual(S.checkAfterReboot(ok, { ipv4: bridge.ipv4, ipv6Subnet: bridge.ipv6Subnet }), []);
   assert.match(S.checkAfterReboot({ ...ok, kernel: "6.1.0-26-cloud-amd64" }, bridge).join(), /isn't a Proxmox kernel/);
   assert.match(S.checkAfterReboot({ ...ok, gateway: "172.31.1.1 eth0" }, bridge).join(), /on vmbr0/);
@@ -249,6 +249,8 @@ test("3e parses the real output of ip, pveversion, uname and systemctl", () => {
 pveversion() { echo "pve-manager/8.4.1/2a5fa54a8503f96d (running kernel: 6.8.12-9-pve)"; }
 cat() { echo 3f2c-boot; }
 systemctl() { printf 'active\\nactive\\nactive\\n'; }
+udevadm() { [ "$*" = "test-builtin net_setup_link /sys/class/net/vmbr0" ] && printf 'ID_NET_DRIVER=bridge\\nID_NET_LINK_FILE=/usr/lib/systemd/network/99-default.link\\n'; }
+journalctl() { echo "systemd-udevd[312]: eth0: Interface name change detected, renamed from enp1s0"; }
 ip() {
   case "$*" in
     "-o -4 addr show dev vmbr0") echo '2: vmbr0    inet 203.0.113.20 peer 172.31.1.1/32 scope global vmbr0\\       valid_lft forever preferred_lft forever' ;;
@@ -270,7 +272,7 @@ test("3e accepts the address whichever way ip prints it: with a peer, or as a pl
     if (!facts) return;
     assert.equal(facts.vmbr0_ipv4, "203.0.113.20", line);
   }
-  const ok = { kernel: "6.8.12-9-pve", pveversion: "pve-manager/8.4.1/abc", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active" };
+  const ok = { kernel: "6.8.12-9-pve", pveversion: "pve-manager/8.4.1/abc", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "2a01:4f8:1c1c:abcd::1/64", pve_services: "active active active", pin_vmbr0: "/usr/lib/systemd/network/99-default.link", vmbr0_renames: "0" };
   assert.deepEqual(S.checkAfterReboot(ok, { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" }), []);
   assert.match(S.checkAfterReboot({ ...ok, vmbr0_ipv4: "203.0.113.99" }, { ipv4: "203.0.113.20", ipv6Subnet: "2a01:4f8:1c1c:abcd" }).join(), /vmbr0 has IPv4/);
 });
@@ -737,4 +739,42 @@ whenBash("the script replaces the link itself, not what it points at, and the fa
   const f = S.parseFacts(spawnSync("bash", ["-s"], { input: `getent() { return 0; }\n${local(S.dnsFactsScript())}`, encoding: "utf8", cwd: dir }).stdout);
   assert.deepEqual(S.checkDns(f), []);
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ── The card's pin never reaches vmbr0 (sowsi-test-05) ────────────────
+
+test("the card's pin matches the physical card only: vmbr0 has the same MAC", () => {
+  const link = S.linkFile({ nic: "eth0", mac: "96:00:03:aa:bb:cc" });
+  assert.match(link, /^\[Match\]\nMACAddress=96:00:03:aa:bb:cc\nType=ether\n\n\[Link\]\nName=eth0\n$/m);
+  assert.ok(S.pinNicScript({ nic: "eth0", mac: "96:00:03:aa:bb:cc" }).includes("Type=ether"), "written that way");
+});
+
+test("after the reboot: the pin must not apply to vmbr0, and udev must not have tried to rename it", () => {
+  const ok = { kernel: "6.8.12-4-pve", pveversion: "pve-manager/8.3.0/1234", vmbr0_ipv4: "203.0.113.20", gateway: "172.31.1.1 vmbr0", ipv6: "", pve_services: "active active active", pin_vmbr0: "/usr/lib/systemd/network/99-default.link", vmbr0_renames: "0" };
+  const want = { ipv4: "203.0.113.20" };
+  assert.deepEqual(S.checkAfterReboot(ok, want), []);
+  assert.match(S.checkAfterReboot({ ...ok, pin_vmbr0: S.LINK_FILE }, want).join(), /udev applies the card's pin \(\/etc\/systemd\/network\/10-sowsi-uplink\.link\) to vmbr0 too/);
+  assert.match(S.checkAfterReboot({ ...ok, pin_vmbr0: "" }, want).join(), /udev can't say which \.link file it applies to vmbr0/);
+  assert.match(S.checkAfterReboot({ ...ok, vmbr0_renames: "1" }, want).join(), /udev tried to rename vmbr0 in this boot \(1 time\(s\)/);
+});
+
+test("3e reads which .link file applies to vmbr0, and counts only failed renames of vmbr0", () => {
+  const journal = [
+    "systemd-udevd[312]: eth0: Interface name change detected, renamed from enp1s0",
+    "systemd-udevd[401]: vmbr0: Failed to rename network interface 3 from 'vmbr0' to 'eth0': File exists",
+    "systemd-udevd[402]: veth100i0: Failed to rename network interface 9 from 'veth100i0' to 'x': File exists",
+  ].map((l) => `"${l}"`).join(" ");
+  const facts = factsFrom(
+    S.afterRebootFactsScript(),
+    `udevadm() { [ "$*" = "test-builtin net_setup_link /sys/class/net/vmbr0" ] && printf 'ID_NET_LINK_FILE=${S.LINK_FILE}\\n'; }
+journalctl() { printf '%s\\n' ${journal}; }
+uname() { :; }
+pveversion() { :; }
+cat() { :; }
+systemctl() { :; }
+ip() { :; }`
+  );
+  if (!facts) return;
+  assert.equal(facts.pin_vmbr0, S.LINK_FILE);
+  assert.equal(facts.vmbr0_renames, "1", "vmbr0's only, not another interface's");
 });

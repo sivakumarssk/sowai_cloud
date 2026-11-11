@@ -37,7 +37,7 @@ test("the installer never sends a table sowsi-gateway would refuse", () => {
   assert.throws(() => S.gatewayTable([{ host: "a.example.com", key, ipv4: "100.64.0.5" }, { host: "a.example.com", key, ipv4: "100.64.0.5" }]), /listed twice/);
 });
 
-const working = { container: "running", ipv4: "198.51.100.7", route: "1", version: "0", routes: "0", haproxy: "active", haproxy_enabled: "enabled", config: S.GATEWAY_CONFIG, live_version: "0", unknown_host: "404", ssh: "inactive", logins: "0", public_ports: "80,443" };
+const working = { container: "running", ipv4: "198.51.100.7", route: "1", version: "0", routes: "0", haproxy: "active", haproxy_enabled: "enabled", config: S.GATEWAY_CONFIG, running_config: S.GATEWAY_CONFIG, live_version: "0", unknown_host: "404", ssh: "inactive", logins: "0", public_ports: "80,443" };
 
 test("a gateway is working only when every fact says so", () => {
   assert.deepEqual(S.checkGatewayStatus(working, { ipv4: "198.51.100.7", version: "0", routes: 0 }), []);
@@ -47,7 +47,10 @@ test("a gateway is working only when every fact says so", () => {
     [{ route: "0" }, /no route for the gateway's Floating IP/],
     [{ haproxy: "failed" }, /HAProxy isn't running in the gateway \(failed\)/],
     [{ haproxy_enabled: "disabled" }, /wouldn't start after a reboot/],
-    [{ config: "/etc/haproxy/haproxy.cfg" }, /HAProxy reads \/etc\/haproxy\/haproxy\.cfg, not \/etc\/haproxy\/sowsi\/current\/haproxy\.cfg/],
+    [{ config: "/etc/haproxy/haproxy.cfg" }, /HAProxy's unit reads \/etc\/haproxy\/haproxy\.cfg, not \/etc\/haproxy\/sowsi\/current\/haproxy\.cfg/],
+    // sowsi-test-05: the unit had our CONFIG, the process still ran the package's.
+    [{ running_config: "/etc/haproxy/haproxy.cfg" }, /HAProxy is running \/etc\/haproxy\/haproxy\.cfg, not \/etc\/haproxy\/sowsi\/current\/haproxy\.cfg/],
+    [{ running_config: "" }, /HAProxy is running no config it can name/],
     [{ version: "" }, /no route table has been applied/],
     [{ live_version: "4" }, /HAProxy serves table version 4, not the applied 0/],
     [{ unknown_host: "200" }, /an unknown name gets 200, not the neutral 404/],

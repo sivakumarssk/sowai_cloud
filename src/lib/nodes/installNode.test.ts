@@ -248,7 +248,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
     const gw = gatewayCt();
     const lines = w.gw.table.split("\n").filter(Boolean).length;
     const f: Record<string, string> = gw
-      ? { container: "running", ipv4: gw.ipv4 ?? "", route: "1", version: w.gw.version === null ? "" : String(w.gw.version), routes: String(lines), haproxy: w.gw.installed ? "active" : "inactive", haproxy_enabled: w.gw.installed ? "enabled" : "disabled", config: w.gw.installed ? S.GATEWAY_CONFIG : "", live_version: w.gw.version === null ? "" : String(w.gw.version), unknown_host: w.gw.installed ? "404" : "", ssh: "inactive", logins: "0", public_ports: w.gw.installed ? "80,443" : "22", memory_mb: "61" }
+      ? { container: "running", ipv4: gw.ipv4 ?? "", route: "1", version: w.gw.version === null ? "" : String(w.gw.version), routes: String(lines), haproxy: w.gw.installed ? "active" : "inactive", haproxy_enabled: w.gw.installed ? "enabled" : "disabled", config: w.gw.installed ? S.GATEWAY_CONFIG : "", running_config: w.gw.installed ? S.GATEWAY_CONFIG : "", live_version: w.gw.version === null ? "" : String(w.gw.version), unknown_host: w.gw.installed ? "404" : "", ssh: "inactive", logins: "0", public_ports: w.gw.installed ? "80,443" : "22", memory_mb: "61" }
       : { container: "missing", ipv4: "", route: "0", version: "", routes: "0" };
     return Object.entries({ ...f, ...(gw ? cfg.gatewayStatus : {}) }).map(([k, v]) => `${k}=${v}`).join("\n");
   };
@@ -315,7 +315,7 @@ function world(cfg: WorldCfg = {}, hz = fakeHetzner(cfg.hetzner)) {
         case "reboot": w.rebootAt = w.clock; return "rebooting";
         case "after reboot": {
           const services = w.servicesStarting-- > 0 ? "activating activating activating" : "active active active";
-          return `kernel=${w.kernel}\npveversion=pve-manager/8.3.0/abc (running kernel: ${w.kernel})\nvmbr0_ipv4=${SERVER_IPV4}\ngateway=172.31.1.1 vmbr0\nipv6=${/inet6/.test(w.installed) ? `${S.subnetOf(SERVER_IPV6_NET)}::1/64` : ""}\npve_services=${services}\nboot_id=${w.booted}`;
+          return `kernel=${w.kernel}\npveversion=pve-manager/8.3.0/abc (running kernel: ${w.kernel})\nvmbr0_ipv4=${SERVER_IPV4}\ngateway=172.31.1.1 vmbr0\nipv6=${/inet6/.test(w.installed) ? `${S.subnetOf(SERVER_IPV6_NET)}::1/64` : ""}\npve_services=${services}\npin_vmbr0=/usr/lib/systemd/network/99-default.link\nvmbr0_renames=0\nboot_id=${w.booted}`;
         }
         case "firewall":
           return runFirewallScript(w.firewall, command);
@@ -1993,8 +1993,10 @@ test("gateway: a container 9000 that isn't the gateway is never touched, and the
 test("gateway: a broken gateway fails its step; its Floating IP goes with the server, and the spend is settled to the hours it lived", async () => {
   const cases: [WorldCfg, RegExp][] = [
     [{ gatewayStatus: { public_ports: "22,80,443" } }, /ports open on the gateway: 22,80,443, expected 80,443/],
-    [{ gatewayStatus: { config: "/etc/haproxy/haproxy.cfg" } }, /HAProxy reads \/etc\/haproxy\/haproxy\.cfg/],
+    [{ gatewayStatus: { config: "/etc/haproxy/haproxy.cfg" } }, /HAProxy's unit reads \/etc\/haproxy\/haproxy\.cfg/],
     [{ gatewayStatus: { haproxy_enabled: "disabled" } }, /wouldn't start after a reboot/],
+    // sowsi-test-05: the unit had our CONFIG, the process still ran the package's.
+    [{ gatewayStatus: { running_config: "/etc/haproxy/haproxy.cfg" } }, /HAProxy is running \/etc\/haproxy\/haproxy\.cfg, not \/etc\/haproxy\/sowsi\/current\/haproxy\.cfg/],
     [{ gatewayStatus: { logins: "1" } }, /holds 1 authorized SSH key/],
     [{ routesIgnoreGateway: true }, /sowsi-routes didn't take container 9000 as the gateway/],
     [{ gatewayFault: "unknown_served" }, /an unknown name on port 80 got 200, not the neutral 404/],

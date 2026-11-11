@@ -71,7 +71,8 @@ test("the repaired config is node 1's shape: IPv4 /32, gateway, pointopoint, the
   const f = interfacesFile(plan);
   for (const line of ["iface enp1s0 inet manual", "auto vmbr0", "address 2.28.75.244/32", "gateway 172.31.1.1", "pointopoint 172.31.1.1", "bridge-ports enp1s0"]) assert.ok(f.includes(line), line);
   assert.doesNotMatch(f.split("\n").filter((l) => !l.startsWith("#")).join("\n"), /inet6|source|dhcp|vmbr1/);
-  assert.equal(linkFile(plan), `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.\n[Match]\nMACAddress=${plan.mac}\n\n[Link]\nName=enp1s0\n`);
+  // Type=ether: the repair's pin never reaches vmbr0, which has the card's MAC.
+  assert.equal(linkFile(plan), `# Written by Sowsi install-node: keeps this card's name whatever the kernel would call it.\n[Match]\nMACAddress=${plan.mac}\nType=ether\n\n[Link]\nName=enp1s0\n`);
 });
 
 test("the repair backs up first, pins the name, rebuilds the initramfs, and touches nothing else", () => {
