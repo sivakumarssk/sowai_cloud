@@ -40,9 +40,12 @@ export function measuredHostRamMB(n: { lastSeenAt: Date | null; hostUsedRamMB: n
 
 const pool = () => (process.env.PROXMOX_STORAGE ?? "").trim() || "local";
 
-export function planNeed(plan: { ramGB: number | null; storageGB: number | null }): Need {
-  return { ramMB: (plan.ramGB ?? 0) * 1024, diskGB: plan.storageGB ?? 0 };
+export function planNeed(plan: { ramGB: number | null; storageGB: number | null }, ipv4Mode?: string): Need {
+  return { ramMB: (plan.ramGB ?? 0) * 1024, diskGB: plan.storageGB ?? 0, ...(ipv4Mode === "SHARED" && { shared: true }) };
 }
+
+/** Takes shared-IPv4 services: the flag, plus a gateway to route them through. */
+export const takesShared = (n: { sharedIpv4: boolean; gatewayIpv4: string | null; gatewayVmId: number | null }) => n.sharedIpv4 && Boolean(n.gatewayIpv4) && n.gatewayVmId !== null;
 
 /** Every registered node with what's committed on it. */
 export async function nodeLoads(db: Db, now = Date.now()): Promise<NodeLoad[]> {
@@ -82,6 +85,7 @@ export async function nodeLoads(db: Db, now = Date.now()): Promise<NodeLoad[]> {
       ipv6Subnet: n.ipv6Subnet,
       acceptNewClients: n.acceptNewClients,
       status: n.status,
+      sharedIpv4: takesShared(n),
       physicalRamMB: n.physicalRamMB,
       physicalDiskGB: n.physicalDiskGB,
       maxContainers: n.maxContainers,
@@ -95,8 +99,8 @@ export async function nodeLoads(db: Db, now = Date.now()): Promise<NodeLoad[]> {
 function placementTx(tx: Prisma.TransactionClient): PlacementTx {
   return {
     async order(serviceId) {
-      const s = await tx.service.findUnique({ where: { id: serviceId }, select: { status: true, provisioningPct: true, plan: { select: { ramGB: true, storageGB: true } } } });
-      return s && { status: s.status, provisioningPct: s.provisioningPct, need: planNeed(s.plan) };
+      const s = await tx.service.findUnique({ where: { id: serviceId }, select: { status: true, provisioningPct: true, ipv4Mode: true, plan: { select: { ramGB: true, storageGB: true } } } });
+      return s && { status: s.status, provisioningPct: s.provisioningPct, need: planNeed(s.plan, s.ipv4Mode) };
     },
     nodes: () => nodeLoads(tx),
     async claim(serviceId, nodeId) {

@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { withDecryptedCredentials } from "@/lib/crypto";
 import { forCustomer } from "@/lib/provisioning/serverReady";
+import { serviceConnection } from "@/lib/provisioning/connection";
 
 export async function GET() {
   const session = await getSession();
@@ -12,6 +13,8 @@ export async function GET() {
     where: { userId: session.userId },
     include: {
       plan: true,
+      // The shared IPv4, for a shared-mode service.
+      node: { select: { gatewayIpv4: true } },
       // Current autopay (newest subscription) for the billing panel.
       subscriptions: {
         orderBy: { createdAt: "desc" },
@@ -43,5 +46,15 @@ export async function GET() {
   });
 
   // IP and credentials only for real servers; anything else shows as "Setting up".
-  return apiSuccess(services.map((s) => forCustomer(withDecryptedCredentials(s))));
+  return apiSuccess(
+    services.map((s) => {
+      const shown = forCustomer(withDecryptedCredentials(s));
+      // Only what the customer needs: not the node's other fields, the private address or the route key.
+      const sent: Partial<typeof shown> = { ...shown };
+      delete sent.node;
+      delete sent.privateIpv4;
+      delete sent.routeKey;
+      return { ...sent, connection: shown.ready ? serviceConnection(shown) : null };
+    })
+  );
 }

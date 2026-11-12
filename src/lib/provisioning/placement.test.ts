@@ -36,6 +36,7 @@ function node(name: "A" | "B", over: Partial<NodeLoad> = {}): NodeLoad {
     ipv6Subnet: `2a01:4f8:1c16:5f1${n}`,
     acceptNewClients: true,
     status: "READY",
+    sharedIpv4: false,
     physicalRamMB: 8192,
     physicalDiskGB: 160,
     maxContainers: 6,
@@ -189,6 +190,59 @@ test("an order that's already claimed (or not paid/provisioning) is skipped", as
   await placeOrder("svc_1", c.deps);
   assert.equal((await placeOrder("svc_1", c.deps)).status, "SKIP", "duplicate call doesn't provision twice");
   assert.equal((await placeOrder("missing", c.deps)).status, "SKIP");
+});
+
+// ── Shared IPv4 (Stage C) ────────────────────────────────────────────
+
+test("a shared-IPv4 order goes only to a node that takes shared services; a dedicated one goes anywhere", async () => {
+  const shared = { ...plan4G, shared: true };
+  assert.deepEqual(nodeFit(node("A"), shared, config), { ok: false, reason: "sowsi-proxmox-01 doesn't take shared-IPv4 services (its flag is off, or it has no gateway)" });
+  assert.equal(nodeFit(node("A", { sharedIpv4: true }), shared, config).ok, true);
+  assert.equal(nodeFit(node("A"), plan4G, config).ok, true, "the flag doesn't limit dedicated orders");
+
+  const c = cluster([node("A", { physicalRamMB: 32768 }), node("B", { sharedIpv4: true })], { s1: shared, d1: plan4G });
+  const s1 = await placeOrder("s1", c.deps);
+  assert.equal(s1.status === "PLACED" && s1.node.id, "node_B", "the shared order skips the roomier node without the flag");
+  const d1 = await placeOrder("d1", c.deps);
+  assert.equal(d1.status === "PLACED" && d1.node.id, "node_A");
+
+  const none = cluster([node("A"), node("B")], { s2: shared });
+  const r = await placeOrder("s2", none.deps);
+  assert.equal(r.status, "WAIT");
+  assert.match(r.status === "WAIT" ? r.reason : "", /doesn't take shared-IPv4 services.*doesn't take shared-IPv4 services/);
+});
+
+test("a pinned test order uses only that node, may use it while it's closed, and is never parked or announced", async () => {
+  const shared = { ...plan4G, shared: true };
+  const c = cluster([node("A", { sharedIpv4: true }), node("B", { acceptNewClients: false, sharedIpv4: true })], { t1: shared });
+  const r = await placeOrder("t1", c.deps, { pinNodeId: "node_B" });
+  assert.equal(r.status === "PLACED" && r.node.id, "node_B", "the closed throwaway, not the open node A");
+
+  const full = cluster([node("B", { acceptNewClients: false, sharedIpv4: true, physicalRamMB: 2048 })], { t2: shared });
+  const w = await placeOrder("t2", full.deps, { pinNodeId: "node_B" });
+  assert.equal(w.status, "WAIT");
+  assert.match(w.status === "WAIT" ? w.reason : "", /has 2048 MB RAM free, needs 4096 MB/);
+  assert.equal(full.svc.get("t2")!.waitingSince, null, "not parked: the sweep must never pick it up for another node");
+  assert.deepEqual([full.alerts, full.customer], [[], []], "nobody alerted or notified");
+
+  const off = cluster([node("B", { acceptNewClients: false })], { t3: shared });
+  const o = await placeOrder("t3", off.deps, { pinNodeId: "node_B" });
+  assert.match(o.status === "WAIT" ? o.reason : "", /doesn't take shared-IPv4 services/, "pinning doesn't skip the shared flag");
+  const retired = cluster([node("B", { acceptNewClients: false, status: "DECOMMISSIONING", sharedIpv4: true })], { t4: shared });
+  assert.match(((r4) => (r4.status === "WAIT" ? r4.reason : ""))(await placeOrder("t4", retired.deps, { pinNodeId: "node_B" })), /is DECOMMISSIONING/, "or the node's status");
+  const missing = await placeOrder("t1", cluster([node("A")], { t1: shared }).deps, { pinNodeId: "node_Z" });
+  assert.deepEqual(missing, { status: "WAIT", reason: "no node with id node_Z" });
+});
+
+test("planNeed marks a SHARED order, and a node takes shared services only with its flag and a gateway", async () => {
+  const { planNeed, takesShared } = await import("./placementDeps");
+  assert.deepEqual(planNeed({ ramGB: 2, storageGB: 40 }, "SHARED"), { ramMB: 2048, diskGB: 40, shared: true });
+  assert.deepEqual(planNeed({ ramGB: 2, storageGB: 40 }, "DEDICATED"), { ramMB: 2048, diskGB: 40 });
+  assert.deepEqual(planNeed({ ramGB: 2, storageGB: 40 }), { ramMB: 2048, diskGB: 40 });
+  assert.equal(takesShared({ sharedIpv4: true, gatewayIpv4: "198.51.100.7", gatewayVmId: 9000 }), true);
+  assert.equal(takesShared({ sharedIpv4: false, gatewayIpv4: "198.51.100.7", gatewayVmId: 9000 }), false);
+  assert.equal(takesShared({ sharedIpv4: true, gatewayIpv4: null, gatewayVmId: 9000 }), false);
+  assert.equal(takesShared({ sharedIpv4: true, gatewayIpv4: "198.51.100.7", gatewayVmId: null }), false);
 });
 
 // ── The node's own network settings ──────────────────────────────────

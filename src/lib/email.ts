@@ -1,3 +1,4 @@
+import type { ServiceConnection } from "@/lib/provisioning/connection";
 import { formatINR } from "@/lib/pricing";
 import { sendMail } from "@/lib/mailer";
 
@@ -50,7 +51,8 @@ export async function sendCredentialsEmail(
   server: {
     planName: string;
     hostname: string;
-    serverIp: string;
+    /** How to reach it: from serviceConnection(), so the email words it as the dashboard does. */
+    connection: ServiceConnection;
     sshUsername: string;
     sshPassword: string;
     panelUrl?: string;
@@ -68,13 +70,19 @@ export async function sendCredentialsEmail(
         <div style="background:#111827;border-radius:8px;padding:24px;margin:24px 0;">
           <p style="color:#9CA3AF;margin:0 0 4px;">Hostname</p>
           <p style="color:#fff;font-family:monospace;margin:0 0 16px;">${server.hostname}</p>
-          <p style="color:#9CA3AF;margin:0 0 4px;">Server IP</p>
-          <p style="color:#fff;font-family:monospace;margin:0 0 16px;">${server.serverIp}</p>
+          ${server.connection.ipv4 ? `<p style="color:#9CA3AF;margin:0 0 4px;">${server.connection.label}</p>
+          <p style="color:#fff;font-family:monospace;margin:0 0 4px;">${server.connection.ipv4}</p>
+          <p style="color:#9CA3AF;font-size:13px;margin:0 0 16px;">${server.connection.ipv4Note}</p>` : ""}
+          ${server.connection.ipv6 ? `<p style="color:#9CA3AF;margin:0 0 4px;">IPv6</p>
+          <p style="color:#fff;font-family:monospace;margin:0 0 16px;">${server.connection.ipv6}</p>` : ""}
+          ${server.connection.sshCommand ? `<p style="color:#9CA3AF;margin:0 0 4px;">Connect</p>
+          <p style="color:#fff;font-family:monospace;margin:0 0 16px;">${server.connection.sshCommand}</p>` : ""}
           <p style="color:#9CA3AF;margin:0 0 4px;">SSH Username</p>
           <p style="color:#fff;font-family:monospace;margin:0 0 16px;">${server.sshUsername}</p>
           <p style="color:#9CA3AF;margin:0 0 4px;">SSH Password</p>
           <p style="color:#fff;font-family:monospace;margin:0;">${server.sshPassword}</p>
         </div>
+        ${server.connection.notice ? `<p style="color:#FBBF24;font-size:14px;">${server.connection.notice}</p>` : ""}
         ${server.panelUrl ? `<p style="color:#D1D5DB;">Control panel: <a href="${server.panelUrl}" style="color:#60A5FA;">${server.panelUrl}</a></p>` : ""}
         ${
           server.panelLogin

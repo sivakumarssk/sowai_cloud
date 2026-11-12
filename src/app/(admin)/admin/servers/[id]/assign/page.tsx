@@ -160,7 +160,7 @@ export default function AssignServerPage() {
             <dt className="text-fg-muted text-xs">Server</dt>
             <dd className="text-fg font-mono">
               {service.serverIp && service.sshVerifiedAt ? service.serverIp : "None yet"}
-              <span className="text-fg-muted font-sans"> · {service.serverSource === "MANUAL" ? "manual" : "Proxmox"}</span>
+              <span className="text-fg-muted font-sans"> · {service.serverSource === "MANUAL" ? "manual, Dedicated IPv4" : "Proxmox"}</span>
             </dd>
           </div>
           <div className="bg-canvas rounded-lg p-3">
@@ -203,7 +203,7 @@ export default function AssignServerPage() {
           </div>
         )}
         <fieldset disabled={Boolean(blocked) || isPending} className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <Input label="Server IP" placeholder="203.0.113.10" value={form.serverIp} onChange={set("serverIp")} required inputMode="decimal" autoComplete="off" />
+          <Input label="Server IPv4 (Dedicated: a manual server's address is its own)" placeholder="203.0.113.10" value={form.serverIp} onChange={set("serverIp")} required inputMode="decimal" autoComplete="off" />
           <Input label="IPv6 address (optional)" placeholder="2a01:4f8::10" value={form.ipv6Address} onChange={set("ipv6Address")} autoComplete="off" />
           <Input label="SSH username" value={form.sshUsername} onChange={set("sshUsername")} required autoComplete="off" />
           <Input label="SSH port" value={form.sshPort} onChange={set("sshPort")} inputMode="numeric" autoComplete="off" />

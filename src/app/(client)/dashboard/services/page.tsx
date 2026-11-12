@@ -9,6 +9,8 @@ import { StatusBadge, type ServiceStatus } from "@/components/ui/StatusBadge";
 import { DELETE_AFTER_SUSPENDED_DAYS, BILLING_SUSPEND_REASON } from "@/lib/billing/constants";
 import { formatINR, formatStorage, categoryLabel } from "@/lib/pricing";
 import { getOsImage, getPreset, getRegion } from "@/lib/provisioning/catalog";
+import type { ServiceConnection } from "@/lib/provisioning/connection";
+import { Ipv4Tag } from "@/components/ui/Ipv4Tag";
 
 type AutopayStatus =
   | "CREATED" | "AUTHENTICATED" | "ACTIVE" | "PENDING" | "HALTED" | "PAUSED" | "CANCELLED" | "COMPLETED" | "EXPIRED";
@@ -36,8 +38,12 @@ interface Service {
   sshUsername: string | null;
   sshPassword: string | null;
   panelUrl: string | null;
+  /** Its name under c.sowsicloud.com (shared mode). */
+  publicName: string | null;
   /** A real server (container, node, Floating IP, SSH check): only then are IP and credentials sent. */
   ready: boolean;
+  /** Shared or Dedicated, its addresses and SSH command: from serviceConnection(), only when ready. */
+  connection: ServiceConnection | null;
   provisioningStep: string | null;
   provisioningPct: number;
   nextBillingDate: string;
@@ -204,7 +210,8 @@ function ServerDetails({ service, onChanged }: { service: Service; onChanged: ()
   const [showPassword, setShowPassword] = useState(false);
   const os = service.osImage ? getOsImage(service.osImage)?.label ?? service.osImage : null;
   const preset = service.stackPreset && service.stackPreset !== "plain" ? getPreset(service.stackPreset)?.label : null;
-  const sshCommand = service.serverIp && service.sshUsername ? `ssh ${service.sshUsername}@${service.serverIp}` : null;
+  const connection = service.connection;
+  const sshCommand = connection?.sshCommand ?? null;
 
   return (
     <div className="border-t border-line px-4 sm:px-5 py-5 flex flex-col gap-5">
@@ -233,16 +240,24 @@ function ServerDetails({ service, onChanged }: { service: Service; onChanged: ()
               </Field>
             )}
           </div>
+          {connection?.notice && <p className="text-xs text-fg-muted mt-2">{connection.notice}</p>}
         </section>
       )}
 
       <section aria-label="Server details">
         <h4 className="text-xs font-semibold text-fg-muted uppercase tracking-wide mb-2">Details</h4>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
-          {service.ipv6Address && (
+          {connection?.ipv4 && (
+            <Field label={connection.label}>
+              <Mono>{connection.ipv4}</Mono>
+              <Ipv4Tag connection={connection} />
+              <CopyButton value={connection.ipv4} label={connection.label} />
+            </Field>
+          )}
+          {connection?.ipv6 && (
             <Field label="IPv6">
-              <Mono>{service.ipv6Address}</Mono>
-              <CopyButton value={service.ipv6Address} label="IPv6 address" />
+              <Mono>{connection.ipv6}</Mono>
+              <CopyButton value={connection.ipv6} label="IPv6 address" />
             </Field>
           )}
           <Field label="Region">
@@ -319,11 +334,12 @@ function ServerRow({ service, onChanged }: { service: Service; onChanged: () => 
             </div>
           ) : !service.ready && service.status === "SUSPENDED" ? (
             <span className="text-sm text-fg-muted">Setting up</span>
-          ) : service.serverIp ? (
+          ) : service.connection?.ipv4 ? (
             <div className="flex items-center gap-1">
               <span className="text-xs text-fg-muted md:hidden mr-1">IPv4</span>
-              <code className="font-mono text-sm text-fg select-all">{service.serverIp}</code>
-              <CopyButton value={service.serverIp} label={`IP address of ${name}`} />
+              <code className="font-mono text-sm text-fg select-all">{service.connection.ipv4}</code>
+              <Ipv4Tag connection={service.connection} />
+              <CopyButton value={service.connection.ipv4} label={`IP address of ${name}`} />
             </div>
           ) : (
             <span className="text-sm text-fg-subtle">No IP</span>
@@ -457,7 +473,7 @@ export default function ServicesPage() {
   const shown = visible.filter(
     (s) =>
       activeFilter.match(s) &&
-      (!q || [s.hostname, s.serverIp, s.plan.name].some((v) => v?.toLowerCase().includes(q)))
+      (!q || [s.hostname, s.publicName, s.connection?.ipv4, s.connection?.ipv6, s.plan.name].some((v) => v?.toLowerCase().includes(q)))
   );
 
   return (

@@ -5,11 +5,15 @@
  *   npx tsx scripts/node/node-state.ts --name sowsi-proxmox-01 --retire --apply --approved-by <name>
  *   npx tsx scripts/node/node-state.ts --name sowsi-proxmox-02 --open                                # dry run
  *   npx tsx scripts/node/node-state.ts --name sowsi-proxmox-02 --open --apply --approved-by <name>
+ *   npx tsx scripts/node/node-state.ts --name sowsi-test-07 --shared on                             # dry run
+ *   npx tsx scripts/node/node-state.ts --name sowsi-test-07 --shared on --apply --approved-by <name>
  *
  * --retire sets DECOMMISSIONING and closes the node; it refuses while the node has a live service,
  * a volume, an open migration or an open engine approval. The row and its history stay.
  * --open sets READY (from PROVISIONING) and opens the node; it refuses a retired node, or one
- * without its own API token or IPv6 subnet. Changes only the database, never a server.
+ * without its own API token or IPv6 subnet. --shared on|off is the node's shared-IPv4 flag (Stage C):
+ * on needs its gateway; it lets shared-mode orders be placed there, and no customer order is
+ * shared until Stage G. Changes only the database, never a server.
  */
 import { config as loadEnv } from "dotenv";
 import type { NodeStatus } from "@prisma/client";
@@ -27,9 +31,11 @@ const value = (flag: string) => {
 
 (async () => {
   const name = value("--name");
-  const actions = (["retire", "open"] as const).filter((a) => argv.includes(`--${a}`));
-  if (!name || actions.length !== 1) throw new Error("usage: node-state.ts --name <node> (--retire | --open) [--apply --approved-by <name>]");
-  const action = actions[0];
+  const shared = value("--shared");
+  if (argv.includes("--shared") && shared !== "on" && shared !== "off") throw new Error("--shared takes on or off");
+  const actions = [...(["retire", "open"] as const).filter((a) => argv.includes(`--${a}`)), ...(shared ? [`shared-${shared}` as const] : [])];
+  if (!name || actions.length !== 1) throw new Error("usage: node-state.ts --name <node> (--retire | --open | --shared on|off) [--apply --approved-by <name>]");
+  const action = actions[0] as import("../../src/lib/nodes/nodeState").NodeStateAction;
   const apply = argv.includes("--apply");
   const approvedBy = value("--approved-by") ?? "";
   if (apply && !approvedBy) throw new Error("--apply needs --approved-by <name>");
@@ -38,7 +44,7 @@ const value = (flag: string) => {
   const { applyNodeState, planNodeState } = await import("../../src/lib/nodes/nodeState");
   const deps: import("../../src/lib/nodes/nodeState").NodeStateDeps = {
     async findNode(n) {
-      const row = await prisma.proxmoxNode.findUnique({ where: { name: n }, select: { id: true, name: true, status: true, acceptNewClients: true, hetznerServerId: true, ipv6Subnet: true, apiTokenId: true, apiTokenSecret: true } });
+      const row = await prisma.proxmoxNode.findUnique({ where: { name: n }, select: { id: true, name: true, status: true, acceptNewClients: true, hetznerServerId: true, ipv6Subnet: true, apiTokenId: true, apiTokenSecret: true, gatewayIpv4: true, gatewayVmId: true, sharedIpv4: true } });
       if (!row) return null;
       const { apiTokenId, apiTokenSecret, ...rest } = row;
       return { ...rest, hasOwnToken: Boolean(apiTokenId && apiTokenSecret) };
@@ -47,11 +53,12 @@ const value = (flag: string) => {
     liveVolumes: (nodeId) => prisma.hetznerVolume.findMany({ where: { nodeId, status: { not: "DELETED" } }, select: { id: true, status: true } }),
     openMigrations: (n) => prisma.migration.count({ where: { OR: [{ fromNode: n }, { toNode: n }], status: { in: ["SCHEDULED", "IN_PROGRESS"] } } }),
     openApprovals: (n) => prisma.engineApproval.count({ where: { subject: `node:${n}`, status: { in: ["PENDING", "APPROVED"] } } }),
+    sharedServices: (nodeId) => prisma.service.count({ where: { nodeId, ipv4Mode: "SHARED", status: { not: "DELETED" } } }),
     async apply(node, change, log) {
       await prisma.$transaction([
-        prisma.proxmoxNode.update({ where: { id: node.id }, data: { status: change.status as NodeStatus, acceptNewClients: change.acceptNewClients } }),
+        prisma.proxmoxNode.update({ where: { id: node.id }, data: { status: change.status as NodeStatus | undefined, acceptNewClients: change.acceptNewClients, sharedIpv4: change.sharedIpv4 } }),
         prisma.engineLog.create({
-          data: { action: log.action, toNode: node.name, trigger: "MANUAL", before: { status: node.status, acceptNewClients: node.acceptNewClients }, after: { ...change, approvedBy: log.approvedBy } },
+          data: { action: log.action, toNode: node.name, trigger: "MANUAL", before: { status: node.status, acceptNewClients: node.acceptNewClients, sharedIpv4: node.sharedIpv4 ?? false }, after: { ...change, approvedBy: log.approvedBy } },
         }),
       ]);
     },

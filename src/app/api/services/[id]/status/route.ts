@@ -2,6 +2,7 @@ import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
 import { isRealServer } from "@/lib/provisioning/serverReady";
+import { serviceConnection } from "@/lib/provisioning/connection";
 
 /** Live provisioning progress for the progress page (polled every few seconds). */
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -23,8 +24,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       hetznerFloatingIpId: true,
       ipv4Mode: true,
       privateIpv4: true,
+      publicName: true,
+      routeKey: true,
       sshVerifiedAt: true,
       serverSource: true,
+      node: { select: { gatewayIpv4: true } },
     },
   });
   if (!service || (service.userId !== session.userId && session.role !== "ADMIN")) {
@@ -39,5 +43,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     provisioningPct: service.provisioningPct,
     serverIp: active ? service.serverIp : null,
     ipv6Address: active ? service.ipv6Address : null,
+    // Shared or Dedicated, worded once (src/lib/provisioning/connection.ts). No SSH command here: the
+    // username is only on the dashboard and in the email.
+    connection: active ? serviceConnection(service) : null,
   });
 }

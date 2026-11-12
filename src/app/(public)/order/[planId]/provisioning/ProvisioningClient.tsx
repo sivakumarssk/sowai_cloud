@@ -6,6 +6,8 @@ import Navbar from "@/components/landing/Navbar";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { OrderSteps } from "@/components/order/OrderSteps";
+import { Ipv4Tag } from "@/components/ui/Ipv4Tag";
+import type { ServiceConnection } from "@/lib/provisioning/connection";
 
 type ProvisioningStatus = {
   status: string;
@@ -13,6 +15,8 @@ type ProvisioningStatus = {
   provisioningPct: number;
   serverIp: string | null;
   ipv6Address: string | null;
+  /** Shared or Dedicated, worded by serviceConnection(): only once it's running. */
+  connection: ServiceConnection | null;
 };
 
 const POLL_MS = 3000;
@@ -161,11 +165,14 @@ export default function ProvisioningClient({
           </div>
         )}
 
-        {isActive && (info?.serverIp || info?.ipv6Address) && (
-          <dl className="rounded-xl bg-surface border border-line divide-y divide-line mb-6">
-            <IpRow label="IPv4" value={info?.serverIp} />
-            <IpRow label="IPv6" value={info?.ipv6Address} />
-          </dl>
+        {isActive && info?.connection && (info.connection.ipv4 || info.connection.ipv6) && (
+          <div className="mb-6">
+            <dl className="rounded-xl bg-surface border border-line divide-y divide-line">
+              <IpRow label={info.connection.label} value={info.connection.ipv4} tag={<Ipv4Tag connection={info.connection} />} />
+              <IpRow label="IPv6" value={info.connection.ipv6} />
+            </dl>
+            {info.connection.notice && <p className="text-xs text-fg-muted mt-2 text-left">{info.connection.notice}</p>}
+          </div>
         )}
 
         {failed && (
@@ -193,13 +200,14 @@ export default function ProvisioningClient({
   );
 }
 
-function IpRow({ label, value }: { label: string; value: string | null | undefined }) {
+function IpRow({ label, value, tag }: { label: string; value: string | null | undefined; tag?: React.ReactNode }) {
   if (!value) return null;
   return (
     <div className="flex items-center justify-between gap-4 px-5 py-3 text-sm">
       <dt className="text-fg-muted shrink-0">{label}</dt>
       <dd className="flex items-center gap-1 min-w-0">
         <code className="font-mono text-fg select-all break-all text-right">{value}</code>
+        {tag}
         <CopyButton value={value} label={`${label} address`} />
       </dd>
     </div>

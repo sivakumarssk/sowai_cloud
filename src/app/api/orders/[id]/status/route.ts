@@ -1,6 +1,8 @@
 import { getSession } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { apiSuccess, apiError } from "@/lib/types";
+import { isRealServer } from "@/lib/provisioning/serverReady";
+import { serviceConnection } from "@/lib/provisioning/connection";
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await getSession();
@@ -10,7 +12,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   const order = await prisma.order.findUnique({
     where: { id },
-    include: { service: true },
+    include: { service: { include: { node: { select: { gatewayIpv4: true } } } } },
   });
 
   if (!order || order.userId !== session.userId) {
@@ -25,6 +27,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
           status: order.service.status,
           serverIp: order.service.serverIp,
           hostname: order.service.hostname,
+          connection: isRealServer(order.service) ? serviceConnection(order.service) : null,
           panelUrl: order.service.panelUrl,
           provisionError: order.service.provisionError,
         }

@@ -214,6 +214,16 @@ npx tsx scripts/node/install-node.ts --destroy <hetznerServerId> [--execute --ap
   `sowsi-gateway status` (`gateway-status`) prints its facts. The node's rules let the gateway reach
   shared containers on 80 and 443 only. The gateway never counts towards `maxContainers`, and
   `--destroy` releases its Floating IP with the server.
+- **Shared IPv4, Stage C (shared mode in provisioning):** a node takes shared-mode services only
+  with its flag on (`node-state.ts --name <node> --shared on|off`, a dry run unless `--apply
+  --approved-by <name>`; on needs its gateway). A shared service buys no Floating IP: it gets its
+  private address, a name under `c.sowsicloud.com` (`Service.publicName`, unique, never reused) and a
+  16-character route key, and is set up over its IPv6. Its route goes to the gateway when it becomes
+  ACTIVE and comes off first when it's cancelled; `scripts/node/gateway-sync.ts --cron` sends every
+  gateway its whole table every 5 minutes. `serviceConnection()` (src/lib/provisioning/connection.ts)
+  words Shared or Dedicated for the dashboard, the progress page, the ready email, the APIs and the
+  admin list. No customer order is shared until Stage G: only `scripts/node/shared-test-order.ts`,
+  for a closed throwaway node, makes one.
 - **Throwaway tests:** `--simulate-bad-nic` points the bridge at a card that
   doesn't exist before the reboot (the `--name` must contain `test`). Add
   `--no-guard` to prove the rescue repair instead of the guard.

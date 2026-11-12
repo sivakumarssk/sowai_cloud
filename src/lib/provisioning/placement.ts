@@ -5,8 +5,11 @@
 // wins (spreads load). If none fits, the paid order is never failed or
 // refunded: it stays PROVISIONING (0%, waitingForNodeSince set), the admin is
 // alerted, and the provisioning sweep starts it once a node has room.
+//
+// A shared-IPv4 order (Stage C) goes only to a node whose sharedIpv4 flag is on and that has
+// its gateway. Until Stage G no customer order is shared.
 
-export type Need = { ramMB: number; diskGB: number };
+export type Need = { ramMB: number; diskGB: number; shared?: boolean };
 
 export type NodeLoad = {
   id: string;
@@ -17,6 +20,8 @@ export type NodeLoad = {
   ipv6Subnet: string | null;
   acceptNewClients: boolean;
   status: string;
+  /** Takes shared-IPv4 services: its flag is on and it has a gateway (address and container). */
+  sharedIpv4: boolean;
   physicalRamMB: number;
   /** Size of the container storage (free pool), GB. */
   physicalDiskGB: number;
@@ -57,9 +62,12 @@ export function usableDiskGB(node: Pick<NodeLoad, "physicalDiskGB">, config: Pla
   return Math.floor(Math.max(0, node.physicalDiskGB - config.diskPoolReserveGB) * config.diskOvercommit);
 }
 
-/** Why a node takes no new containers at all, or null if it's open. */
-export function closedReason(node: Pick<NodeLoad, "name" | "acceptNewClients" | "status">): string | null {
-  if (!node.acceptNewClients) return `${node.name} is closed to new clients`;
+/**
+ * Why a node takes no new containers at all, or null if it's open. `pinned`: a test order placed on
+ * this node by name (scripts/node/shared-test-order.ts), which may use a node closed to customers.
+ */
+export function closedReason(node: Pick<NodeLoad, "name" | "acceptNewClients" | "status">, pinned = false): string | null {
+  if (!node.acceptNewClients && !pinned) return `${node.name} is closed to new clients`;
   // READY/WARNING/CRITICAL are health (written by the ServerMonitor), not closure.
   if (node.status === "PROVISIONING" || node.status === "DECOMMISSIONING") return `${node.name} is ${node.status}`;
   return null;
@@ -72,10 +80,11 @@ export type Fit = { ok: true; freeRamMB: number; freeDiskGB: number } | { ok: fa
  * what the database has settled there, plus orders still being set up
  * (counted even if the monitor already sees them — erring on the safe side).
  */
-export function nodeFit(node: NodeLoad, need: Need, config: PlacementConfig): Fit {
-  const closed = closedReason(node);
+export function nodeFit(node: NodeLoad, need: Need, config: PlacementConfig, pinned = false): Fit {
+  const closed = closedReason(node, pinned);
   if (closed) return { ok: false, reason: closed };
   if (!node.ipv6Subnet) return { ok: false, reason: `${node.name} has no IPv6 subnet configured` };
+  if (need.shared && !node.sharedIpv4) return { ok: false, reason: `${node.name} doesn't take shared-IPv4 services (its flag is off, or it has no gateway)` };
 
   const ram = Math.max(node.monitor?.allocatedRamMB ?? 0, node.settled.ramMB) + node.inFlight.ramMB;
   const disk = Math.max(node.monitor?.allocatedDiskGB ?? 0, node.settled.diskGB) + node.inFlight.diskGB;
@@ -90,11 +99,11 @@ export function nodeFit(node: NodeLoad, need: Need, config: PlacementConfig): Fi
 }
 
 /** The open node with room and the most free RAM; otherwise why each node was refused. */
-export function chooseNode(nodes: NodeLoad[], need: Need, config: PlacementConfig): { node: NodeLoad; reasons: string[] } | { node: null; reasons: string[] } {
+export function chooseNode(nodes: NodeLoad[], need: Need, config: PlacementConfig, pinned = false): { node: NodeLoad; reasons: string[] } | { node: null; reasons: string[] } {
   const reasons: string[] = [];
   let best: { node: NodeLoad; freeRamMB: number; freeDiskGB: number } | null = null;
   for (const node of nodes) {
-    const fit = nodeFit(node, need, config);
+    const fit = nodeFit(node, need, config, pinned);
     if (!fit.ok) {
       reasons.push(fit.reason);
       continue;
@@ -165,16 +174,30 @@ export type PlacementResult =
   /** Not a fresh paid order (already claimed, cancelled, …): leave it alone. */
   | { status: "SKIP" };
 
+export type PlaceOptions = {
+  /**
+   * Only this node (by id), even if it's closed to customers — for a test order on a throwaway
+   * node. Its status, room and shared flag still count. If it doesn't fit, the order isn't parked
+   * and nobody is alerted or notified: the caller gets WAIT with the reason and decides.
+   */
+  pinNodeId?: string;
+};
+
 /** Picks a node for a paid order and claims the order on it — or parks the order. */
-export async function placeOrder(serviceId: string, deps: PlacementDeps): Promise<PlacementResult> {
+export async function placeOrder(serviceId: string, deps: PlacementDeps, options: PlaceOptions = {}): Promise<PlacementResult> {
+  const pin = options.pinNodeId;
   const result = await deps.locked(async (tx): Promise<PlacementResult & { newlyWaiting?: boolean }> => {
     const order = await tx.order(serviceId);
     if (!order || order.status !== "PROVISIONING" || order.provisioningPct !== 0) return { status: "SKIP" };
-    const choice = chooseNode(await tx.nodes(), order.need, deps.config);
+    const all = await tx.nodes();
+    const nodes = pin ? all.filter((n) => n.id === pin) : all;
+    if (pin && nodes.length === 0) return { status: "WAIT", reason: `no node with id ${pin}` };
+    const choice = chooseNode(nodes, order.need, deps.config, Boolean(pin));
     if (choice.node) {
       return (await tx.claim(serviceId, choice.node.id)) ? { status: "PLACED", node: choice.node } : { status: "SKIP" };
     }
     const reason = choice.reasons.join("; ");
+    if (pin) return { status: "WAIT", reason };
     return { status: "WAIT", reason, newlyWaiting: await tx.markWaiting(serviceId, WAITING_STEP) };
   });
 

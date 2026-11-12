@@ -584,13 +584,24 @@ whenBash("isolation-test.sh tests 17 and 18 learn the gateway first, then check 
 });
 
 /** isolation-test.sh test 16's in-container script, with apt, docker and curl faked. sleep moves bash's clock. */
-function runDockerCheck(o: { daemonAfter?: number; portAfter?: number; runFails?: boolean; runFailsOnce?: boolean; installFails?: boolean } = {}) {
+function runDockerCheck(o: { daemonAfter?: number; portAfter?: number; runFails?: boolean; runFailsOnce?: boolean; installFails?: boolean; edit?: (check: string) => string } = {}) {
   const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8").replace(/\r\n/g, "\n");
-  const check = /\n {2}docker_check='([\s\S]*?)'\n/.exec(script)![1];
+  const check = (o.edit ?? ((c: string) => c))(/\n {2}docker_check='([\s\S]*?)'\n/.exec(script)![1]);
   const fakes = `
 sleep() { SECONDS=$((SECONDS + 1)); }
 apt-get() { return ${o.installFails ? 1 : 0}; }
+# Docker's own check on a name (moby daemon/names: ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$) and its words on sowsi-test-06.
+named() {
+  [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$ ]] && return 0
+  echo "docker: Error response from daemon: Invalid container name ($1), only [a-zA-Z0-9][a-zA-Z0-9_.-] are allowed." >&2
+  return 125
+}
 docker() {
+  local a prev=
+  for a in "$@"; do
+    if [[ $prev == --name || ($1 == rm && $prev == -f) || ($1 == logs && $prev == logs) ]]; then named "$a" || return 125; fi
+    prev=$a
+  done
   case "$1" in
     info) [ "$SECONDS" -ge ${o.daemonAfter ?? 0} ] ;;
     run)
@@ -603,7 +614,7 @@ docker() {
       fi
       echo "3f9ac21e7b10"
       ;;
-    rm) echo "docker rm" >> calls ;;
+    rm) echo "docker rm $*" >> calls ;;
     ps) echo "CONTAINER ID   IMAGE          STATUS" ;;
     logs) echo "nginx: starting" ;;
   esac
@@ -621,7 +632,8 @@ whenBash("test 16 waits up to 30 seconds for Docker's port, and says which step 
   const slow = runDockerCheck({ daemonAfter: 4, portAfter: 20 });
   assert.equal(slow.status, 0, slow.stdout + slow.stderr);
   assert.match(slow.stdout, /^served_after=1[0-9]s$/m, "nginx answering 20 s in still passes");
-  assert.match(slow.calls, /docker rm\n$/, "the test container is removed afterwards");
+  assert.match(slow.calls, /docker rm rm -f sowsi-test16\n$/, "the test container is removed afterwards");
+  assert.doesNotMatch(slow.stdout + slow.stderr, /Invalid container name/);
 
   const never = runDockerCheck({ portAfter: 999 });
   assert.notEqual(never.status, 0);
@@ -642,7 +654,7 @@ whenBash("test 16 removes a leftover test container first, prints docker run's o
   assert.match(fails.stdout, /^run_exit=125 \(attempt 2\)$/m);
   assert.match(fails.stdout, /^run_error: docker: Error response from daemon: Get "?https:\/\/registry-1\.docker\.io\/v2\/"?: net\/http: TLS handshake timeout\.$/m, "Docker's own words, not an empty ps header");
   assert.equal(fails.calls.match(/^docker run /gm)!.length, 2, "two tries, no more");
-  assert.match(fails.calls, /^docker rm\ndocker run /, "a container left by an earlier run is removed before the first try");
+  assert.match(fails.calls, /^docker rm [^\n]*\ndocker run /, "a container left by an earlier run is removed before the first try");
   assert.doesNotMatch(fails.calls, /curl/, "no waiting on a port that can't come");
   assert.doesNotMatch(fails.stdout, /3f9ac21e7b10/, "the container id isn't mistaken for an error");
 
@@ -650,7 +662,34 @@ whenBash("test 16 removes a leftover test container first, prints docker run's o
   assert.equal(once.status, 0, once.stdout + once.stderr);
   assert.match(once.stdout, /^run_exit=125 \(attempt 1\)$/m, "the failed try is still shown");
   assert.match(once.stdout, /^served_after=/m);
-  assert.match(once.calls, /docker run [^\n]*\ndocker rm\ndocker run /, "the half-made container is removed before the second try");
+  assert.match(once.calls, /docker run [^\n]*\ndocker rm [^\n]*\ndocker run /, "the half-made container is removed before the second try");
+});
+
+whenBash("test 16's docker commands all name one container, with a name Docker accepts (sowsi-test-06 refused \"t\")", () => {
+  const ok = runDockerCheck({ portAfter: 1 });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  const run = ok.calls.split("\n").find((l) => l.startsWith("docker run "))!;
+  assert.equal(run, "docker run run -d --name sowsi-test16 -p 8080:80 nginx:alpine", "the generated docker run, word for word");
+  const names = [...ok.calls.matchAll(/(?:--name|rm -f) (\S+)/g)].map((m) => m[1]);
+  assert.ok(names.length >= 3, ok.calls);
+  assert.deepEqual([...new Set(names)], ["sowsi-test16"], "run and every rm use the same name");
+  for (const n of names) assert.match(n, /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/, "Docker's own name pattern");
+
+  // The text of the script, too: no docker command names a container any other way, and none is one character.
+  const script = readFileSync(path.join(process.cwd(), "scripts", "node", "isolation-test.sh"), "utf8").replace(/\r\n/g, "\n");
+  const check = /\n {2}docker_check='([\s\S]*?)'\n/.exec(script)![1];
+  const uses = [...check.matchAll(/docker (?:run [^\n]*--name|rm -f|logs) (\S+)/g)].map((m) => m[1]);
+  assert.ok(uses.length >= 5, uses.join());
+  for (const u of uses) assert.equal(u, '"$name"', `docker uses "$name", not ${u}`);
+  assert.match(check, /^name=sowsi-test16$/m);
+});
+
+whenBash("with the old name \"t\" test 16 fails at the run step with Docker's words, as on sowsi-test-06", () => {
+  const old = runDockerCheck({ portAfter: 1, edit: (c) => c.replace(/^name=sowsi-test16$/m, "name=t") });
+  assert.notEqual(old.status, 0);
+  assert.match(old.stdout, /^step=run$/m);
+  assert.match(old.stdout, /^run_exit=125 \(attempt 2\)$/m);
+  assert.match(old.stdout, /^run_error: docker: Error response from daemon: Invalid container name \(t\), only \[a-zA-Z0-9\]\[a-zA-Z0-9_.-\] are allowed\.$/m);
 });
 
 test("the proof fails on any attempt that got through and any rule that stopped nothing", () => {

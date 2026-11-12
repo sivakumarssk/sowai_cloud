@@ -240,17 +240,19 @@ until docker info >/dev/null 2>&1; do
   if ((SECONDS >= deadline)); then echo "step=daemon"; exit 1; fi
   sleep 1
 done
+# Docker wants two characters or more (^[a-zA-Z0-9][a-zA-Z0-9_.-]+$): "t" was refused on sowsi-test-06.
+name=sowsi-test16
 # Whatever an earlier run left under this name goes first.
-docker rm -f t >/dev/null 2>&1
+docker rm -f "$name" >/dev/null 2>&1
 # The error and exit code of docker run, and one retry: a pull can fail once on a slow registry.
 started=no
 for attempt in 1 2; do
   rc=0
-  err=$(docker run -d --name t -p 8080:80 nginx:alpine 2>&1 >/dev/null) || rc=$?
+  err=$(docker run -d --name "$name" -p 8080:80 nginx:alpine 2>&1 >/dev/null) || rc=$?
   if ((rc == 0)); then started=yes; break; fi
   echo "run_exit=$rc (attempt $attempt)"
   printf "%s\n" "$err" | tail -5 | sed "s/^/run_error: /"
-  docker rm -f t >/dev/null 2>&1
+  docker rm -f "$name" >/dev/null 2>&1
   sleep 5
 done
 if [[ $started != yes ]]; then echo "step=run"; docker ps -a 2>&1 | tail -3; exit 1; fi
@@ -259,8 +261,8 @@ while ((SECONDS < deadline)); do
   if curl -fsS -m 2 -o /dev/null http://localhost:8080; then rc=0; echo "served_after=$((SECONDS - start))s"; break; fi
   sleep 1
 done
-if ((rc != 0)); then echo "step=port"; docker ps -a 2>&1 | tail -3; docker logs t 2>&1 | tail -5; fi
-docker rm -f t >/dev/null 2>&1
+if ((rc != 0)); then echo "step=port"; docker ps -a 2>&1 | tail -3; docker logs "$name" 2>&1 | tail -5; fi
+docker rm -f "$name" >/dev/null 2>&1
 exit $rc'
   if docker_out=$(in_ct "$A" "$docker_check" 2>&1); then
     served=$(sed -n 's/^served_after=//p' <<<"$docker_out")

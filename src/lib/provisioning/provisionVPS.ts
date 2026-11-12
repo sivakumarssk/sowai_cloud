@@ -15,6 +15,11 @@ import { cancelAutopayForService } from "@/lib/billing/subscriptions";
 import { placeOrder } from "@/lib/provisioning/placement";
 import { prismaPlacementDeps } from "@/lib/provisioning/placementDeps";
 import { containerNode, inService, ipv6ForVmid, nodeTarget, type NodeTarget } from "@/lib/provisioning/nodeTarget";
+import { prepareIpv4, setupAddress, type Ipv4Plan, type NetworkDeps } from "@/lib/provisioning/serviceNetwork";
+import { assignPrivateIpv4, prismaPrivateIpv4Db } from "@/lib/provisioning/privateIpv4";
+import { assignSharedIdentity, prismaPublicNameDb } from "@/lib/provisioning/publicName";
+import { serviceConnection } from "@/lib/provisioning/connection";
+import { syncGatewayAfterChange } from "@/lib/nodes/gatewaySyncDeps";
 
 export type PlanResources = { cores: number; memory: number; disk: number };
 
@@ -61,13 +66,33 @@ export type ProvisionOptions = {
    * service whose payment stands (scripts/billing/reprovision.ts). [true]
    */
   refundOnFailure?: boolean;
+  /**
+   * Only this node (by id), even while it's closed to customers: a test order on a throwaway node
+   * (scripts/node/shared-test-order.ts). See PlaceOptions.pinNodeId.
+   */
+  pinNodeId?: string;
+  /** false = no credentials email and no in-app notification (a test order's made-up customer). [true] */
+  notifyCustomer?: boolean;
 };
+
+/** Hetzner and the database, for prepareIpv4. */
+function networkDeps(serviceId: string, hasCoolify: boolean): NetworkDeps {
+  return {
+    buyFloatingIP: (name, location) => hetzner.buyFloatingIP(name, location),
+    saveFloatingIP: async (id, ip) => void (await prisma.service.update({ where: { id }, data: { hetznerFloatingIpId: String(ip.id), serverIp: ip.ip, hasCoolify } })),
+    assignFloatingIP: (id, serverId) => hetzner.assignFloatingIP(id, serverId),
+    assignPrivateIpv4: async (id) => assignPrivateIpv4(await prismaPrivateIpv4Db(), id),
+    assignSharedIdentity: async (id, hint) => assignSharedIdentity(await prismaPublicNameDb(), id, hint),
+    progress: (step, pct) => updateStatus(serviceId, "PROVISIONING", step, pct),
+  };
+}
 
 export async function provisionVPS(serviceId: string, options: ProvisionOptions = {}): Promise<void> {
   // Picks a node and claims the order on it (0% → 10%) under a lock, so a
   // duplicate call can't provision twice and two orders can't take the last slot.
-  const placement = await placeOrder(serviceId, prismaPlacementDeps());
+  const placement = await placeOrder(serviceId, prismaPlacementDeps(), { pinNodeId: options.pinNodeId });
   if (placement.status !== "PLACED") return;
+  const notify = options.notifyCustomer ?? true;
 
   let floatingIpId: number | null = null;
   let vmid: number | null = null;
@@ -90,17 +115,18 @@ export async function provisionVPS(serviceId: string, options: ProvisionOptions 
       throw new Error(`LXC template for OS "${osImage}" is not available on ${node.name}`);
     }
 
-    // b. Buy the Floating IP in the node's location — saved immediately so it can be released even if we crash.
-    const ip = await hetzner.buyFloatingIP(`sowsi-${serviceId}`, node.location);
-    floatingIpId = ip.id;
-    await prisma.service.update({
-      where: { id: serviceId },
-      data: { hetznerFloatingIpId: String(ip.id), serverIp: ip.ip, hasCoolify },
+    // b–d. Its IPv4. Dedicated: buy the Floating IP in the node's location (saved immediately so it
+    // can be released even if we crash) and route it to the node's server. Shared: its private
+    // address, name and route key, on a node that takes shared services.
+    const ip: Ipv4Plan = await prepareIpv4(networkDeps(serviceId, hasCoolify), {
+      serviceId,
+      mode: service.ipv4Mode,
+      node: { ...node, sharedIpv4: placement.node.sharedIpv4 },
+      hasCoolify,
+      hostname: service.hostname,
+      onFloatingIp: (id) => void (floatingIpId = id),
     });
-
-    // c–d. Route it to the chosen node's server.
-    await updateStatus(serviceId, "PROVISIONING", "Assigning IP address...", 20);
-    await hetzner.assignFloatingIP(ip.id, node.hetznerServerId);
+    if (ip.mode === "SHARED") await prisma.service.update({ where: { id: serviceId }, data: { hasCoolify, serverIp: null } });
 
     // e–f. Create the container — this is where the OS is installed from the template.
     await updateStatus(serviceId, "INSTALLING", `Installing ${osLabel}...`, 40);
@@ -118,7 +144,7 @@ export async function provisionVPS(serviceId: string, options: ProvisionOptions 
           memory: resources.memory,
           diskSize: resources.disk,
           osTemplate: osImage,
-          ipv4: ip.ip,
+          ipv4: ip.ipv4,
           ipv6,
           start: true,
         });
@@ -139,10 +165,11 @@ export async function provisionVPS(serviceId: string, options: ProvisionOptions 
     await pve.waitForLXC(vmid);
     await vmSetup.syncHostRoutes(node.ip);
 
-    // h–k. SSH in: updates, UFW, client user, Coolify, SSH hardening.
+    // h–k. SSH in: updates, UFW, client user, Coolify, SSH hardening. Shared: over its IPv6.
     await updateStatus(serviceId, "INSTALLING", ...SETUP_PROGRESS.connecting);
+    const ipv6 = ipv6ForVmid(node.ipv6Subnet, vmid);
     const credentials = await vmSetup.setupVM({
-      ipAddress: ip.ip,
+      ipAddress: setupAddress(ip, ipv6),
       hasCoolify,
       clientEmail: service.user.email,
       onStep: (step) => updateStatus(serviceId, "INSTALLING", ...SETUP_PROGRESS[step]),
@@ -164,11 +191,26 @@ export async function provisionVPS(serviceId: string, options: ProvisionOptions 
       },
     });
 
+    // Shared: the gateway gets its route now (the 5-minute job would, too).
+    if (ip.mode === "SHARED") await syncGatewayAfterChange(placement.node.id, `service ${serviceId} is ready`);
+
+    if (!notify) return;
+
     // m. Welcome email with credentials.
+    const connection = serviceConnection({
+      serverSource: "PROXMOX",
+      ipv4Mode: ip.mode,
+      serverIp: ip.mode === "DEDICATED" ? ip.ipv4 : null,
+      ipv6Address: ipv6,
+      publicName: ip.mode === "SHARED" ? ip.publicName : null,
+      sshUsername: credentials.sshUsername,
+      // The server is ACTIVE by now: nothing here may throw into handleFailure, which would delete it.
+      node: await prisma.proxmoxNode.findUnique({ where: { id: placement.node.id }, select: { gatewayIpv4: true } }).catch(() => null),
+    });
     await sendCredentialsEmail(service.user.email, service.user.name, {
       planName: service.plan.name,
-      hostname: service.hostname || ip.ip,
-      serverIp: ip.ip,
+      hostname: service.hostname || (ip.mode === "SHARED" ? ip.publicName : ip.ipv4),
+      connection,
       sshUsername: credentials.sshUsername,
       sshPassword: credentials.sshPassword,
       panelUrl: credentials.coolifyUrl ?? undefined,
@@ -188,7 +230,7 @@ export async function provisionVPS(serviceId: string, options: ProvisionOptions 
       })
       .catch((err) => console.error("[provisioning] notification failed:", err));
   } catch (error) {
-    await handleFailure(serviceId, error, { vmid, floatingIpId }, options.refundOnFailure ?? true);
+    await handleFailure(serviceId, error, { vmid, floatingIpId }, options.refundOnFailure ?? true, notify);
   }
 }
 
@@ -269,7 +311,8 @@ async function handleFailure(
   serviceId: string,
   error: unknown,
   { vmid, floatingIpId }: { vmid: number | null; floatingIpId: number | null },
-  refundOnFailure: boolean
+  refundOnFailure: boolean,
+  notifyCustomer = true
 ) {
   console.error(`[provisioning] service ${serviceId} failed:`, error);
 
@@ -289,11 +332,11 @@ async function handleFailure(
   });
 
   if (!refundOnFailure) {
-    // A rebuild of a service that's paid for: the payment and autopay stand; a person decides what's next.
+    // A rebuild of a service that's paid for (or a test order): the payment and autopay stand; a person decides what's next.
     await sendAdminAlert(
       serviceId,
       [
-        `REBUILD FAILED for service ${serviceId} — payment and autopay NOT touched, no refund, customer not emailed.`,
+        `${notifyCustomer ? "REBUILD" : "TEST ORDER"} FAILED for service ${serviceId} — payment and autopay NOT touched, no refund, customer not emailed.`,
         `Client: ${service.user.name} <${service.user.email}>`,
         `Plan: ${service.plan.name}`,
         `Error: ${errorMessage(error)}`,
@@ -330,7 +373,7 @@ async function handleFailure(
   }
   const refunded = refundError === null;
 
-  await prisma.notification
+  if (notifyCustomer) await prisma.notification
     .create({
       data: {
         userId: service.userId,
@@ -342,7 +385,7 @@ async function handleFailure(
     })
     .catch(console.error);
 
-  await sendProvisioningFailedEmail(service.user.email, service.user.name, service.plan.name, refunded).catch(
+  if (notifyCustomer) await sendProvisioningFailedEmail(service.user.email, service.user.name, service.plan.name, refunded).catch(
     console.error
   );
 
@@ -400,6 +443,9 @@ export async function deprovisionVPS(serviceId: string): Promise<void> {
   }
 
   const service = await prisma.service.findUniqueOrThrow({ where: { id: serviceId } });
+  // Shared: the route goes first, while its container still exists (the status is CANCELLED now,
+  // so the table leaves it out). A failed sync doesn't stop the teardown: the 5-minute job retries.
+  if (service.ipv4Mode === "SHARED" && service.nodeId) await syncGatewayAfterChange(service.nodeId, `service ${serviceId} is being cancelled`);
   const errors = await releaseResources(
     service.proxmoxVmId ? Number(service.proxmoxVmId) : null,
     service.hetznerFloatingIpId ? Number(service.hetznerFloatingIpId) : null,

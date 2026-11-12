@@ -1,6 +1,6 @@
-// Retiring a node (out of service, row and history kept) and opening one for orders.
-// Used by scripts/node/node-state.ts. A dry run unless --apply, and every refusal is
-// worked out before anything changes.
+// Retiring a node (out of service, row and history kept), opening one for orders, and its
+// shared-IPv4 flag (Stage C). Used by scripts/node/node-state.ts. A dry run unless --apply,
+// and every refusal is worked out before anything changes.
 import { isRetired, RETIRED_STATUS } from "@/lib/provisioning/nodeTarget";
 
 export type NodeRow = {
@@ -11,9 +11,13 @@ export type NodeRow = {
   hetznerServerId: string;
   ipv6Subnet: string | null;
   hasOwnToken: boolean;
+  /** The gateway (Stage B): its address and container, null when it has none. */
+  gatewayIpv4?: string | null;
+  gatewayVmId?: number | null;
+  sharedIpv4?: boolean;
 };
 
-export type NodeStateChange = { status: string; acceptNewClients: boolean };
+export type NodeStateChange = { status?: string; acceptNewClients?: boolean; sharedIpv4?: boolean };
 
 export type NodeStateDeps = {
   findNode(name: string): Promise<NodeRow | null>;
@@ -25,11 +29,13 @@ export type NodeStateDeps = {
   openMigrations(name: string): Promise<number>;
   /** Engine approvals for "node:<name>" that are PENDING or APPROVED. */
   openApprovals(name: string): Promise<number>;
+  /** Shared-mode services on the node that aren't DELETED. */
+  sharedServices?(nodeId: string): Promise<number>;
   /** The change and its EngineLog row, together or not at all. */
   apply(node: NodeRow, change: NodeStateChange, log: { action: string; approvedBy: string }): Promise<void>;
 };
 
-export type NodeStateAction = "retire" | "open";
+export type NodeStateAction = "retire" | "open" | "shared-on" | "shared-off";
 export type NodeStatePlan = { ok: boolean; problems: string[]; lines: string[]; node: NodeRow | null; change: NodeStateChange | null };
 
 export async function planNodeState(deps: NodeStateDeps, name: string, action: NodeStateAction): Promise<NodeStatePlan> {
@@ -54,6 +60,27 @@ export async function planNodeState(deps: NodeStateDeps, name: string, action: N
     return { ok: problems.length === 0, problems, lines, node, change };
   }
 
+  if (action === "shared-on" || action === "shared-off") {
+    const on = action === "shared-on";
+    lines[0] += `, shared IPv4 ${node.sharedIpv4 ? "on" : "off"}`;
+    if (on) {
+      if (isRetired(node)) problems.push(`it's retired (${node.status})`);
+      if (!node.gatewayIpv4 || node.gatewayVmId === null || node.gatewayVmId === undefined) problems.push("it has no gateway (a node gets one from install-node.ts): shared services couldn't be reached over IPv4");
+    }
+    if (Boolean(node.sharedIpv4) === on && !problems.length) return { ok: true, problems, lines: [...lines, `shared IPv4 is already ${on ? "on" : "off"}: nothing to change`], node, change: null };
+    if (on) {
+      lines.push(
+        "turn shared IPv4 on: shared-mode orders may be placed here (still only when it's open, or by a pinned test order)",
+        "every customer order stays DEDICATED until Stage G, so this alone changes no customer's server"
+      );
+    } else {
+      const left = (await deps.sharedServices?.(node.id)) ?? 0;
+      lines.push("turn shared IPv4 off: no new shared-mode service is placed here");
+      if (left) lines.push(`its ${left} shared service(s) keep running and keep their routes`);
+    }
+    return { ok: problems.length === 0, problems, lines, node, change: { sharedIpv4: on } };
+  }
+
   if (isRetired(node)) problems.push(`it's retired (${node.status}): a retired node isn't reopened, since its server may be gone`);
   if (!node.hasOwnToken) problems.push("it has no API token of its own: nothing could reach it (nodes get one from install-node.ts)");
   if (!node.ipv6Subnet) problems.push("it has no ipv6Subnet: containers couldn't get addresses");
@@ -67,6 +94,8 @@ export async function applyNodeState(deps: NodeStateDeps, plan: NodeStatePlan, a
   if (!plan.ok || !plan.node) throw new Error(`refused: ${plan.problems.join("; ")}`);
   if (!approvedBy.trim()) throw new Error("--apply needs --approved-by <name>");
   if (!plan.change) return "nothing to change";
-  await deps.apply(plan.node, plan.change, { action: action === "retire" ? "NODE_RETIRED" : "NODE_OPENED", approvedBy });
+  const logAction = { retire: "NODE_RETIRED", open: "NODE_OPENED", "shared-on": "NODE_SHARED_IPV4_ON", "shared-off": "NODE_SHARED_IPV4_OFF" }[action];
+  await deps.apply(plan.node, plan.change, { action: logAction, approvedBy });
+  if (plan.change.sharedIpv4 !== undefined) return `${plan.node.name}: shared IPv4 ${plan.change.sharedIpv4 ? "on" : "off"}`;
   return `${plan.node.name}: ${plan.change.status}, ${plan.change.acceptNewClients ? "open" : "closed"} for new clients`;
 }

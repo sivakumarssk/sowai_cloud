@@ -177,6 +177,11 @@ model Service {
   /// Shared-mode private address (100.64.0.0/10), assigned once from a sequence and never reused or
   /// handed to another service. 100.127.255.0/24 is kept for the installer's test containers.
   privateIpv4         String?       @unique
+  /// Its name under c.sowsicloud.com (the label only, e.g. "myshop"): what the gateway routes by, and
+  /// from Stage D its DNS name. Assigned once, unique, never handed to another service.
+  publicName          String?       @unique
+  /// The gateway table's key for this service: 16 lowercase letters and digits, unique.
+  routeKey            String?       @unique
   sshUsername         String?
   sshPassword         String?
   panelUrl            String?
@@ -190,7 +195,7 @@ model Service {
   /// Paid but held (status PROVISIONING, 0%) because no node accepts new clients. Cleared when provisioning starts.
   waitingForNodeSince DateTime?
   /// When the client's SSH login was verified on the real server. ACTIVE requires it, plus (PROXMOX)
-  /// proxmoxVmId, nodeId and either hetznerFloatingIpId or shared mode with a privateIpv4, or (MANUAL)
+  /// proxmoxVmId, nodeId and either hetznerFloatingIpId or shared mode with a privateIpv4, publicName and routeKey, or (MANUAL)
   /// serverIp — enforced by the CHECK constraint "Service_active_requires_real_server".
   sshVerifiedAt       DateTime?
   serverSource        ServerSource  @default(PROXMOX)
@@ -474,6 +479,12 @@ model ProxmoxNode {
   gatewayVmId          Int?
   /// The last route table version the gateway applied; each sync must send a higher one.
   gatewayRoutesVersion BigInt?
+  /// The last version handed to a sync (src/lib/nodes/gatewaySync.ts), taken under this row's lock
+  /// together with the table, so a later version always carries a table read later.
+  gatewayRoutesIssued  BigInt?
+  /// Takes new shared-IPv4 services (Stage C). Off by default; needs the gateway. Set with
+  /// scripts/node/node-state.ts --shared on|off. Until Stage G no customer order is shared anyway.
+  sharedIpv4           Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

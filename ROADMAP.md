@@ -49,46 +49,65 @@ committed, and stops for review before the next one starts.
   internet over IPv4 through NAT (nat_out 0 → 3).
 - isolation-test.sh: 65 passed, 1 failed (test 16, the test itself: see Stage B). Test 27, all 6;
   reboot-check, 14 passed, including NAT after the reboot. Destroy and `--expect-gone` clean.
-- Every service still defaults to a dedicated IPv4; nothing uses shared mode until Stage C.
+- Every service still defaults to a dedicated IPv4.
 
-## In progress
-
-**1. Shared IPv4 gateway — Stage B: the gateway container.** Built and tested locally; waiting
-for the throwaway-node test.
-- First test (sowsi-test-05, server 175731990, 12 Nov 2026): failed at the gateway step. HAProxy
-  started by apt on the package's config, and a reload keeps the config the master started with,
-  so ours was never loaded. Fixed: HAProxy is restarted onto our config whenever the running
-  process isn't on it (read from its master's command line), and "serving" now requires it. The
-  rig now behaves like systemd and reproduces the failure with the old script.
-- Also from that test: the card's name pin matched vmbr0 too (same MAC), so udev tried to rename
-  the bridge. Fixed with `Type=ether`, as Proxmox's own docs do; the installer now checks after the
-  reboot that the pin doesn't apply to vmbr0 and that udev never tried to rename it.
-- `sowsi-gateway` refusing a command line now shows what it got (a stray carriage return showed
-  only as the usage line).
+**Shared IPv4 gateway, Stage B: the gateway container** (proven on sowsi-test-06, 12 Nov 2026)
 - `sowsi-gateway` on each node: HAProxy in container 9000 on a Floating IP of its own. Port 80 by
   the Host header, 443 by the TLS name, passed through still encrypted. Unknown name: a neutral 404
   on 80, a closed connection on 443. The client's own X-Forwarded-For is dropped.
-- `sync <version>`: the whole table on stdin, every line checked (hostname, 16-character key,
-  a shared address of a container on this node, PROXY 0 or 1), size-capped, older versions refused;
-  then HAProxy's config test, a graceful reload, proof the new version serves, else back to the
-  last good. Dispatcher: `gateway-status`, `gateway-sync <version>`.
+- `sync <version>`: the whole table on stdin, every line checked, size-capped, older versions
+  refused; HAProxy's config test, a graceful reload, proof the new version serves, else back to the
+  last good. HAProxy is restarted onto our config whenever the running master isn't on it (the
+  sowsi-test-05 failure: a reload keeps the config apt started it with). Dispatcher:
+  `gateway-status`, `gateway-sync <version>`.
 - Rules: the gateway reaches shared containers on 80 and 443 only; containers reach it on 80 and
-  443 only (a site calling its own domain).
-- Installer: a gateway step (its Floating IP under the spend cap, adopted if a run stopped after
-  buying it, released with the server on a failed install), step 4 proves two names route to two
-  containers from outside, and the node registers with its gateway. The gateway takes no
-  customer's slot in `maxContainers`.
-- `--destroy` releases every Floating IP the installer labelled; any other on the server stops the
-  plan until `--release-floating-ip <id>` or `--keep-floating-ip <id>`.
-- isolation-test.sh test 16 prints docker run's own error and retries once; test 28 checks the
-  gateway on the node, and again after a reboot.
+  443 only. The card's name pin matches `Type=ether`, so it never applies to vmbr0.
+- Installer: the gateway step (its Floating IP under the spend cap), step 4 routes two names to two
+  containers from outside, the node registers with its gateway; `--destroy` releases the labelled
+  Floating IPs.
+- sowsi-test-06: install steps 1 to 5 passed (vmbr0 check, HAProxy on our config, one/two.gateway.test
+  to containers 101/102 on 80 and 443, X-Forwarded-For replaced, unknown name 404 / closed, routes
+  removed). Hashes 9b7d355f / 24037d7f / 2b1e5536; 0 vmbr rename attempts. isolation-test.sh main:
+  81 passed, 1 failed (test 16, the test's own bug: see below); test 28 all 16. Reboot-check: 21
+  passed, gateway status unchanged but for memory, 404 after the reboot.
+- Test 16 named its Docker container `t`; Docker wants two characters or more, so every run failed
+  with "Invalid container name (t)". Now `sowsi-test16`, with a test of the generated commands and a
+  fake docker that refuses names the way Docker does.
+
+## In progress
+
+**1. Shared IPv4 gateway — Stage C: shared mode in provisioning.** Built and tested locally; waiting
+for the throwaway-node test (done when a simulated order ends ACTIVE as shared on it).
+- Per-node flag `ProxmoxNode.sharedIpv4` (off by default; `node-state.ts --shared on|off`; on needs
+  the gateway). Placement sends a shared order only to a node with the flag and a gateway.
+- A shared service buys no Floating IP: its private address, a name under `c.sowsicloud.com`
+  (`publicName`: the order's hostname, or with a short suffix when taken or reserved; unique, never
+  reused) and a 16-character route key. Setup logs in over its IPv6. ACTIVE in shared mode now also
+  needs the name and key (constraint and `serverReady.ts`). A Coolify server stays dedicated.
+- Gateway sync: the node's whole table (shared services ACTIVE or SUSPENDED) after a service becomes
+  ACTIVE, before a cancelled one's container goes, and every 5 minutes from
+  `scripts/node/gateway-sync.ts --cron` (alerts at most once an hour per node). Versions are taken
+  under the node row's lock (`gatewayRoutesIssued`), so a later version always carries a later table;
+  "older than applied" means a newer table is already there.
+- One connection helper, `serviceConnection()`: Shared or Dedicated with its IPv4, IPv6, SSH command
+  and notice, used by the dashboard, the progress page, the ready email, the status APIs and the admin
+  list. A manual server is always Dedicated. The service name isn't shown as an address until its DNS
+  exists (Stage D).
+- `scripts/node/shared-test-order.ts`: the proof on a closed throwaway node. A made-up customer
+  (`.invalid`, no login, no mail), no payment, billingHold on, refunds and emails off, pinned to the
+  node; checks ACTIVE as shared with nothing bought, its net0, the gateway's route, a web server
+  reached by its name on 80 and 443 through the gateway, IPv4 out by NAT; `--cleanup` cancels it and
+  deletes the rows.
+- Every customer order is still DEDICATED, and nothing a customer does can make one shared (a test
+  checks that only the test-order script writes SHARED).
+- Not changed (billing): `scripts/billing/reprovision.ts` and `reprovisionDeps.ts` look up Floating
+  IPs; a shared service would need them to allow none. No shared customer service exists before
+  Stage G, so this waits for your OK to touch billing code. `capacityReport.ts` doesn't yet show
+  shared and dedicated costs separately (Stage G).
 
 ## Pending
 
 **1. Shared IPv4 gateway** (design: "Shared IPv4 Gateway Design", with your answers of 11 Nov 2026)
-- Stage C: shared mode in provisioning behind a per-node flag, one connection helper, labels
-  everywhere an IP is shown. The sync job (on every route change and every 5 minutes) sends
-  versions above the node's `gatewayRoutesVersion`.
 - Stage F: abuse limits and a per-service ports panel (IPv6 default-deny); per-client limits in
   HAProxy (Stage B has a 5,000 connection ceiling and 500 per site).
 - Stage G: dedicated IPv4 add-on (monthly). Touches billing: designed in test mode first, then your

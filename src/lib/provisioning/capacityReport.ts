@@ -40,6 +40,7 @@ export function hypotheticalNode(size: (typeof DOCUMENTED_SIZES)[number]): NodeL
     ipv6Subnet: "hypothetical",
     acceptNewClients: true,
     status: "READY",
+    sharedIpv4: false,
     physicalRamMB: size.ramGB * 1024,
     physicalDiskGB: size.diskGB,
     maxContainers: DEFAULT_MAX_CONTAINERS,

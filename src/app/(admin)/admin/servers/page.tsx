@@ -5,6 +5,8 @@ import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { showToast } from "@/components/ui/Toast";
+import { Ipv4Tag } from "@/components/ui/Ipv4Tag";
+import type { ServiceConnection } from "@/lib/provisioning/connection";
 
 interface ServiceRecord {
   id: string;
@@ -13,6 +15,11 @@ interface ServiceRecord {
   billingHold: boolean;
   proxmoxVmId: string | null;
   serverIp: string | null;
+  /** Shared mode: its private address and its name under c.sowsicloud.com. */
+  privateIpv4: string | null;
+  publicName: string | null;
+  node: { name: string; gatewayIpv4: string | null } | null;
+  connection: ServiceConnection;
   sshUsername: string | null;
   sshPassword: string | null;
   panelUrl: string | null;
@@ -160,7 +167,7 @@ export default function AdminServersPage() {
               <tr className="border-b border-[#1F2937]">
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Client</th>
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Plan</th>
-                <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Server IP</th>
+                <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">IPv4</th>
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Status</th>
                 <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Next Billing</th>
                 <th className="text-right px-6 py-3 text-gray-500 text-xs font-medium uppercase tracking-wider">Actions</th>
@@ -178,7 +185,17 @@ export default function AdminServersPage() {
                     <p className="text-gray-500 text-xs">{svc.plan.category}</p>
                   </td>
                   <td className="px-6 py-4">
-                    <code className="text-white text-sm font-mono">{svc.serverIp || "—"}</code>
+                    <div className="flex items-center gap-2">
+                      <code className="text-white text-sm font-mono">{svc.connection.ipv4 || "—"}</code>
+                      <Ipv4Tag connection={svc.connection} />
+                    </div>
+                    {svc.connection.mode === "SHARED" && (
+                      <p className="text-gray-500 text-xs mt-1">
+                        private {svc.privateIpv4 || "none yet"}
+                        {svc.publicName ? ` · ${svc.publicName}` : ""}
+                        {svc.node ? ` · gateway on ${svc.node.name}` : ""}
+                      </p>
+                    )}
                   </td>
                   <td className="px-6 py-4">
                     <span className={`text-xs font-medium px-2 py-0.5 rounded-md border ${statusColors[svc.status]}`}>

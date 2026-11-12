@@ -34,7 +34,7 @@ export async function runProvisioningSweep(now = new Date()) {
           planName: s.plan.name,
           customer: `${s.user.name} <${s.user.email}>`,
           waitingSince: s.waitingForNodeSince,
-          need: planNeed(s.plan),
+          need: planNeed(s.plan, s.ipv4Mode),
         }));
       },
       nodes: () => nodeLoads(prisma, now.getTime()),

@@ -2,6 +2,7 @@ import { NodeSSH } from "node-ssh";
 import { prisma } from "@/lib/prisma";
 import { encrypt } from "@/lib/crypto";
 import { sendCredentialsEmail } from "@/lib/email";
+import { serviceConnection } from "@/lib/provisioning/connection";
 import { prismaEngineLog } from "@/engine/data/engineLog";
 import type { AssignDeps } from "./manualServer";
 
@@ -48,6 +49,8 @@ export function prismaAssignDeps(): AssignDeps {
         data: {
           ...d,
           status: d.status as "ACTIVE" | "SUSPENDED",
+          // A manual server's address is its own: always Dedicated.
+          ipv4Mode: "DEDICATED",
           sshUsername: encrypt(d.sshUsername),
           sshPassword: encrypt(d.sshPassword),
           panelPassword: d.panelPassword ? encrypt(d.panelPassword) : null,
@@ -60,7 +63,8 @@ export function prismaAssignDeps(): AssignDeps {
       await sendCredentialsEmail(s.user.email, s.user.name, {
         planName: s.plan.name,
         hostname: s.hostname || input.serverIp,
-        serverIp: input.serverIp.trim(),
+        // A server an admin assigned is always Dedicated: its address is its own.
+        connection: serviceConnection({ serverSource: "MANUAL", ipv4Mode: "DEDICATED", serverIp: input.serverIp.trim(), ipv6Address: input.ipv6Address?.trim() || null, sshUsername: input.sshUsername.trim(), sshPort: input.sshPort }),
         sshUsername: input.sshUsername.trim(),
         sshPassword: input.sshPassword,
         panelUrl: input.panelUrl?.trim() || undefined,

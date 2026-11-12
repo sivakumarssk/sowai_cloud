@@ -94,3 +94,43 @@ test("a failed write is reported, not claimed done", async () => {
   const plan = await planNodeState(w.deps, "sowsi-proxmox-01", "retire");
   await assert.rejects(applyNodeState(w.deps, plan, "retire", "sivakumar"), /database down/);
 });
+
+// ── The shared-IPv4 flag (Stage C) ───────────────────────────────────
+
+const GW: NodeRow = { ...NEW, status: "READY", gatewayIpv4: "198.51.100.7", gatewayVmId: 9000, sharedIpv4: false };
+
+test("shared on: needs the node's gateway, changes only the flag, and logs who approved it", async () => {
+  const w = world({ node: GW });
+  const plan = await planNodeState(w.deps, GW.name, "shared-on");
+  assert.equal(plan.ok, true, plan.problems.join());
+  assert.deepEqual(plan.change, { sharedIpv4: true }, "not its status, and not whether it's open");
+  assert.match(plan.lines.join("\n"), /every customer order stays DEDICATED until Stage G/);
+  assert.equal(await applyNodeState(w.deps, plan, "shared-on", "sivakumar"), "sowsi-proxmox-02: shared IPv4 on");
+  assert.deepEqual(w.applied, [{ node: GW.name, change: { sharedIpv4: true }, log: { action: "NODE_SHARED_IPV4_ON", approvedBy: "sivakumar" } }]);
+
+  for (const [node, why] of [
+    [{ ...GW, gatewayIpv4: null }, /has no gateway/],
+    [{ ...GW, gatewayVmId: null }, /has no gateway/],
+    [{ ...GW, status: "DECOMMISSIONING" }, /it's retired/],
+  ] as const) {
+    const refused = await planNodeState(world({ node }).deps, GW.name, "shared-on");
+    assert.equal(refused.ok, false);
+    assert.match(refused.problems.join(), why);
+    await assert.rejects(applyNodeState(world({ node }).deps, refused, "shared-on", "sivakumar"), /refused/);
+  }
+  const already = await planNodeState(world({ node: { ...GW, sharedIpv4: true } }).deps, GW.name, "shared-on");
+  assert.deepEqual([already.ok, already.change], [true, null]);
+});
+
+test("shared off: always allowed, says the shared services already there keep running", async () => {
+  const w = world({ node: { ...GW, sharedIpv4: true, gatewayIpv4: null } });
+  w.deps.sharedServices = async () => 2;
+  const plan = await planNodeState(w.deps, GW.name, "shared-off");
+  assert.equal(plan.ok, true, plan.problems.join());
+  assert.deepEqual(plan.change, { sharedIpv4: false });
+  assert.match(plan.lines.join("\n"), /its 2 shared service\(s\) keep running and keep their routes/);
+  assert.equal(await applyNodeState(w.deps, plan, "shared-off", "sivakumar"), "sowsi-proxmox-02: shared IPv4 off");
+  assert.equal(w.applied[0].log.action, "NODE_SHARED_IPV4_OFF");
+  const already = await planNodeState(world({ node: GW }).deps, GW.name, "shared-off");
+  assert.deepEqual([already.ok, already.change], [true, null]);
+});
