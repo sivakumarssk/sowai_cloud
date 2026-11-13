@@ -234,6 +234,31 @@ test("a pinned test order uses only that node, may use it while it's closed, and
   assert.deepEqual(missing, { status: "WAIT", reason: "no node with id node_Z" });
 });
 
+test("a pinned test order takes a just-registered node (PROVISIONING, closed), as on sowsi-test-07, and never an open or retired one", async () => {
+  const shared = { ...plan4G, shared: true };
+  const fresh = node("B", { status: "PROVISIONING", acceptNewClients: false, sharedIpv4: true });
+  assert.equal(nodeFit(fresh, shared, config, true).ok, true, "pinned: the installer's new node is the place for it");
+  assert.deepEqual(nodeFit(fresh, shared, config), { ok: false, reason: "sowsi-proxmox-02 is closed to new clients" }, "a customer order still can't use it");
+  assert.deepEqual(nodeFit({ ...fresh, acceptNewClients: true }, plan4G, config), { ok: false, reason: "sowsi-proxmox-02 is PROVISIONING" }, "nor while it's PROVISIONING, even if it were open");
+  const c = cluster([fresh], { t5: shared });
+  const r = await placeOrder("t5", c.deps, { pinNodeId: "node_B" });
+  assert.equal(r.status === "PLACED" && r.node.id, "node_B");
+
+  for (const [over, why] of [
+    [{ acceptNewClients: true }, /sowsi-proxmox-02 is open to customers: a pinned test order only goes to a closed node/],
+    [{ acceptNewClients: true, status: "PROVISIONING" }, /is open to customers/],
+    [{ acceptNewClients: false, status: "DECOMMISSIONING" }, /sowsi-proxmox-02 is DECOMMISSIONING/],
+  ] as const) {
+    const fit = nodeFit(node("B", { sharedIpv4: true, ...over }), shared, config, true);
+    assert.equal(fit.ok, false, JSON.stringify(over));
+    assert.match(fit.ok ? "" : fit.reason, why);
+    const open = cluster([node("B", { sharedIpv4: true, ...over })], { t6: shared });
+    const w = await placeOrder("t6", open.deps, { pinNodeId: "node_B" });
+    assert.equal(w.status, "WAIT");
+    assert.equal(open.svc.get("t6")!.nodeId, null, "not claimed");
+  }
+});
+
 test("planNeed marks a SHARED order, and a node takes shared services only with its flag and a gateway", async () => {
   const { planNeed, takesShared } = await import("./placementDeps");
   assert.deepEqual(planNeed({ ramGB: 2, storageGB: 40 }, "SHARED"), { ramMB: 2048, diskGB: 40, shared: true });

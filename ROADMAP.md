@@ -78,6 +78,11 @@ committed, and stops for review before the next one starts.
 
 **1. Shared IPv4 gateway — Stage C: shared mode in provisioning.** Built and tested locally; waiting
 for the throwaway-node test (done when a simulated order ends ACTIVE as shared on it).
+- First run (sowsi-test-07, server 175974701, 12 Nov 2026): install, `--shared on` and the gateway
+  sync (0 routes) were fine, but the test order was refused: "sowsi-test-07 is PROVISIONING".
+  The installer registers a node PROVISIONING and closed, and a pinned order still treated that as
+  closed. Fixed: a pinned test order takes a closed node, PROVISIONING included, and refuses an
+  open one (real orders land there) or a retired one. Customer orders are unchanged.
 - Per-node flag `ProxmoxNode.sharedIpv4` (off by default; `node-state.ts --shared on|off`; on needs
   the gateway). Placement sends a shared order only to a node with the flag and a gateway.
 - A shared service buys no Floating IP: its private address, a name under `c.sowsicloud.com`
@@ -134,7 +139,12 @@ for the throwaway-node test (done when a simulated order ends ACTIVE as shared o
 - The paid client: Dedicated Business, next charge 29 Nov 2026, has no server.
 - Billing cron running on sowsi-mgmt-01.
 - Razorpay live webhook check.
-- Alert emails through Microsoft mail.
+- Alert emails through Microsoft mail. Seen failing on 12 Nov 2026: at the end of the sowsi-test-07
+  install, "[admin-alert] failed: New Proxmox node installed: sowsi-test-07 Error: Microsoft sendMail
+  failed (502): UnknownError" (src/lib/mailer.ts). The sign-in worked (its failure reads differently);
+  Graph's sendMail itself answered 502. Not fixed yet. `scripts/prod/mail-check.ts` (read only, sends
+  nothing) shows the token's permissions, the sender user and its mailbox. To do: log Graph's
+  request-id on a failed send (Microsoft support asks for it) and decide on a retry for 5xx.
 - GST and GSTIN.
 - A small live order and refund test.
 - Coolify tested inside a container.

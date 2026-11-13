@@ -64,10 +64,17 @@ export function usableDiskGB(node: Pick<NodeLoad, "physicalDiskGB">, config: Pla
 
 /**
  * Why a node takes no new containers at all, or null if it's open. `pinned`: a test order placed on
- * this node by name (scripts/node/shared-test-order.ts), which may use a node closed to customers.
+ * this node by name (scripts/node/shared-test-order.ts). That's the other way round: it needs a
+ * node closed to customers, and a new node just registered (PROVISIONING, closed) is the safest
+ * place for it. It never goes to an open node, where real orders land, nor a retired one.
  */
 export function closedReason(node: Pick<NodeLoad, "name" | "acceptNewClients" | "status">, pinned = false): string | null {
-  if (!node.acceptNewClients && !pinned) return `${node.name} is closed to new clients`;
+  if (pinned) {
+    if (node.status === "DECOMMISSIONING") return `${node.name} is ${node.status}`;
+    if (node.acceptNewClients) return `${node.name} is open to customers: a pinned test order only goes to a closed node`;
+    return null;
+  }
+  if (!node.acceptNewClients) return `${node.name} is closed to new clients`;
   // READY/WARNING/CRITICAL are health (written by the ServerMonitor), not closure.
   if (node.status === "PROVISIONING" || node.status === "DECOMMISSIONING") return `${node.name} is ${node.status}`;
   return null;

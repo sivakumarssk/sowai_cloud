@@ -27,6 +27,18 @@ test("a test order needs a closed throwaway with its gateway and shared IPv4 on,
   }
 });
 
+test("the installer's new node (PROVISIONING, closed) passes the script's checks and placement's pinned fit; opened, it's refused", async () => {
+  const { nodeFit } = await import("@/lib/provisioning/placement");
+  const fresh = { ...NODE, status: "PROVISIONING" };
+  assert.deepEqual(T.testOrderProblems({ node: fresh, plan: PLAN, fit: null, liveTestServices: [] }), [], "as on sowsi-test-07");
+  const load = { id: "n7", name: fresh.name, ip: "203.0.113.20", hetznerServerId: "175974701", location: "nbg1", ipv6Subnet: fresh.ipv6Subnet, acceptNewClients: false, status: "PROVISIONING", sharedIpv4: true, physicalRamMB: 8192, physicalDiskGB: 160, maxContainers: 6, monitor: null, settled: { ramMB: 0, diskGB: 0, count: 0 }, inFlight: { ramMB: 0, diskGB: 0, count: 0 } };
+  const config = { ramOvercommit: 1, diskOvercommit: 1, diskPoolReserveGB: 20, hostRamReserveMB: 1536 };
+  assert.equal(nodeFit(load, { ramMB: 2048, diskGB: 40, shared: true }, config, true).ok, true, "the fit the script reports in its plan");
+  assert.match(T.testOrderProblems({ node: { ...fresh, acceptNewClients: true }, plan: PLAN, fit: null, liveTestServices: [] }).join(), /open to customers/);
+  const opened = nodeFit({ ...load, acceptNewClients: true }, { ramMB: 2048, diskGB: 40, shared: true }, config, true);
+  assert.match(opened.ok ? "" : opened.reason, /open to customers/);
+});
+
 const ACTIVE = {
   status: "ACTIVE", serverSource: "PROXMOX", serverIp: null, ipv6Address: "2a01:4f8:1c16:5f11::101", proxmoxVmId: "101", nodeId: "n1",
   hetznerFloatingIpId: null, ipv4Mode: "SHARED", privateIpv4: "100.64.0.5", publicName: "shared-test", routeKey: "q7w8e9r0t1y2u3i4", sshVerifiedAt: new Date(),
